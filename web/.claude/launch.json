@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "event-graph",
+      "runtimeExecutable": "C:\\ProgramData\\anaconda3\\python.exe",
+      "runtimeArgs": ["app.py"],
+      "port": 5000
+    }
+  ]
+}
