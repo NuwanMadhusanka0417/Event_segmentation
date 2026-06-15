@@ -1,0 +1,16 @@
+# Core (required)
+numpy>=1.24
+
+# Parquet output (recommended; CSV fallback works without these)
+pandas>=2.0
+pyarrow>=12.0
+
+# Visualization (visualize.py + --render-frames)
+matplotlib>=3.7
+Pillow>=9.0
+
+# Optional: faster causal neighbour search (a numpy path is used if absent)
+scipy>=1.10
+
+# Optional: enables preview.mp4 instead of preview.gif
+# imageio-ffmpeg>=0.4

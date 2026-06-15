@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Event Camera Graph (3D)</title>
+  <title>Event Camera Visualizer</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
   <script type="importmap">
   {
@@ -15,11 +15,53 @@
   </script>
 </head>
 <body>
-  <div id="viewport"></div>
+  <div id="viz-shell">
+    <nav id="viz-tabs" aria-label="Visualization mode">
+      <button type="button" class="viz-tab active" data-view="graph">Graph 3D</button>
+      <button type="button" class="viz-tab" data-view="video">Event video</button>
+      <button type="button" class="viz-tab" data-view="st3d">Space-time 3D</button>
+    </nav>
+    <div id="viewport" class="viz-pane active" aria-label="3D graph view"></div>
+    <div id="video-viewport" class="viz-pane" aria-label="Event video view">
+      <div id="video-stage">
+        <canvas id="video-canvas"></canvas>
+        <p id="video-empty">Load an event file, set the time window, then press Run.</p>
+      </div>
+      <div id="video-control-bar" hidden>
+        <label class="video-control-label">
+          Time window <span id="vw-val" class="frame-bar-count">2%</span>
+          <input type="range" id="vw" min="0.5" max="25" step="0.5" value="2" />
+        </label>
+        <div class="frame-bar-top">
+          <span class="frame-bar-title">Playback</span>
+          <span id="video-progress" class="frame-bar-count">0%</span>
+        </div>
+        <input type="range" id="video-scrub" min="0" max="1000" value="0" step="1" />
+        <div id="video-time-range" class="frame-bar-range">—</div>
+      </div>
+    </div>
+    <div id="st-viewport" class="viz-pane" aria-label="Space-time 3D video view">
+      <div id="st-stage">
+        <p id="st-empty">Load an event file, then press Run to grow the 3D space-time volume.</p>
+      </div>
+      <div id="st-control-bar" hidden>
+        <label class="video-control-label">
+          Time window <span id="st-vw-val" class="frame-bar-count">2%</span>
+          <input type="range" id="st-vw" min="0.5" max="25" step="0.5" value="2" />
+        </label>
+        <div class="frame-bar-top">
+          <span class="frame-bar-title">Playback</span>
+          <span id="st-progress" class="frame-bar-count">0%</span>
+        </div>
+        <input type="range" id="st-scrub" min="0" max="1000" value="0" step="1" />
+        <div id="st-time-range" class="frame-bar-range">—</div>
+      </div>
+    </div>
+  </div>
 
   <aside id="hud">
     <header>
-      <h1>Event Graph 3D</h1>
+      <h1>Event Visualizer</h1>
       <button id="collapse" title="Collapse panel">&#x2715;</button>
     </header>
 
@@ -29,8 +71,8 @@
         <select id="file-select"></select>
         <button id="refresh" title="Reload list">&#x21bb;</button>
       </div>
-      <input type="file" id="file-upload" accept=".mat,.h5,.hdf5" />
-      <label for="file-upload" class="file-button">Upload .mat / .h5</label>
+      <input type="file" id="file-upload" accept=".mat,.bin,.dat,.txt,.h5,.hdf5" />
+      <label for="file-upload" class="file-button">Upload .mat / .bin / .dat / .txt</label>
     </section>
 
     <section class="row">
