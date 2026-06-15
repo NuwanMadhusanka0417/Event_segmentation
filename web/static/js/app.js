@@ -2,17 +2,22 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import {
+  VIDEO_WINDOW_FRAC_DEFAULT,
+  EVENT_VIDEO_DOT_U_SIZE,
+  EVENT_VIDEO_DOT_DEPTH_REF,
+  getEventVideoDisplayScale,
+  eventVideoDotPx,
+} from './video-common.js';
 
 const SPACE_SCALE = 100;
 const ST_SCALE = 100;
 const HARD_MAX_EDGES = 2_000_000;
 const ST_WINDOW_FRAC_DEFAULT = 0.02;
-const VIDEO_WINDOW_FRAC_DEFAULT = 0.02;
 const IMG_POS = [255, 0, 0];
 const IMG_NEG = [0, 0, 255];
-const ST_DOT_U_SIZE = 0.85;
-// Reference view depth for matching Event video dot size to Space-Time 3D.
-const ST_DOT_DEPTH_REF = 150;
+const ST_DOT_U_SIZE = EVENT_VIDEO_DOT_U_SIZE;
+const ST_DOT_DEPTH_REF = EVENT_VIDEO_DOT_DEPTH_REF;
 
 const COLOR_SOURCE = new THREE.Color(0x14283c);
 const COLOR_POS_TARGET = new THREE.Color(0x3d8cc4);
@@ -119,7 +124,7 @@ const stScrub = document.getElementById('st-scrub');
 const stProgress = document.getElementById('st-progress');
 const stTimeRange = document.getElementById('st-time-range');
 
-const VIZ_PANE_IDS = { graph: 'viewport', video: 'video-viewport', st3d: 'st-viewport' };
+const VIZ_PANE_IDS = { graph: 'viewport', video: 'video-viewport', st3d: 'st-viewport', seg: 'seg-viewport' };
 
 // ---- Graph 3D scene ----
 const scene = new THREE.Scene();
@@ -224,16 +229,11 @@ function resizeGraph() {
 }
 
 function getVideoDisplayScale() {
-  if (!state.imgW || !state.imgH) return 1;
-  const pad = 48;
-  const barH = videoControlBar.hidden ? 0 : 180;
-  const maxW = window.innerWidth - pad;
-  const maxH = window.innerHeight - pad - barH;
-  return Math.min(maxW / state.imgW, maxH / state.imgH, 16);
+  return getEventVideoDisplayScale(state.imgW, state.imgH, videoControlBar.hidden);
 }
 
 function videoDotPx() {
-  return Math.max(1, Math.round(ST_DOT_U_SIZE * (300 / ST_DOT_DEPTH_REF)));
+  return eventVideoDotPx();
 }
 
 function resizeVideoDisplay() {
@@ -836,6 +836,7 @@ function msg(text, kind = 'err') {
 
 function setViewMode(mode) {
   if (mode !== state.viewMode && state.running) setRunning(false);
+  if (mode !== 'seg' && window.segOnViewLeave) window.segOnViewLeave();
   state.viewMode = mode;
   document.querySelectorAll('.viz-tab').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.view === mode);
@@ -846,6 +847,11 @@ function setViewMode(mode) {
   document.body.classList.toggle('view-graph', mode === 'graph');
   document.body.classList.toggle('view-video', mode === 'video');
   document.body.classList.toggle('view-st3d', mode === 'st3d');
+  document.body.classList.toggle('view-seg', mode === 'seg');
+  const hudGraph = $('hud-graph');
+  const hudSeg = $('hud-seg');
+  if (hudGraph) hudGraph.hidden = mode === 'seg';
+  if (hudSeg) hudSeg.hidden = mode !== 'seg';
   syncVideoBarVisibility();
   syncStBarVisibility();
   if (mode === 'graph') resizeGraph();
@@ -855,6 +861,8 @@ function setViewMode(mode) {
   } else if (mode === 'st3d') {
     resizeSpaceTime();
     if (state.payload) updateStWindow();
+  } else if (mode === 'seg' && window.segOnViewEnter) {
+    window.segOnViewEnter();
   }
 }
 

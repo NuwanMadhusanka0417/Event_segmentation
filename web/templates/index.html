@@ -20,6 +20,7 @@
       <button type="button" class="viz-tab active" data-view="graph">Graph 3D</button>
       <button type="button" class="viz-tab" data-view="video">Event video</button>
       <button type="button" class="viz-tab" data-view="st3d">Space-time 3D</button>
+      <button type="button" class="viz-tab" data-view="seg">event_segmentation</button>
     </nav>
     <div id="viewport" class="viz-pane active" aria-label="3D graph view"></div>
     <div id="video-viewport" class="viz-pane" aria-label="Event video view">
@@ -57,6 +58,43 @@
         <div id="st-time-range" class="frame-bar-range">—</div>
       </div>
     </div>
+    <div id="seg-viewport" class="viz-pane" aria-label="Event segmentation view">
+      <div id="seg-main-scroll">
+        <div id="seg-video-shell">
+          <div id="seg-video-stage">
+            <canvas id="seg-video-canvas"></canvas>
+            <p id="seg-empty">Select an event file, tune parameters in the panel, then Run segmentation.</p>
+          </div>
+          <div id="seg-control-bar" hidden>
+            <label class="video-control-label">
+              Time window <span id="seg-vw-val" class="frame-bar-count">2%</span>
+              <input type="range" id="seg-vw" min="0.5" max="25" step="0.5" value="2" />
+            </label>
+            <div class="frame-bar-top">
+              <span class="frame-bar-title">Playback</span>
+              <span id="seg-progress" class="frame-bar-count">0%</span>
+            </div>
+            <input type="range" id="seg-scrub" min="0" max="1000" value="0" step="1" />
+            <div id="seg-time-range" class="frame-bar-range">—</div>
+          </div>
+        </div>
+        <div id="seg-results-scroll" hidden>
+          <section id="seg-results">
+            <div id="seg-summary-panel"></div>
+            <div class="seg-plots">
+              <figure class="seg-plot">
+                <img id="seg-trajectories" alt="Instance trajectories" />
+                <figcaption>Instance centroid trajectories</figcaption>
+              </figure>
+              <figure class="seg-plot">
+                <img id="seg-speed" alt="Speed profiles" />
+                <figcaption>Per-instance speed vs time</figcaption>
+              </figure>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
   </div>
 
   <aside id="hud">
@@ -75,6 +113,7 @@
       <label for="file-upload" class="file-button">Upload .mat / .bin / .dat / .txt</label>
     </section>
 
+    <div id="hud-graph">
     <section class="row">
       <label>
         Max neighbours <span id="k-val" class="num">8</span>
@@ -113,10 +152,36 @@
     </section>
 
     <section id="msg" class="row msg"></section>
+    </div>
+
+    <div id="hud-seg" hidden>
+      <section class="row">
+        <p class="seg-hint">Motion-coherence instance segmentation. Uses the event file selected above.</p>
+      </section>
+      <div id="seg-params"></div>
+      <section class="row buttons">
+        <button id="seg-run" class="primary">Run segmentation</button>
+        <button id="seg-play" disabled>Play</button>
+        <button id="seg-pause" disabled>Pause</button>
+        <button id="seg-reset" disabled>Reset</button>
+      </section>
+      <section class="row">
+        <label>
+          Speed &times; <span id="seg-sp-val" class="num">1.0</span>
+          <input type="range" id="seg-sp" min="0.05" max="20" step="0.05" value="1" />
+        </label>
+      </section>
+      <section class="row seg-progress-row" id="seg-progress-row" hidden>
+        <div class="seg-progress-bar"><div id="seg-progress-fill"></div></div>
+        <span id="seg-progress-msg">—</span>
+      </section>
+      <section id="seg-msg" class="row msg"></section>
+    </div>
   </aside>
 
   <button id="show-hud" title="Show panel" hidden>&#x2630;</button>
 
   <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='js/seg.js') }}"></script>
 </body>
 </html>

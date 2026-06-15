@@ -14,6 +14,8 @@ from typing import Iterable
 import numpy as np
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
+from segment_api import register_segment_routes
+
 try:
     from scipy.io import loadmat as _scipy_loadmat
 except Exception:  # pragma: no cover
@@ -440,6 +442,9 @@ def get_events():
 @app.get("/favicon.ico")
 def favicon():
     return ("", 204)
+
+
+register_segment_routes(app, _load_raw_events, EVENTS_DIR)
 
 
 if __name__ == "__main__":
