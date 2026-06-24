@@ -140,7 +140,7 @@ class GraphCNN(nn.Module):
         pooled.index_add_(0, dst, messages)
         if average:
             degree = torch.zeros(num_nodes, 1, device=h_to_pool.device, dtype=h_to_pool.dtype)
-            degree.index_add_(0, dst.unsqueeze(1), torch.ones(E, 1, device=h_to_pool.device, dtype=h_to_pool.dtype))
+            degree.index_add_(0, dst, torch.ones(E, 1, device=h_to_pool.device, dtype=h_to_pool.dtype))
             degree = degree.clamp(min=1.0)
             pooled = pooled / degree
         return pooled
