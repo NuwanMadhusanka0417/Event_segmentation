@@ -8,17 +8,15 @@ coherence encoded as hypervectors (VSA / HRR) and refined by a few hops of the
 GVFA GraphCNN, then clustered online by cosine similarity inside each spatial
 connected component.
 
-NODE FEATURES: {x, y, t, vx, vy}.  Polarity is deliberately NOT used as a node
-feature (it carries edge contrast sign, not motion identity); it is still kept
-as a column in the saved output.
+NODE FEATURES (both graphs): {x, y, t} via FPE.  Polarity appears only in
+temporal edge features (Eq. 6); it is still kept as a column in saved output.
 
 PIPELINE
     load_events      -> read txt, take a time WINDOW (fast)
     build_multigraph -> spatial + temporal ellipsoid graphs (causal, past-only)
-    node_flow        -> per-node optical flow on the spatial graph
-    fpe_encode       -> fractional-power (HRR) hypervector per node from
-                        channels {x, y, t, vx, vy}
-    encode_nodes     -> edge-conditioned GVFA on each graph, concat H
+    fpe_encode       -> FPE hypervector per node from {x, y, t}
+    encode_nodes     -> edge-conditioned GVFA per graph (no reservoir/Sigma-Pi);
+                        bundle all hop-level vectors, then concat spatial|temporal
     assign           -> streaming prototype clustering, factored by component
     save             -> events_labeled.parquet + seg.png + console summary
 
@@ -40,9 +38,8 @@ PARAMETERS (constants below; edit them in place)
     MIN_EVENTS  objects smaller than this are treated as noise and relabeled to
                 background id -1 (default 80). Set to 0 to keep every object.
 
-    Secondary FPE bandwidths (POS_BW, TIME_BW, VEL_BW) control how fast the
-    hypervector code de-correlates along each channel; raise a bandwidth to make
-    that channel more discriminative. They are documented at their definitions.
+    Secondary FPE bandwidths (POS_BW, TIME_BW) control how fast the
+    hypervector code de-correlates along each channel.
 
 USAGE
     python segment.py                         # 30 ms window of events_filtered.txt
@@ -75,20 +72,15 @@ TEMPORAL_R_T_MS    = 40.0  # semi-major axis along time (ms)
 TEMPORAL_MMAX      = 12    # max past temporal neighbours per node
 
 D          = 4000     # hypervector dimensionality per graph branch
-NUM_LAYERS = 3        # GraphCNN layers incl. input (3 => 2 hops + tap buffer)
-USE_RESERVOIR = True  # VSA-RC tap buffer + Sigma-Pi readout (new GVFA)
+NUM_LAYERS = 3        # GraphCNN layers incl. input (3 => 2 hops)
+USE_RESERVOIR = False # no tap buffer / Sigma-Pi; hop vectors are bundled (summed)
 TAU        = 0.15     # cosine threshold to join an existing object (lower -> fewer objects)
 ALPHA      = 0.15     # prototype decayed-bundle update rate
 MIN_EVENTS = 150      # objects below this size -> background id -1 (0 = keep all)
 
-# FPE channel bandwidths: how many "turns" the code makes across the data range
-# of each channel. Bigger => nearby values stay similar over a shorter span =>
-# the channel is more discriminative. Velocity is the motion cue that separates
-# objects sharing a location, so it is the dominant one.
-POS_BW  = 1.0    # x, y  (small: position varies slowly -> within-object coherence)
-TIME_BW = 0.5    # t     (small: time varies slowly across the window)
-VEL_BW  = 6.0    # vx, vy (the dominant cue: plane-fit flow separates the movers)
-
+# FPE channel bandwidths for node features {x, y, t}
+POS_BW  = 1.0    # x, y
+TIME_BW = 0.5    # t
 SEED   = 0
 DEVICE = "cpu"
 
@@ -119,15 +111,23 @@ def _ellipsoid_metric(dx, dy, dt_ms, r_xy, r_t):
     return np.hypot(dx, dy) / r_xy + np.abs(dt_ms) / r_t
 
 
-def edge_features(rec, src, x, y, t, r_xy, r_t):
-    """Normalized Cartesian edge attributes e_ij = (dx, dy, dt) from source to
-    receiver: deltas are x_j - x_i, y_j - y_i, t_j - t_i, scaled by the graph
-    ellipsoid axes (Eq. 5 in the paper). Returns [E, 3] float64."""
-    dt_ms = (t[rec] - t[src]) * 1e3
-    dx = (x[rec] - x[src]) / r_xy
-    dy = (y[rec] - y[src]) / r_xy
-    dt = dt_ms / r_t
-    return np.stack([dx, dy, dt], axis=1)
+def edge_features_spatial(rec, src, x, y, t):
+    """Spatial edge features (Eq. 5): e_ij = (Δx, Δy, Δt) with
+    Δx = x_j - x_i, Δy = y_j - y_i, Δt = t_j - t_i  (receiver minus neighbour)."""
+    dx = x[rec] - x[src]
+    dy = y[rec] - y[src]
+    dt = t[rec] - t[src]
+    return np.stack([dx, dy, dt], axis=1).astype(np.float64)
+
+
+def edge_features_temporal(rec, src, x, y, t, p):
+    """Temporal edge features (Eq. 6): (Δx, Δy, Δt, Δx/Δt, Δy/Δt, Δp)."""
+    dx = x[rec] - x[src]
+    dy = y[rec] - y[src]
+    dt = t[rec] - t[src]
+    dp = p[rec] - p[src]
+    dt_safe = np.where(np.abs(dt) > 1e-12, dt, np.sign(dt) * 1e-12 + 1e-12)
+    return np.stack([dx, dy, dt, dx / dt_safe, dy / dt_safe, dp], axis=1).astype(np.float64)
 
 
 def _build_causal_ellipsoid_edges(t, x, y, r_xy, r_t, mmax):
@@ -183,7 +183,7 @@ def _build_causal_ellipsoid_edges(t, x, y, r_xy, r_t, mmax):
     return edge_index, rec, src
 
 
-def build_multigraph(t, x, y, sensor=SENSOR,
+def build_multigraph(t, x, y, p, sensor=SENSOR,
                      spatial_r_xy_frac=SPATIAL_R_XY_FRAC,
                      spatial_r_t_ms=SPATIAL_R_T_MS,
                      spatial_mmax=SPATIAL_MMAX,
@@ -192,13 +192,14 @@ def build_multigraph(t, x, y, sensor=SENSOR,
                      temporal_mmax=TEMPORAL_MMAX):
     """Build spatial (E_s) and temporal (E_t) causal ellipsoid graphs.
 
-    Spatial graph  — R_XY = 4% of sensor width, R_t = 5 ms,  max 16 neighbours.
-    Temporal graph — R_XY = 1% of sensor width, R_t = 40 ms, max 12 neighbours.
+    Spatial edges  — Eq. 5 features: (Δx, Δy, Δt).
+    Temporal edges — Eq. 6 features: (Δx, Δy, Δt, Δx/Δt, Δy/Δt, Δp).
 
     Returns
         edge_spatial, edge_temporal : torch.LongTensor [2, E]
-        edge_attr_spatial, edge_attr_temporal : np.ndarray [E, 3]
-        rec_s, src_s : int arrays for spatial connected components / flow
+        edge_attr_spatial  : np.ndarray [E, 3]
+        edge_attr_temporal : np.ndarray [E, 6]
+        rec_s, src_s : int arrays for spatial connected components
     """
     w, _ = sensor
     r_xy_s = spatial_r_xy_frac * w
@@ -209,8 +210,8 @@ def build_multigraph(t, x, y, sensor=SENSOR,
     edge_temporal, rec_t, src_t = _build_causal_ellipsoid_edges(
         t, x, y, r_xy_t, temporal_r_t_ms, temporal_mmax)
 
-    attr_spatial = edge_features(rec_s, src_s, x, y, t, r_xy_s, spatial_r_t_ms)
-    attr_temporal = edge_features(rec_t, src_t, x, y, t, r_xy_t, temporal_r_t_ms)
+    attr_spatial = edge_features_spatial(rec_s, src_s, x, y, t)
+    attr_temporal = edge_features_temporal(rec_t, src_t, x, y, t, p)
 
     return (edge_spatial, edge_temporal,
             attr_spatial, attr_temporal,
@@ -332,18 +333,10 @@ def _fpe_channel(values, base_phase, scale, chunk=4096):
     return out
 
 
-def fpe_encode(x, y, t, vx, vy, dim=D, sensor=(346, 260), seed=SEED):
-    """Build one normalized node hypervector per event by FPE-encoding each
-    channel {x, y, t, vx, vy} then bundling (sum + L2-normalize). No polarity.
-
-    Each channel gets one random base phasor. Channel values are mapped to the
-    FPE exponent through a normalize-then-bandwidth scaling so the code
-    de-correlates over the data range at a controllable rate."""
+def fpe_encode(x, y, t, dim=D, sensor=SENSOR, seed=SEED):
+    """FPE-encode node features {x, y, t} -> one L2-normalized hypervector [N, D]."""
     rng = np.random.default_rng(seed)
     W, H = sensor
-
-    speed = np.sqrt(vx ** 2 + vy ** 2)
-    vscale = np.percentile(speed, 95) + 1e-12
     t_ms = (t - t[0]) * 1e3
     t_span = max(t_ms.max(), 1e-6)
 
@@ -351,8 +344,6 @@ def fpe_encode(x, y, t, vx, vy, dim=D, sensor=(346, 260), seed=SEED):
         (x / W,          POS_BW),
         (y / H,          POS_BW),
         (t_ms / t_span,  TIME_BW),
-        (vx / vscale,    VEL_BW),
-        (vy / vscale,    VEL_BW),
     ]
 
     bundle = np.zeros((len(x), dim), dtype=np.float32)
@@ -511,26 +502,20 @@ def main():
     print("building spatial + temporal ellipsoid multigraph ...")
     (edge_spatial, edge_temporal,
      attr_spatial, attr_temporal,
-     rec, src) = build_multigraph(t, x, y)
+     rec, src) = build_multigraph(t, x, y, p)
     print(f"  spatial:  {edge_spatial.shape[1]} edges  "
-          f"(R_XY={SPATIAL_R_XY_FRAC*SENSOR[0]:.1f}px, R_t={SPATIAL_R_T_MS}ms)")
+          f"(attr dim=3: dx,dy,dt)")
     print(f"  temporal: {edge_temporal.shape[1]} edges  "
-          f"(R_XY={TEMPORAL_R_XY_FRAC*SENSOR[0]:.1f}px, R_t={TEMPORAL_R_T_MS}ms)")
+          f"(attr dim=6: dx,dy,dt,dx/dt,dy/dt,dp)")
 
     comp = connected_components(len(t), rec, src)
     print(f"  {comp.max()+1} spatial connected components")
 
-    vx, vy = node_flow(t, x, y, edge_spatial)
-    spd = np.hypot(vx, vy)
-    if (spd > 0).any():
-        print(f"  flow valid on {(spd>0).mean():.0%} of nodes  "
-              f"(median {np.median(spd[spd>0])/1e3:.2f} px/ms)")
-
-    print("FPE-encoding nodes ...")
-    x_hv = fpe_encode(x, y, t, vx, vy)
+    print("FPE-encoding nodes (x, y, t) ...")
+    x_hv = fpe_encode(x, y, t)
 
     print(f"running edge-conditioned GVFA ({NUM_LAYERS} layers, "
-          f"reservoir={USE_RESERVOIR}) on each graph ...")
+          f"hop-bundle sum, no reservoir) on each graph ...")
     H = encode_nodes_multigraph(
         x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal)
     print(f"  concatenated hypervectors: {H.shape[1]} dims ({D} spatial + {D} temporal)")

@@ -40,7 +40,7 @@ def encode_graph(
     num_layers=3,
     edge_feat_dim=3,
     device="cpu",
-    use_reservoir=True,
+    use_reservoir=False,
     delta=1,
     equation=10,
     rng_seed=0,

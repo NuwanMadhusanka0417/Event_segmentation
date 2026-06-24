@@ -501,7 +501,8 @@ class GraphCNN(nn.Module):
             )
 
         if return_node_rep:
-            H = hidden_rep[-1]
+            # Bundle (sum) hypervectors from input layer + every hop level.
+            H = torch.stack(hidden_rep, dim=0).sum(dim=0)
             batch = torch.zeros(N, dtype=torch.long, device=H.device)
             for b in range(B):
                 batch[start_idx[b] : start_idx[b + 1]] = b
