@@ -1,6 +1,6 @@
 ssh nk8155@gadi.nci.org.au
 
-qsub -I  -l walltime=15:00:00,mem=30GB,ncpus=12,jobfs=30GB -P mi23 -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+qsub -I  -l walltime=20:00:00,mem=30GB,ncpus=12,jobfs=30GB -P mi23 -l storage=gdata/jq77+scratch/jq77+scratch/mi23
 
 module load python3/3.9.2
 source /scratch/jq77/nk8155/seg/bin/activate
@@ -9,9 +9,9 @@ cd /g/data/jq77/nuwan/Event_segmentation/GVFA
 python segment.py
 
 
-python segment.py --tau 0.12  --window-ms 30
+python segment.py --tau 0.12  --window-ms 30    # even fewer objects (~5)
 
-python segment.py --tau 0.18  --window-ms 30
+python segment.py --tau 0.18  --window-ms 30    # slightly more objects (~8)
 
 
 ---------------------------------------------------------------
