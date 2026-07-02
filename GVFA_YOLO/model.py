@@ -165,8 +165,8 @@ def detection_loss(preds, pos_xy, gt_boxes, gt_classes, n_classes):
         loss_iou = torch.zeros((), device=device)
 
     total = loss_cls + loss_obj + 2.0 * loss_iou + loss_l1
-    return total, {"cls": float(loss_cls), "obj": float(loss_obj),
-                   "iou": float(loss_iou), "l1": float(loss_l1),
+    return total, {"cls": loss_cls.detach().item(), "obj": loss_obj.detach().item(),
+                   "iou": loss_iou.detach().item(), "l1": loss_l1.detach().item(),
                    "n_pos": int(pos_mask.sum())}
 
 

@@ -145,6 +145,8 @@ def _run_epoch(encoder, head, ds, device, optimizer=None, scaler=None):
     running = {}
     all_preds, all_gts = [], []
     use_amp = scaler is not None and device == "cuda"
+    n_seen = 0
+    n_skipped = 0
 
     indices = list(range(len(ds)))
     if train:
@@ -153,6 +155,10 @@ def _run_epoch(encoder, head, ds, device, optimizer=None, scaler=None):
     for i in indices:
         sample = ds[i]
         ev, gt_boxes, gt_cls = _sample_to_tensors(sample, device)
+        if ev.shape[0] == 0:
+            n_skipped += 1
+            continue
+        n_seen += 1
         with torch.no_grad():
             H, pos = encoder(ev)
         if train:
@@ -179,8 +185,10 @@ def _run_epoch(encoder, head, ds, device, optimizer=None, scaler=None):
             all_gts.append((gxyxy.cpu(), gl.cpu()))
 
     if train:
-        n = max(len(ds), 1)
+        n = max(n_seen, 1)
         msg = " ".join(f"{k}={running[k] / n:.3f}" for k in ("cls", "obj", "iou", "l1"))
+        if n_skipped:
+            msg += f"  skipped_empty={n_skipped}"
         return msg, None
     return None, (all_preds, all_gts)
 

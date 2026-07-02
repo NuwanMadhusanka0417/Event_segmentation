@@ -1,6 +1,6 @@
 ssh nk8155@gadi.nci.org.au
 
-qsub -I  -l walltime=20:00:00,mem=30GB,ncpus=12,jobfs=30GB -P mi23 -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+qsub -I  -l walltime=20:00:00,mem=190GB,ncpus=12,jobfs=50GB -P mi23 -l storage=gdata/jq77+scratch/jq77+scratch/mi23
 
 module load python3/3.9.2
 source /scratch/jq77/nk8155/seg/bin/activate

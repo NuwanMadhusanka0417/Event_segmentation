@@ -19,12 +19,14 @@ qsub -I  -l walltime=15:00:00,mem=100GB,ncpus=7,jobfs=100GB -P mi23 -l storage=g
 ------------------------------------------------------------------
 source /scratch/jq77/nk8155/nv2/bin/activate
 
+cd "/g/data/jq77/nuwan/Event_segmentation/GVFA_YOLO/"
+
 Extract data 
 7z x Data/Prophesee/val_a.7z   -oData/Prophesee/val_a
 
 
 Step 2 — Train (streaming loader — full train_a OK at ~30–40GB with max_events 15000)
-python train.py train --data_dir Data/Prophesee/train_a --val_dir Data/Prophesee/val_a --window_ms 50 --epochs 10 --max_events 15000 --ckpt checkpoints/head.pt
+python train.py train --data_dir ../Data/train_a --val_dir ../Data//val_a --window_ms 50 --epochs 10 --max_events 15000 --ckpt checkpoints/head.pt 
 
 Debug run
 python train.py train --data_dir ../Data/Prophesee/train_a --max_recordings 2 --max_windows 20 --max_events 15000 --epochs 2

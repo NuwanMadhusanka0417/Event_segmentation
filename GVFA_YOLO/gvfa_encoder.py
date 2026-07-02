@@ -79,6 +79,11 @@ class GVFAEncoder(nn.Module):
     @torch.no_grad()
     def forward(self, events):
         ev = np.asarray(events, dtype=np.float64)
+        if ev.size == 0 or ev.shape[0] == 0:
+            empty = torch.zeros((0, self.dim), device=self.device)
+            pos = torch.zeros((0, 2), dtype=torch.float32, device=self.device)
+            return empty, pos
+
         t_us, x, y, p = ev[:, 0], ev[:, 1], ev[:, 2], ev[:, 3]
         t_sec = t_us / 1e6
 

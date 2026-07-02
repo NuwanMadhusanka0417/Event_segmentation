@@ -40,6 +40,9 @@ def edge_features_temporal(rec, src, x, y, t, p):
 
 
 def _build_causal_ellipsoid_edges(t, x, y, r_xy, r_t, mmax):
+    if len(t) == 0:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        return edge_index, np.empty(0, np.int64), np.empty(0, np.int64)
     t_ms = (t - t[0]) * 1e3
     xy = np.stack([x, y], axis=1).astype(np.float64)
 
@@ -97,6 +100,12 @@ def build_multigraph(t, x, y, p, sensor=SENSOR,
 
     `t` must be in seconds (monotone).  Returns edge indices and edge attrs.
     """
+    if len(t) == 0:
+        ei = torch.zeros((2, 0), dtype=torch.long)
+        ea_s = np.zeros((0, 3), dtype=np.float64)
+        ea_t = np.zeros((0, 6), dtype=np.float64)
+        return ei, ei, ea_s, ea_t, np.empty(0, np.int64), np.empty(0, np.int64)
+
     w, _ = sensor
     r_xy_s = spatial_r_xy_frac * w
     r_xy_t = temporal_r_xy_frac * w
