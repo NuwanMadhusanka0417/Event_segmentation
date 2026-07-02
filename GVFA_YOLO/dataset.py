@@ -1,14 +1,12 @@
 """
 Pluggable event-camera DETECTION dataset adapters.
 
-Contract -- every dataset yields, per event window:
-    events : (N, 4) float32  [t_us, x, y, p]            (p in {0,1})
-    boxes  : (M, 5) float32  [class, xc, yc, w, h]      (pixels; class in [0,N_CLASSES))
+Lightweight Prophesee loading: index windows from mmap metadata only;
+load one event window at a time on __getitem__ (no full .dat in RAM).
 
-Provided here:
-  * PropheseeDetectionDataset : Prophesee Gen1 Automotive Detection (*.td.dat + *_bbox.npy)
-  * Gen1ETraMDataset            : legacy single-file txt + npy adapter
-  * load_unlabeled              : forward-pass smoke test only
+Contract -- every dataset yields, per event window:
+    events : (N, 4) float32  [t_us, x, y, p]
+    boxes  : (M, 5) float32  [class, xc, yc, w, h]
 """
 
 import os
@@ -18,7 +16,10 @@ from torch.utils.data import Dataset
 from model import WINDOW_MS, MS_TO_US, N_CLASSES
 from prophesee_io import (
     find_prophesee_pairs,
-    load_prophesee_recording,
+    probe_dat,
+    window_ranges,
+    DatWindowReader,
+    load_prophesee_bbox,
     boxes_in_window,
     PROPHESEE_CLASS_NAMES,
     PROPHESEE_SENSOR_W,
@@ -30,7 +31,6 @@ from prophesee_io import (
 #                           raw event stream loader                           #
 # --------------------------------------------------------------------------- #
 def load_events_txt(path, t_scale_to_us=True):
-    """Load a space-separated event file: timestamp x y polarity."""
     arr = np.loadtxt(path, dtype=np.float64)
     if arr.ndim == 1:
         arr = arr[None, :]
@@ -46,7 +46,6 @@ def load_events_txt(path, t_scale_to_us=True):
 
 
 def slice_windows(events, window_ms=WINDOW_MS):
-    """Split an event array into consecutive time windows. Yields (start_us, ev)."""
     if events.shape[0] == 0:
         return
     win_us = window_ms * MS_TO_US
@@ -63,19 +62,21 @@ def slice_windows(events, window_ms=WINDOW_MS):
 #                       Prophesee Gen1 Automotive Detection                  #
 # --------------------------------------------------------------------------- #
 class PropheseeDetectionDataset(Dataset):
-    """Prophesee Gen1 detection: paired *_td.dat + *_bbox.npy in one folder.
+    """Prophesee Gen1 detection — streaming one window at a time.
 
-    Scans `data_dir` recursively for recording pairs, slices each into
-    `window_ms` time windows, and returns GT boxes active in each window.
+    At init: probes each .dat (mmap first/last timestamp only) to build a
+    lightweight window index.  On __getitem__: loads just that window's events
+    via mmap + binary search; bbox .npy cached per recording (small).
     """
 
     CLASS_NAMES = PROPHESEE_CLASS_NAMES
 
     def __init__(self, data_dir, window_ms=WINDOW_MS, max_events=40000,
-                 max_recordings=None, max_windows=None):
+                 max_recordings=None, max_windows=None, reader_cache_size=1):
         self.data_dir = data_dir
         self.window_ms = window_ms
         self.max_events = max_events
+        self.reader_cache_size = max(1, reader_cache_size)
         self.pairs = find_prophesee_pairs(data_dir)
         if max_recordings is not None:
             self.pairs = self.pairs[:max_recordings]
@@ -85,49 +86,88 @@ class PropheseeDetectionDataset(Dataset):
                 "Extract train_a.7z / val_a.7z first."
             )
 
-        self._cache = {}
+        self._rec_meta = []
         self._flat = []
+        self._bbox_cache = {}
+        self._reader_cache = {}
+        self._reader_order = []
         self.sensor = (PROPHESEE_SENSOR_W, PROPHESEE_SENSOR_H)
         self._build_index(max_windows)
 
-    def _load_recording(self, rec_i):
-        if rec_i in self._cache:
-            return self._cache[rec_i]
-        dat_path, bbox_path = self.pairs[rec_i]
-        events, boxes, sensor, name = load_prophesee_recording(dat_path, bbox_path)
-        windows = list(slice_windows(events, self.window_ms))
-        rec = dict(events=events, boxes=boxes, sensor=sensor, name=name, windows=windows)
-        self._cache[rec_i] = rec
-        self.sensor = sensor
-        return rec
-
     def _build_index(self, max_windows):
-        for rec_i in range(len(self.pairs)):
-            rec = self._load_recording(rec_i)
-            for win_i in range(len(rec["windows"])):
-                self._flat.append((rec_i, win_i))
+        """Build window list from mmap probes only — no event arrays loaded."""
+        for dat_path, bbox_path in self.pairs:
+            meta = probe_dat(dat_path)
+            meta["dat_path"] = dat_path
+            meta["bbox_path"] = bbox_path
+            rec_i = len(self._rec_meta)
+            self._rec_meta.append(meta)
+            self.sensor = meta["sensor"]
+
+            for win_i, t_start, t_end in window_ranges(
+                    meta["t0"], meta["t_last"], self.window_ms):
+                self._flat.append((rec_i, win_i, t_start, t_end))
                 if max_windows is not None and len(self._flat) >= max_windows:
                     return
+
+    def _get_boxes(self, rec_i):
+        if rec_i not in self._bbox_cache:
+            meta = self._rec_meta[rec_i]
+            self._bbox_cache[rec_i] = load_prophesee_bbox(
+                meta["bbox_path"], t0_us=meta["t0"])
+        return self._bbox_cache[rec_i]
+
+    def _get_reader(self, rec_i):
+        if rec_i in self._reader_cache:
+            self._reader_order.remove(rec_i)
+            self._reader_order.append(rec_i)
+            return self._reader_cache[rec_i]
+
+        while len(self._reader_cache) >= self.reader_cache_size:
+            old = self._reader_order.pop(0)
+            r = self._reader_cache.pop(old, None)
+            if r is not None:
+                r.close()
+
+        meta = self._rec_meta[rec_i]
+        reader = DatWindowReader(meta["dat_path"])
+        self._reader_cache[rec_i] = reader
+        self._reader_order.append(rec_i)
+        return reader
 
     def __len__(self):
         return len(self._flat)
 
     def __getitem__(self, i):
-        rec_i, win_i = self._flat[i]
-        rec = self._load_recording(rec_i)
-        w_start, ev = rec["windows"][win_i]
+        rec_i, win_i, t_start, t_end = self._flat[i]
+        meta = self._rec_meta[rec_i]
+        reader = self._get_reader(rec_i)
+        ev = reader.load_window(t_start, t_end)
+
         if ev.shape[0] > self.max_events:
             sel = np.linspace(0, ev.shape[0] - 1, self.max_events).astype(int)
             ev = ev[sel]
-        w_end = w_start + self.window_ms * MS_TO_US
-        boxes = boxes_in_window(rec["boxes"], w_start, w_end)
+
+        boxes = boxes_in_window(self._get_boxes(rec_i), t_start, t_end)
         return {
             "events": ev,
             "boxes": boxes.astype(np.float32),
-            "sensor": rec["sensor"],
-            "name": rec["name"],
+            "sensor": meta["sensor"],
+            "name": meta["stem"],
             "window_idx": win_i,
         }
+
+    def close(self):
+        for r in self._reader_cache.values():
+            r.close()
+        self._reader_cache.clear()
+        self._reader_order.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -176,7 +216,6 @@ class Gen1ETraMDataset(DetectionWindowDataset):
 
 
 def make_dataset(args):
-    """Factory: build dataset from CLI args."""
     if getattr(args, "dataset", "prophesee") == "prophesee":
         data_dir = args.data_dir
         if not data_dir:
@@ -187,6 +226,7 @@ def make_dataset(args):
             max_events=args.max_events,
             max_recordings=getattr(args, "max_recordings", None),
             max_windows=getattr(args, "max_windows", None),
+            reader_cache_size=getattr(args, "reader_cache_size", 1),
         )
     if not args.events:
         raise ValueError("--events is required for txt dataset")
@@ -195,9 +235,6 @@ def make_dataset(args):
                             max_events=args.max_events)
 
 
-# --------------------------------------------------------------------------- #
-#                       unlabeled forward-only smoke test                       #
-# --------------------------------------------------------------------------- #
 def load_unlabeled(path="events_filtered.txt", window_ms=WINDOW_MS, max_events=40000):
     events = load_events_txt(path)
     first = next(slice_windows(events, window_ms), (0.0, events[:0]))[1]

@@ -21,9 +21,21 @@ PROPHESEE_SENSOR_H = 240
 PROPHESEE_CLASS_NAMES = ["car", "pedestrian"]
 
 _EV_DTYPE = [("t", "u4"), ("_", "i4")]
+_EV_ITEMSIZE = np.dtype(_EV_DTYPE).itemsize
 _X_MASK = 2**14 - 1
 _Y_MASK = 2**28 - 2**14
 _P_MASK = 2**29 - 2**28
+
+
+def _raw_to_events(raw, t0):
+    """Decode a raw Event2D chunk -> float32 [N,4] with relative timestamps."""
+    if raw.size == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+    t_abs = raw["t"].astype(np.float64)
+    x = np.bitwise_and(raw["_"], _X_MASK).astype(np.float64)
+    y = np.right_shift(np.bitwise_and(raw["_"], _Y_MASK), 14).astype(np.float64)
+    p = np.right_shift(np.bitwise_and(raw["_"], _P_MASK), 28).astype(np.float64)
+    return np.stack([t_abs - t0, x, y, p.clip(0, 1)], axis=1).astype(np.float32)
 
 
 def parse_dat_header(f):
@@ -55,6 +67,103 @@ def parse_dat_header(f):
     return bod, ev_type, ev_size, tuple(size)
 
 
+def probe_dat(dat_path):
+    """Read only metadata from a .dat file (mmap; no full load into RAM).
+
+    Returns dict with keys: t0, t_last, sensor (w,h), n_events, bod, stem.
+    """
+    with open(dat_path, "rb") as f:
+        bod, ev_type, ev_size, size = parse_dat_header(f)
+        if ev_type != 0:
+            raise ValueError(f"Unsupported DAT event type {ev_type} in {dat_path}")
+    w = int(size[1] or PROPHESEE_SENSOR_W)
+    h = int(size[0] or PROPHESEE_SENSOR_H)
+    stem = Path(dat_path).stem.replace("_td", "")
+    fsize = os.path.getsize(dat_path)
+    n_events = max(0, (fsize - bod) // _EV_ITEMSIZE)
+    if n_events == 0:
+        return dict(t0=0.0, t_last=0.0, sensor=(w, h), n_events=0, bod=bod, stem=stem)
+    mm = np.memmap(dat_path, dtype=np.dtype(_EV_DTYPE), mode="r", offset=bod,
+                   shape=(n_events,))
+    t0 = float(mm["t"][0])
+    t_last = float(mm["t"][-1])
+    del mm
+    return dict(t0=t0, t_last=t_last, sensor=(w, h), n_events=n_events, bod=bod, stem=stem)
+
+
+class DatWindowReader:
+    """Memory-mapped .dat reader; loads one time window at a time."""
+
+    def __init__(self, dat_path):
+        self.dat_path = dat_path
+        self.meta = probe_dat(dat_path)
+        self._mm = np.memmap(
+            dat_path, dtype=np.dtype(_EV_DTYPE), mode="r",
+            offset=self.meta["bod"], shape=(self.meta["n_events"],),
+        )
+
+    @property
+    def t0(self):
+        return self.meta["t0"]
+
+    @property
+    def sensor(self):
+        return self.meta["sensor"]
+
+    @property
+    def stem(self):
+        return self.meta["stem"]
+
+    def load_window(self, t_start_rel, t_end_rel):
+        """Load events with relative timestamps in [t_start_rel, t_end_rel) us."""
+        if self.meta["n_events"] == 0:
+            return np.zeros((0, 4), dtype=np.float32)
+        t_lo = self.t0 + float(t_start_rel)
+        t_hi = self.t0 + float(t_end_rel)
+        i0 = int(np.searchsorted(self._mm["t"], t_lo, side="left"))
+        i1 = int(np.searchsorted(self._mm["t"], t_hi, side="left"))
+        if i1 <= i0:
+            return np.zeros((0, 4), dtype=np.float32)
+        return _raw_to_events(np.asarray(self._mm[i0:i1]), self.t0)
+
+    def close(self):
+        mm = getattr(self, "_mm", None)
+        if mm is not None:
+            del self._mm
+            self._mm = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def load_prophesee_window(dat_path, t_start_rel, t_end_rel, reader=None):
+    """Load one event window without reading the full recording."""
+    if reader is not None:
+        return reader.load_window(t_start_rel, t_end_rel)
+    r = DatWindowReader(dat_path)
+    try:
+        return r.load_window(t_start_rel, t_end_rel)
+    finally:
+        r.close()
+
+
+def window_ranges(t0, t_last, window_ms):
+    """Yield (win_i, t_start_rel, t_end_rel) for relative-us windows."""
+    if t_last <= t0:
+        yield 0, 0.0, window_ms * 1000.0
+        return
+    win_us = window_ms * 1000.0
+    span = t_last - t0
+    n = max(1, int(np.ceil(span / win_us)))
+    for wi in range(n):
+        ts = wi * win_us
+        te = min((wi + 1) * win_us, span + 1.0)
+        yield wi, ts, te
+
+
 def load_prophesee_recording(dat_path, bbox_path):
     """Load paired *_td.dat + *_bbox.npy with aligned relative timestamps.
 
@@ -78,12 +187,8 @@ def load_prophesee_recording(dat_path, bbox_path):
         boxes = load_prophesee_bbox(bbox_path, t0_us=0.0)
         return np.zeros((0, 4), dtype=np.float32), boxes, (w, h), stem
 
-    t_abs = raw["t"].astype(np.float64)
-    t0 = float(t_abs[0])
-    x = np.bitwise_and(raw["_"], _X_MASK).astype(np.float64)
-    y = np.right_shift(np.bitwise_and(raw["_"], _Y_MASK), 14).astype(np.float64)
-    p = np.right_shift(np.bitwise_and(raw["_"], _P_MASK), 28).astype(np.float64)
-    events = np.stack([t_abs - t0, x, y, p.clip(0, 1)], axis=1).astype(np.float32)
+    t0 = float(raw["t"][0])
+    events = _raw_to_events(raw, t0)
     boxes = load_prophesee_bbox(bbox_path, t0_us=t0)
     return events, boxes, (w, h), stem
 
@@ -104,13 +209,8 @@ def load_prophesee_dat(path):
     h = int(size[0] or PROPHESEE_SENSOR_H)
     if raw.size == 0:
         return np.zeros((0, 4), dtype=np.float32), (w, h)
-    t_abs = raw["t"].astype(np.float64)
-    t0 = float(t_abs[0])
-    x = np.bitwise_and(raw["_"], _X_MASK).astype(np.float64)
-    y = np.right_shift(np.bitwise_and(raw["_"], _Y_MASK), 14).astype(np.float64)
-    p = np.right_shift(np.bitwise_and(raw["_"], _P_MASK), 28).astype(np.float64)
-    events = np.stack([t_abs - t0, x, y, p.clip(0, 1)], axis=1).astype(np.float32)
-    return events, (w, h)
+    t0 = float(raw["t"][0])
+    return _raw_to_events(raw, t0), (w, h)
 
 
 def load_prophesee_bbox(path, t0_us=None):

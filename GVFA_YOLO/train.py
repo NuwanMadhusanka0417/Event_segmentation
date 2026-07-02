@@ -7,8 +7,11 @@ Prophesee Gen1 Automotive Detection
   #    7z x ../Data/Prophesee/train_a.7z -o../Data/Prophesee/train_a
   #    7z x ../Data/Prophesee/val_a.7z   -o../Data/Prophesee/val_a
 
-  # 2) Train:
+  # 2) Train (streaming: one window at a time, low RAM):
   python train.py train --data_dir ../Data/Prophesee/train_a --val_dir ../Data/Prophesee/val_a
+
+  Recommended for ~30GB RAM:
+  python train.py train --data_dir ../Data/Prophesee/train_a --max_events 15000
 
   # 3) Eval mAP:
   python train.py eval --data_dir ../Data/Prophesee/val_a --ckpt head.pt
@@ -187,7 +190,7 @@ def _run_epoch(encoder, head, ds, device, optimizer=None, scaler=None):
 # --------------------------------------------------------------------------- #
 def train(args):
     device = get_device()
-    print(f"[train] device={device}")
+    print(f"[train] device={device}  (streaming window loader — no full .dat in RAM)")
     ds = make_dataset(args)
     sensor = configure_sensor(ds)
     print(f"[train] sensor={sensor[0]}x{sensor[1]}  windows={len(ds)}  "
@@ -199,88 +202,102 @@ def train(args):
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     val_ds = None
-    if args.val_dir:
-        val_ds = PropheseeDetectionDataset(
-            args.val_dir, window_ms=args.window_ms, max_events=args.max_events,
-            max_recordings=args.max_recordings, max_windows=args.max_windows,
-        )
-        configure_sensor(val_ds)
+    try:
+        if args.val_dir:
+            val_ds = PropheseeDetectionDataset(
+                args.val_dir, window_ms=args.window_ms, max_events=args.max_events,
+                max_recordings=args.max_recordings, max_windows=args.max_windows,
+                reader_cache_size=args.reader_cache_size,
+            )
+            configure_sensor(val_ds)
 
-    for epoch in range(args.epochs):
-        msg, _ = _run_epoch(encoder, head, ds, device, opt, scaler)
-        print(f"[epoch {epoch}] train {msg}")
-        if val_ds is not None:
-            _, (vp, vg) = _run_epoch(encoder, head, val_ds, device)
-            mAP, ap50 = coco_map(vp, vg, args.n_classes)
-            print(f"[epoch {epoch}] val   mAP@[.5:.95]={mAP:.4f}  "
-                  + "  ".join(f"AP50_{PROPHESEE_CLASS_NAMES[c]}={ap50[c]:.3f}"
-                             for c in range(args.n_classes)))
+        for epoch in range(args.epochs):
+            msg, _ = _run_epoch(encoder, head, ds, device, opt, scaler)
+            print(f"[epoch {epoch}] train {msg}")
+            if val_ds is not None:
+                _, (vp, vg) = _run_epoch(encoder, head, val_ds, device)
+                mAP, ap50 = coco_map(vp, vg, args.n_classes)
+                print(f"[epoch {epoch}] val   mAP@[.5:.95]={mAP:.4f}  "
+                      + "  ".join(f"AP50_{PROPHESEE_CLASS_NAMES[c]}={ap50[c]:.3f}"
+                                 for c in range(args.n_classes)))
 
-    os.makedirs(os.path.dirname(args.ckpt) or ".", exist_ok=True)
-    torch.save(head.state_dict(), args.ckpt)
-    print(f"[train] saved head -> {args.ckpt}")
+        os.makedirs(os.path.dirname(args.ckpt) or ".", exist_ok=True)
+        torch.save(head.state_dict(), args.ckpt)
+        print(f"[train] saved head -> {args.ckpt}")
+    finally:
+        if hasattr(ds, "close"):
+            ds.close()
+        if val_ds is not None and hasattr(val_ds, "close"):
+            val_ds.close()
 
 
 @torch.no_grad()
 def evaluate(args):
     device = get_device()
     ds = make_dataset(args)
-    sensor = configure_sensor(ds)
-    print(f"[eval] sensor={sensor}  windows={len(ds)}")
-    encoder, head = build_models(device, args.n_classes, sensor=sensor)
-    if args.ckpt:
-        head.load_state_dict(torch.load(args.ckpt, map_location=device))
-    _, (all_preds, all_gts) = _run_epoch(encoder, head, ds, device)
-    mAP, ap50 = coco_map(all_preds, all_gts, args.n_classes)
-    print(f"[eval] mAP@[.5:.95] = {mAP:.4f}")
-    for c in range(args.n_classes):
-        name = PROPHESEE_CLASS_NAMES[c] if c < len(PROPHESEE_CLASS_NAMES) else str(c)
-        print(f"       AP@0.5 {name}: {ap50[c]:.4f}")
-    return mAP
+    try:
+        sensor = configure_sensor(ds)
+        print(f"[eval] sensor={sensor}  windows={len(ds)}")
+        encoder, head = build_models(device, args.n_classes, sensor=sensor)
+        if args.ckpt:
+            head.load_state_dict(torch.load(args.ckpt, map_location=device))
+        _, (all_preds, all_gts) = _run_epoch(encoder, head, ds, device)
+        mAP, ap50 = coco_map(all_preds, all_gts, args.n_classes)
+        print(f"[eval] mAP@[.5:.95] = {mAP:.4f}")
+        for c in range(args.n_classes):
+            name = PROPHESEE_CLASS_NAMES[c] if c < len(PROPHESEE_CLASS_NAMES) else str(c)
+            print(f"       AP@0.5 {name}: {ap50[c]:.4f}")
+        return mAP
+    finally:
+        if hasattr(ds, "close"):
+            ds.close()
 
 
 @torch.no_grad()
 def test_and_save_frames(args):
-    """Run inference and save event-stream frames with predicted (and GT) boxes."""
     device = get_device()
     ds = make_dataset(args)
-    sensor = configure_sensor(ds)
-    sw, sh = sensor
-    print(f"[test] sensor={sensor}  windows={len(ds)}  out_dir={args.out_dir}")
+    try:
+        sensor = configure_sensor(ds)
+        sw, sh = sensor
+        print(f"[test] sensor={sensor}  windows={len(ds)}  out_dir={args.out_dir}")
 
-    encoder, head = build_models(device, args.n_classes, sensor=sensor)
-    if args.ckpt:
-        head.load_state_dict(torch.load(args.ckpt, map_location=device))
-    head.eval()
+        encoder, head = build_models(device, args.n_classes, sensor=sensor)
+        if args.ckpt:
+            head.load_state_dict(torch.load(args.ckpt, map_location=device))
+        head.eval()
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    saved = 0
-    for i in range(len(ds)):
-        sample = ds[i]
-        ev, gt_boxes, gt_cls = _sample_to_tensors(sample, device)
-        H, pos = encoder(ev)
-        preds = head(H)
-        pb, ps, pl = postprocess(preds, pos, score_thr=args.score_thr)
+        os.makedirs(args.out_dir, exist_ok=True)
+        saved = 0
+        for i in range(len(ds)):
+            sample = ds[i]
+            ev, gt_boxes, gt_cls = _sample_to_tensors(sample, device)
+            H, pos = encoder(ev)
+            preds = head(H)
+            pb, ps, pl = postprocess(preds, pos, score_thr=args.score_thr)
 
-        gt_xyxy = None
-        gt_labels = None
-        if gt_boxes.shape[0]:
-            gx, gy, gw, gh = gt_boxes.unbind(1)
-            gt_xyxy = torch.stack([gx - gw / 2, gy - gh / 2, gx + gw / 2, gy + gh / 2], 1).cpu().numpy()
-            gt_labels = gt_cls.cpu().numpy()
+            gt_xyxy = None
+            gt_labels = None
+            if gt_boxes.shape[0]:
+                gx, gy, gw, gh = gt_boxes.unbind(1)
+                gt_xyxy = torch.stack([gx - gw / 2, gy - gh / 2, gx + gw / 2, gy + gh / 2], 1).cpu().numpy()
+                gt_labels = gt_cls.cpu().numpy()
 
-        rec_name = sample.get("name", f"sample_{i:05d}")
-        win_idx = sample.get("window_idx", i)
-        out_path = os.path.join(args.out_dir, rec_name, f"win_{win_idx:05d}.png")
-        save_detection_frame(
-            out_path, ev, sw, sh, pb, pl, ps,
-            gt_boxes=gt_xyxy, gt_labels=gt_labels,
-        )
-        saved += 1
-        if saved % 20 == 0:
-            print(f"[test] saved {saved}/{len(ds)} frames ...")
+            rec_name = sample.get("name", f"sample_{i:05d}")
+            win_idx = sample.get("window_idx", i)
+            out_path = os.path.join(args.out_dir, rec_name, f"win_{win_idx:05d}.png")
+            save_detection_frame(
+                out_path, ev, sw, sh, pb, pl, ps,
+                gt_boxes=gt_xyxy, gt_labels=gt_labels,
+            )
+            saved += 1
+            if saved % 20 == 0:
+                print(f"[test] saved {saved}/{len(ds)} frames ...")
 
-    print(f"[test] done — {saved} frames in {args.out_dir}")
+        print(f"[test] done — {saved} frames in {args.out_dir}")
+    finally:
+        if hasattr(ds, "close"):
+            ds.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -330,6 +347,8 @@ def main():
                     help="Limit number of Prophesee recordings (debug)")
     ap.add_argument("--max_windows", type=int, default=None,
                     help="Limit total windows across dataset (debug)")
+    ap.add_argument("--reader_cache_size", type=int, default=1,
+                    help="Max mmap .dat readers kept open (default 1 = lowest RAM)")
     ap.add_argument("--n_classes", type=int, default=N_CLASSES)
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--score_thr", type=float, default=0.3)

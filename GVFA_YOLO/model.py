@@ -26,7 +26,7 @@ from gvfa_encoder import GVFAEncoder
 SENSOR_W = 346
 SENSOR_H = 260
 
-WINDOW_MS = 50.0
+WINDOW_MS = 5.0
 D = 4000
 NUM_LAYERS = 3
 
