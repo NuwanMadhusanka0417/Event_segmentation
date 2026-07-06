@@ -51,13 +51,18 @@ def configure_sensor(ds):
     return (w, h)
 
 
-def build_models(device, n_classes=N_CLASSES, sensor=None):
+def build_models(device, n_classes=N_CLASSES, sensor=None, verbose=False):
+    if verbose:
+        print("[init] building GVFAEncoder + PointwiseYOLO...")
     sensor_tuple = sensor or (304, 240)
     encoder = GVFAEncoder(
         dim=D, num_layers=NUM_LAYERS, device=device, sensor=sensor_tuple,
+        verbose_init=verbose,
     ).to(device)
     encoder.eval()
     head = PointwiseYOLO(dim=D, n_classes=n_classes).to(device)
+    if verbose:
+        print(f"[init] models on {device}  (encoder frozen, head trainable)")
     return encoder, head
 
 
@@ -135,7 +140,8 @@ def _sample_to_tensors(sample, device):
     return ev, gt_boxes, gt_cls
 
 
-def _run_epoch(encoder, head, ds, device, optimizer=None, scaler=None):
+def _run_epoch(encoder, head, ds, device, optimizer=None, scaler=None,
+               verbose=False, verbose_every=100):
     train = optimizer is not None
     if train:
         head.train()
@@ -159,9 +165,17 @@ def _run_epoch(encoder, head, ds, device, optimizer=None, scaler=None):
             n_skipped += 1
             continue
         n_seen += 1
+        show = verbose and (n_seen <= 3 or n_seen % verbose_every == 0)
+        if show:
+            print(f"\n[step] window idx={i}  (#{n_seen})  events={ev.shape[0]}  "
+                  f"gt_boxes={gt_boxes.shape[0]}")
         with torch.no_grad():
-            H, pos = encoder(ev)
+            H, pos = encoder(ev, verbose=show)
+        if show:
+            print(f"[step] GVFA done  H={tuple(H.shape)}  pos={tuple(pos.shape)}")
         if train:
+            if show:
+                print("[step] detection head forward + SimOTA loss...")
             optimizer.zero_grad()
             with torch.autocast(device_type=device, enabled=use_amp):
                 preds = head(H)
@@ -169,12 +183,21 @@ def _run_epoch(encoder, head, ds, device, optimizer=None, scaler=None):
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            if show:
+                print(f"[step] backward done  loss={loss.item():.4f}  "
+                      f"n_pos={parts['n_pos']}  "
+                      f"cls={parts['cls']:.3f} obj={parts['obj']:.3f} "
+                      f"iou={parts['iou']:.3f} l1={parts['l1']:.3f}")
             for k, v in parts.items():
                 if k != "n_pos":
                     running[k] = running.get(k, 0.0) + v
         else:
+            if show:
+                print("[step] detection head forward + NMS...")
             preds = head(H)
             pb, ps, pl = postprocess(preds, pos)
+            if show:
+                print(f"[step] NMS done  detections={pb.shape[0]}")
             all_preds.append((pb.cpu(), ps.cpu(), pl.cpu()))
             if gt_boxes.shape[0]:
                 gx, gy, gw, gh = gt_boxes.unbind(1)
@@ -204,7 +227,8 @@ def train(args):
     print(f"[train] sensor={sensor[0]}x{sensor[1]}  windows={len(ds)}  "
           f"recordings={len(getattr(ds, 'pairs', []))}")
 
-    encoder, head = build_models(device, args.n_classes, sensor=sensor)
+    encoder, head = build_models(device, args.n_classes, sensor=sensor,
+                                 verbose=args.verbose)
     opt = torch.optim.AdamW(head.parameters(), lr=LR, weight_decay=1e-4)
     use_amp = device == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -220,10 +244,14 @@ def train(args):
             configure_sensor(val_ds)
 
         for epoch in range(args.epochs):
-            msg, _ = _run_epoch(encoder, head, ds, device, opt, scaler)
+            msg, _ = _run_epoch(encoder, head, ds, device, opt, scaler,
+                                verbose=args.verbose,
+                                verbose_every=args.verbose_every)
             print(f"[epoch {epoch}] train {msg}")
             if val_ds is not None:
-                _, (vp, vg) = _run_epoch(encoder, head, val_ds, device)
+                _, (vp, vg) = _run_epoch(encoder, head, val_ds, device,
+                                          verbose=args.verbose,
+                                          verbose_every=args.verbose_every)
                 mAP, ap50 = coco_map(vp, vg, args.n_classes)
                 print(f"[epoch {epoch}] val   mAP@[.5:.95]={mAP:.4f}  "
                       + "  ".join(f"AP50_{PROPHESEE_CLASS_NAMES[c]}={ap50[c]:.3f}"
@@ -246,10 +274,13 @@ def evaluate(args):
     try:
         sensor = configure_sensor(ds)
         print(f"[eval] sensor={sensor}  windows={len(ds)}")
-        encoder, head = build_models(device, args.n_classes, sensor=sensor)
+        encoder, head = build_models(device, args.n_classes, sensor=sensor,
+                                     verbose=args.verbose)
         if args.ckpt:
             head.load_state_dict(torch.load(args.ckpt, map_location=device))
-        _, (all_preds, all_gts) = _run_epoch(encoder, head, ds, device)
+        _, (all_preds, all_gts) = _run_epoch(encoder, head, ds, device,
+                                             verbose=args.verbose,
+                                             verbose_every=args.verbose_every)
         mAP, ap50 = coco_map(all_preds, all_gts, args.n_classes)
         print(f"[eval] mAP@[.5:.95] = {mAP:.4f}")
         for c in range(args.n_classes):
@@ -270,7 +301,8 @@ def test_and_save_frames(args):
         sw, sh = sensor
         print(f"[test] sensor={sensor}  windows={len(ds)}  out_dir={args.out_dir}")
 
-        encoder, head = build_models(device, args.n_classes, sensor=sensor)
+        encoder, head = build_models(device, args.n_classes, sensor=sensor,
+                                     verbose=args.verbose)
         if args.ckpt:
             head.load_state_dict(torch.load(args.ckpt, map_location=device))
         head.eval()
@@ -280,9 +312,16 @@ def test_and_save_frames(args):
         for i in range(len(ds)):
             sample = ds[i]
             ev, gt_boxes, gt_cls = _sample_to_tensors(sample, device)
-            H, pos = encoder(ev)
+            show = args.verbose and (saved < 3 or (saved + 1) % args.verbose_every == 0)
+            if show:
+                print(f"\n[test] window {i}  events={ev.shape[0]}")
+            H, pos = encoder(ev, verbose=show)
+            if show:
+                print("[test] detection head + NMS...")
             preds = head(H)
             pb, ps, pl = postprocess(preds, pos, score_thr=args.score_thr)
+            if show:
+                print(f"[test] detections={pb.shape[0]}")
 
             gt_xyxy = None
             gt_labels = None
@@ -315,18 +354,22 @@ def smoke(args):
     print(f"[smoke] device={device}  events={args.events}  window_ms={args.window_ms}")
     ev = load_unlabeled(args.events, window_ms=args.window_ms, max_events=args.max_events)
     print(f"[smoke] window events: {ev.shape[0]}")
-    encoder, head = build_models(device, args.n_classes)
+    verbose = True  # smoke always shows pipeline steps
+    encoder, head = build_models(device, args.n_classes, verbose=verbose)
     head.eval()
 
-    H, pos = encoder(ev, pool=not args.no_pool)
+    print("[smoke] --- GVFA encoder ---")
+    H, pos = encoder(ev, pool=not args.no_pool, verbose=True)
     st = encoder.last_stats
-    print(f"[smoke] codebook≈{st.get('codebook_mb', 0):.1f} MB  "
-          f"N={st.get('n_events', 0)} -> M={st.get('n_pooled', 0)} pooled nodes")
+    print(f"[smoke] summary: codebook≈{st.get('codebook_mb', 0):.1f} MB  "
+          f"N={st.get('n_events', 0)} -> M={st.get('n_pooled', 0)} pooled")
     et = st.get("edge_temporal_dim", 0)
     print(f"[smoke] encode_edges_temporal: {et} edge HVs "
           f"({'ok' if et > 0 or ev.shape[0] == 0 else 'no temporal edges'})")
-    print(f"[smoke] H shape {tuple(H.shape)}  (D={D})")
+
+    print("[smoke] --- detection head ---")
     preds = head(H)
+    print("[smoke] --- NMS postprocess ---")
     boxes, scores, labels = postprocess(preds, pos, score_thr=args.score_thr)
     print(f"[smoke] boxes after NMS: {boxes.shape[0]}")
 
@@ -365,6 +408,10 @@ def main():
                     help="Max mmap .dat readers kept open (default 1 = lowest RAM)")
     ap.add_argument("--no_pool", action="store_true",
                     help="Disable voxel max-pooling (smoke/debug)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Print pipeline steps (first 3 windows + every --verbose_every)")
+    ap.add_argument("--verbose_every", type=int, default=100,
+                    help="With --verbose, also print every N windows (default 100)")
     ap.add_argument("--n_classes", type=int, default=N_CLASSES)
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--score_thr", type=float, default=0.3)
