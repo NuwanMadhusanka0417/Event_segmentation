@@ -318,8 +318,14 @@ def smoke(args):
     encoder, head = build_models(device, args.n_classes)
     head.eval()
 
-    H, pos = encoder(ev)
-    print(f"[smoke] H (per-node, bundled): {tuple(H.shape)}  expected [N, {D}]")
+    H, pos = encoder(ev, pool=not args.no_pool)
+    st = encoder.last_stats
+    print(f"[smoke] codebook≈{st.get('codebook_mb', 0):.1f} MB  "
+          f"N={st.get('n_events', 0)} -> M={st.get('n_pooled', 0)} pooled nodes")
+    et = st.get("edge_temporal_dim", 0)
+    print(f"[smoke] encode_edges_temporal: {et} edge HVs "
+          f"({'ok' if et > 0 or ev.shape[0] == 0 else 'no temporal edges'})")
+    print(f"[smoke] H shape {tuple(H.shape)}  (D={D})")
     preds = head(H)
     boxes, scores, labels = postprocess(preds, pos, score_thr=args.score_thr)
     print(f"[smoke] boxes after NMS: {boxes.shape[0]}")
@@ -357,6 +363,8 @@ def main():
                     help="Limit total windows across dataset (debug)")
     ap.add_argument("--reader_cache_size", type=int, default=1,
                     help="Max mmap .dat readers kept open (default 1 = lowest RAM)")
+    ap.add_argument("--no_pool", action="store_true",
+                    help="Disable voxel max-pooling (smoke/debug)")
     ap.add_argument("--n_classes", type=int, default=N_CLASSES)
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--score_thr", type=float, default=0.3)

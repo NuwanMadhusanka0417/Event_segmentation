@@ -104,7 +104,9 @@ def build_multigraph(t, x, y, p, sensor=SENSOR,
         ei = torch.zeros((2, 0), dtype=torch.long)
         ea_s = np.zeros((0, 3), dtype=np.float64)
         ea_t = np.zeros((0, 6), dtype=np.float64)
-        return ei, ei, ea_s, ea_t, np.empty(0, np.int64), np.empty(0, np.int64)
+        vx_e = np.empty(0, np.float64)
+        vy_e = np.empty(0, np.float64)
+        return ei, ei, ea_s, ea_t, np.empty(0, np.int64), np.empty(0, np.int64), vx_e, vy_e
 
     w, _ = sensor
     r_xy_s = spatial_r_xy_frac * w
@@ -117,41 +119,10 @@ def build_multigraph(t, x, y, p, sensor=SENSOR,
 
     attr_spatial = edge_features_spatial(rec_s, src_s, x, y, t)
     attr_temporal = edge_features_temporal(rec_t, src_t, x, y, t, p)
+    # temporal cols 3,4 = Δx/Δt, Δy/Δt in px/s -> px/ms for codebook
+    vx_edge = (attr_temporal[:, 3] / 1000.0).astype(np.float64) if attr_temporal.size else np.empty(0)
+    vy_edge = (attr_temporal[:, 4] / 1000.0).astype(np.float64) if attr_temporal.size else np.empty(0)
 
     return (edge_spatial, edge_temporal,
             attr_spatial, attr_temporal,
-            rec_s, src_s)
-
-
-def _fpe_channel(values, base_phase, scale, chunk=4096):
-    v = (values * scale).astype(np.float32)
-    out = np.empty((len(v), base_phase.shape[0]), dtype=np.float32)
-    bp = torch.from_numpy(base_phase)
-    for s in range(0, len(v), chunk):
-        vb = torch.from_numpy(v[s:s + chunk])
-        ang = vb[:, None] * bp[None, :]
-        code = torch.fft.ifft(torch.exp(1j * ang)).real
-        out[s:s + chunk] = code.numpy()
-    return out
-
-
-def fpe_encode(x, y, t, dim, sensor=SENSOR, seed=SEED):
-    """FPE-encode node features {x, y, t} -> L2-normalized hypervector [N, D]."""
-    rng = np.random.default_rng(seed)
-    w, h = sensor
-    t_ms = (t - t[0]) * 1e3
-    t_span = max(t_ms.max(), 1e-6)
-
-    channels = [
-        (x / w, POS_BW),
-        (y / h, POS_BW),
-        (t_ms / t_span, TIME_BW),
-    ]
-
-    bundle = np.zeros((len(x), dim), dtype=np.float32)
-    for vals, scale in channels:
-        base_phase = rng.uniform(0, 2 * np.pi, size=dim).astype(np.float32)
-        bundle += _fpe_channel(np.asarray(vals, dtype=np.float64), base_phase, float(scale))
-
-    h_in = torch.from_numpy(bundle)
-    return torch.nn.functional.normalize(h_in, p=2, dim=1)
+            rec_s, src_s, vx_edge, vy_edge)

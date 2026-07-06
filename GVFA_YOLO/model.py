@@ -1,22 +1,14 @@
 """
-Two-graph edge-conditioned GVFA + point-wise (YOLOX-style) detection head.
+Two-graph edge-conditioned GVFA + point-wise YOLOX head.
 
-Pipeline (per event window):
-  events (t_us, x, y, p)
-    -> causal ellipsoid SPATIAL + TEMPORAL graphs (GVFA/segment.py)
-    -> spatial edge features (Δx, Δy, Δt); temporal (Δx, Δy, Δt, Δx/Δt, Δy/Δt, Δp)
-    -> FPE node encoding {x, y, t}
-    -> frozen edge-conditioned GraphCNN (src/graphcnnVSA_Binding_FULL_new) on each graph
-    -> bundle H = normalize(H_spatial + H_temporal)  ->  [N, D] single hypervector
-    -> trainable adapter + point-wise YOLO head (cls, reg, obj)
-
-Only the adapter + head train; GraphCNN is frozen.
+  events -> graphs -> FPE codebook node HVs -> frozen GraphCNN (raw-float edges)
+  -> bundle H -> voxel max-pool -> SimOTA-trained point-wise head
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.ops import nms, generalized_box_iou_loss
+from torchvision.ops import nms, generalized_box_iou_loss, box_iou, generalized_box_iou
 
 from gvfa_encoder import GVFAEncoder
 
@@ -47,6 +39,9 @@ def set_sensor(width, height):
 LR = 2e-4
 FOCAL_GAMMA = 2.0
 FOCAL_ALPHA = 0.25
+SIMOTA_CENTER_RADIUS = 2.5
+SIMOTA_LAMBDA_REG = 3.0
+SIMOTA_TOP_Q = 10
 
 MS_TO_US = 1000.0
 
@@ -114,31 +109,74 @@ def sigmoid_focal_loss(logits, targets, alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA):
     return loss.sum()
 
 
-def assign_targets(pos_xy, gt_boxes, gt_classes):
+def simota_assign(preds, pos_xy, gt_boxes, gt_classes, n_classes,
+                  center_radius=SIMOTA_CENTER_RADIUS,
+                  lambda_reg=SIMOTA_LAMBDA_REG, top_q=SIMOTA_TOP_Q):
+    """YOLOX SimOTA: dynamic-k matching with center prior."""
     N = pos_xy.shape[0]
-    matched = torch.full((N,), -1, dtype=torch.long)
-    if gt_boxes.numel() == 0:
-        return torch.zeros(N, dtype=torch.bool), matched
+    device = pos_xy.device
+    matched = torch.full((N,), -1, dtype=torch.long, device=device)
+    pos_mask = torch.zeros(N, dtype=torch.bool, device=device)
+    if gt_boxes.numel() == 0 or N == 0:
+        return pos_mask, matched
+
+    gt_boxes = gt_boxes.to(device)
+    gt_classes = gt_classes.to(device)
+    M = gt_boxes.shape[0]
     gx, gy, gw, gh = gt_boxes.unbind(1)
     x1, y1 = gx - gw / 2, gy - gh / 2
     x2, y2 = gx + gw / 2, gy + gh / 2
-    area = (gw * gh)
     px, py = pos_xy[:, 0], pos_xy[:, 1]
+
     inside = ((px[:, None] >= x1[None]) & (px[:, None] <= x2[None]) &
               (py[:, None] >= y1[None]) & (py[:, None] <= y2[None]))
-    big = area.max() + 1.0
-    cost = torch.where(inside, area[None].expand_as(inside),
-                       torch.full_like(inside, big, dtype=torch.float32))
-    best = cost.argmin(1)
-    has = inside.any(1)
-    matched[has] = best[has]
-    return has, matched
+    dist = torch.hypot(px[:, None] - gx[None], py[:, None] - gy[None])
+    valid = inside & (dist <= center_radius)
+
+    pred_xyxy = decode_boxes(preds["reg"], pos_xy)
+    gt_xyxy = torch.stack([x1, y1, x2, y2], dim=1)
+    giou = generalized_box_iou(pred_xyxy, gt_xyxy)
+    ious = box_iou(pred_xyxy, gt_xyxy)
+
+    cls_prob = F.softmax(preds["cls"][:, :n_classes], dim=1)
+    L_cls = -torch.log(cls_prob[:, gt_classes.long()].clamp(min=1e-8))
+    L_iou = 1.0 - giou
+    cost = L_cls + lambda_reg * L_iou + 1e5 * (~valid).float()
+
+    assigned = {}
+    for g in range(M):
+        cand = valid[:, g].nonzero(as_tuple=False).view(-1)
+        if cand.numel() == 0:
+            continue
+        iou_g = ious[cand, g]
+        q = min(top_q, int(cand.numel()))
+        k_g = max(1, int(iou_g.topk(q).values.sum().item()))
+        order = cost[cand, g].argsort()
+        for n in cand[order[:k_g]].tolist():
+            c = cost[n, g].item()
+            if n not in assigned or c < assigned[n][1]:
+                assigned[n] = (g, c)
+
+    for n, (g, _) in assigned.items():
+        pos_mask[n] = True
+        matched[n] = g
+    return pos_mask, matched
+
+
+def assign_targets(pos_xy, gt_boxes, gt_classes, preds=None, n_classes=N_CLASSES):
+    """SimOTA when preds given; else fallback for tests."""
+    if preds is not None:
+        return simota_assign(preds, pos_xy, gt_boxes, gt_classes, n_classes)
+    return simota_assign(
+        {"reg": torch.zeros(pos_xy.shape[0], 4, device=pos_xy.device),
+         "cls": torch.zeros(pos_xy.shape[0], n_classes + 1, device=pos_xy.device)},
+        pos_xy, gt_boxes, gt_classes, n_classes)
 
 
 def detection_loss(preds, pos_xy, gt_boxes, gt_classes, n_classes):
     device = preds["cls"].device
     N = pos_xy.shape[0]
-    pos_mask, matched = assign_targets(pos_xy, gt_boxes, gt_classes)
+    pos_mask, matched = assign_targets(pos_xy, gt_boxes, gt_classes, preds, n_classes)
     pos_mask = pos_mask.to(device)
     n_pos = max(int(pos_mask.sum()), 1)
 
