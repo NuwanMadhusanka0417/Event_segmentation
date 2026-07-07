@@ -8,15 +8,14 @@ coherence encoded as hypervectors (VSA / HRR) and refined by a few hops of the
 GVFA GraphCNN, then clustered online by cosine similarity inside each spatial
 connected component.
 
-NODE FEATURES (both graphs): {x, y, t} via FPE.  Polarity appears only in
-temporal edge features (Eq. 6); it is still kept as a column in saved output.
+NODE FEATURES (both graphs): absolute {x, y, t, p} via FPE codebooks.  Relative
+position/motion appears only in edge Δ terms (Eq. 5 / Eq. 6).
 
 PIPELINE
     load_events      -> read txt, take a time WINDOW (fast)
     build_multigraph -> spatial + temporal ellipsoid graphs (causal, past-only)
-    fpe_encode       -> FPE hypervector per node from {x, y, t}
-    encode_nodes     -> edge-conditioned GVFA per graph (no reservoir/Sigma-Pi);
-                        bundle all hop-level vectors, then concat spatial|temporal
+    fpe_encode       -> FPE codebook node hypervectors from {x, y, t, p}
+    encode_nodes     -> FPE codebook edge_H + GVFA per graph; hop-bundle; concat
     assign           -> streaming prototype clustering, factored by component
     save             -> events_labeled.parquet + seg.png + console summary
 
@@ -38,13 +37,11 @@ PARAMETERS (constants below; edit them in place)
     MIN_EVENTS  objects smaller than this are treated as noise and relabeled to
                 background id -1 (default 80). Set to 0 to keep every object.
 
-    Secondary FPE bandwidths (POS_BW, TIME_BW) control how fast the
-    hypervector code de-correlates along each channel.
+    Secondary FPE codebook bandwidths / bundle weights — see FPE CODEBOOK CONFIG.
 
 USAGE
-    python segment.py                         # 30 ms window of events_filtered.txt
-    python segment.py --window-ms 60          # bigger slice
-    python segment.py --input other.txt --window-ms 100
+    python segment.py --window-ms 60 --num-layers 3
+    python segment.py --input events_filtered.txt --tau 0.12 --num-layers 4
 Outputs events_labeled.parquet and seg.png in the working directory.
 """
 
@@ -53,6 +50,7 @@ import numpy as np
 import torch
 from sklearn.neighbors import NearestNeighbors
 
+from fpe_codebook import FPECodebook, bundle_weighted
 from gvfa_encoder import encode_graph
 
 # ----------------------------------------------------------------------------
@@ -71,16 +69,37 @@ TEMPORAL_R_XY_FRAC = 0.01  # R_XY = this fraction of sensor width
 TEMPORAL_R_T_MS    = 40.0  # semi-major axis along time (ms)
 TEMPORAL_MMAX      = 12    # max past temporal neighbours per node
 
-D          = 4000     # hypervector dimensionality per graph branch
-NUM_LAYERS = 3        # GraphCNN layers incl. input (3 => 2 hops)
-USE_RESERVOIR = False # no tap buffer / Sigma-Pi; hop vectors are bundled (summed)
-TAU        = 0.15     # cosine threshold to join an existing object (lower -> fewer objects)
-ALPHA      = 0.15     # prototype decayed-bundle update rate
-MIN_EVENTS = 150      # objects below this size -> background id -1 (0 = keep all)
+D          = 4000     # hypervector dimensionality per graph branch (tunable)
+NUM_LAYERS = 3        # GraphCNN layers incl. input (tunable via --num-layers)
+USE_RESERVOIR = False # no tap buffer / Sigma-Pi
+TAU        = 0.15     # cosine merge threshold (tunable)
+ALPHA      = 0.15     # prototype update rate (tunable)
+MIN_EVENTS = 150      # min cluster size; smaller -> background (tunable)
 
-# FPE channel bandwidths for node features {x, y, t}
-POS_BW  = 1.0    # x, y
-TIME_BW = 0.5    # t
+# === FPE CODEBOOK CONFIG (tunable) ===
+# Per-feature bandwidth (length-scale / kernel decay rate)
+BW_X, BW_Y, BW_T, BW_P = 1.0, 1.0, 0.5, 1.0
+BW_DX, BW_DY, BW_DT = 1.0, 1.0, 0.5
+BW_VX, BW_VY, BW_DP = 2.0, 2.0, 1.0
+
+# Node bundle weights (absolute x, y, t, p only)
+W_NODE_X, W_NODE_Y, W_NODE_T, W_NODE_P = 1.0, 1.0, 0.5, 0.4
+
+# Spatial edge bundle weights
+W_EDGE_S_DX, W_EDGE_S_DY, W_EDGE_S_DT = 1.0, 1.0, 0.5
+
+# Temporal edge bundle weights (velocity weighted up for motion cue)
+W_EDGE_T_DX, W_EDGE_T_DY, W_EDGE_T_DT = 0.5, 0.5, 0.5
+W_EDGE_T_VX, W_EDGE_T_VY, W_EDGE_T_DP = 2.5, 2.5, 1.0
+
+# Radix / signed-log grid params
+RADIX_S_T = 250           # sqrt-scale fine radix for time (µs)
+RADIX_S_DT_SPATIAL = 32   # radix fine for spatial Δt (µs)
+RADIX_S_DT_TEMPORAL = 200 # radix fine for temporal Δt (µs)
+SIGNED_LOG_V0 = 100.0     # px/s scale for log(1+|v|/v0) on edge velocity
+VEL_LOG_GRID = 0.1        # grid step in log-preconditioned velocity units
+VEL_LOG_UMAX = 400        # half-range index for signed-log velocity radix
+
 SEED   = 0
 DEVICE = "cpu"
 
@@ -314,55 +333,75 @@ def node_flow(t, x, y, edge_index, min_pts=5, ridge=1e-9, clip_pct=99.0):
 
 
 # ----------------------------------------------------------------------------
-# 4. FRACTIONAL-POWER (HRR) ENCODING
+# 4. FPE CODEBOOK NODE / EDGE ENCODING
 # ----------------------------------------------------------------------------
-def _fpe_channel(values, base_phase, scale, chunk=4096):
-    """Fractional power encoding for one channel, HRR/FFT style (cf. bind()):
-    h_v = real(ifft(base ** v)). The base is a unit-modulus phasor, so base**v
-    is a clean rotation exp(i * phase * v) that preserves norm and varies
-    smoothly with v. Computed in chunks to bound memory. Returns [N, D] float32.
-    """
-    v = (values * scale).astype(np.float32)
-    out = np.empty((len(v), base_phase.shape[0]), dtype=np.float32)
-    bp = torch.from_numpy(base_phase)                      # [D] float32
-    for s in range(0, len(v), chunk):
-        vb = torch.from_numpy(v[s:s + chunk])             # [b]
-        ang = vb[:, None] * bp[None, :]                   # [b, D]
-        code = torch.fft.ifft(torch.exp(1j * ang)).real   # [b, D]
-        out[s:s + chunk] = code.numpy()
-    return out
-
-
-def fpe_encode(x, y, t, dim=D, sensor=SENSOR, seed=SEED):
-    """FPE-encode node features {x, y, t} -> one L2-normalized hypervector [N, D]."""
-    rng = np.random.default_rng(seed)
+def make_codebooks(sensor=SENSOR, t_span_s=0.06, seed=SEED):
+    """Build node and edge FPE codebooks for one processing window."""
     W, H = sensor
-    t_ms = (t - t[0]) * 1e3
-    t_span = max(t_ms.max(), 1e-6)
+    t_us_max = max(int(t_span_s * 1e6) + 1, 1)
+    dt_s_max = int(SPATIAL_R_T_MS * 1000) + 1
+    dt_t_max = int(TEMPORAL_R_T_MS * 1000) + 1
+    umax = VEL_LOG_UMAX
 
-    channels = [
-        (x / W,          POS_BW),
-        (y / H,          POS_BW),
-        (t_ms / t_span,  TIME_BW),
+    node = {
+        "x": FPECodebook("x", D, BW_X, "integer", vmin=0, vmax=W - 1, seed=seed + 1),
+        "y": FPECodebook("y", D, BW_Y, "integer", vmin=0, vmax=H - 1, seed=seed + 2),
+        "t": FPECodebook("t", D, BW_T, "radix", radix_S=RADIX_S_T,
+                         vmin=0, vmax=t_us_max, value_grid_step=1.0, seed=seed + 3),
+        "p": FPECodebook("p", D, BW_P, "integer", vmin=0, vmax=1, seed=seed + 4),
+    }
+    edge_dx = FPECodebook("dx", D, BW_DX, "integer", vmin=-W, vmax=W, seed=seed + 10)
+    edge_dy = FPECodebook("dy", D, BW_DY, "integer", vmin=-H, vmax=H, seed=seed + 11)
+    edge_spatial = {
+        "dx": edge_dx,
+        "dy": edge_dy,
+        "dt": FPECodebook("dt_s", D, BW_DT, "radix", radix_S=RADIX_S_DT_SPATIAL,
+                          vmin=0, vmax=dt_s_max, value_grid_step=1.0, seed=seed + 12),
+    }
+    edge_temporal = {
+        "dx": edge_dx,
+        "dy": edge_dy,
+        "dt": FPECodebook("dt_t", D, BW_DT, "radix", radix_S=RADIX_S_DT_TEMPORAL,
+                          vmin=0, vmax=dt_t_max, value_grid_step=1.0, seed=seed + 13),
+        "vx": FPECodebook("vx", D, BW_VX, "signed_log_radix", radix_S=64,
+                          vmin=-umax, vmax=umax, value_grid_step=VEL_LOG_GRID,
+                          signed_log_v0=SIGNED_LOG_V0, seed=seed + 14),
+        "vy": FPECodebook("vy", D, BW_VY, "signed_log_radix", radix_S=64,
+                          vmin=-umax, vmax=umax, value_grid_step=VEL_LOG_GRID,
+                          signed_log_v0=SIGNED_LOG_V0, seed=seed + 15),
+        "dp": FPECodebook("dp", D, BW_DP, "integer", vmin=-1, vmax=1, seed=seed + 16),
+    }
+    w_spatial = {"dx": W_EDGE_S_DX, "dy": W_EDGE_S_DY, "dt": W_EDGE_S_DT}
+    w_temporal = {
+        "dx": W_EDGE_T_DX, "dy": W_EDGE_T_DY, "dt": W_EDGE_T_DT,
+        "vx": W_EDGE_T_VX, "vy": W_EDGE_T_VY, "dp": W_EDGE_T_DP,
+    }
+    return node, edge_spatial, edge_temporal, w_spatial, w_temporal
+
+
+def fpe_encode(x, y, t, p, codebooks):
+    """FPE-codebook node features {x, y, t, p} -> L2-normalized [N, D]."""
+    t_us = (t - t[0]) * 1e6
+    terms = [
+        (codebooks["x"].encode(x), W_NODE_X),
+        (codebooks["y"].encode(y), W_NODE_Y),
+        (codebooks["t"].encode(t_us, interpolate=True), W_NODE_T),
+        (codebooks["p"].encode(p), W_NODE_P),
     ]
-
-    bundle = np.zeros((len(x), dim), dtype=np.float32)
-    for vals, scale in channels:
-        base_phase = (rng.uniform(0, 2 * np.pi, size=dim)).astype(np.float32)
-        bundle += _fpe_channel(np.asarray(vals, dtype=np.float64), base_phase, float(scale))
-
-    H_in = torch.from_numpy(bundle)
-    H_in = torch.nn.functional.normalize(H_in, p=2, dim=1)
-    return H_in   # [N, D] float32
+    return bundle_weighted(terms)
 
 
 # ----------------------------------------------------------------------------
 # 5. GVFA ENCODER  (edge-conditioned, graphcnnVSA_Binding_FULL_new)
 # ----------------------------------------------------------------------------
-def encode_nodes(x_hv, edge_index, edge_attr, num_layers=NUM_LAYERS):
-    """Edge-conditioned GVFA -> contextual node hypervectors H [N, D]."""
+def encode_nodes(x_hv, edge_index, edge_attr, edge_codebooks, edge_weights,
+                 graph_kind, num_layers=NUM_LAYERS):
+    """Edge-codebook GVFA -> contextual node hypervectors H [N, D]."""
     return encode_graph(
         x_hv, edge_index, edge_attr,
+        graph_kind=graph_kind,
+        edge_codebooks=edge_codebooks,
+        edge_weights=edge_weights,
         num_layers=num_layers,
         edge_feat_dim=edge_attr.shape[1],
         device=DEVICE,
@@ -373,10 +412,15 @@ def encode_nodes(x_hv, edge_index, edge_attr, num_layers=NUM_LAYERS):
 
 def encode_nodes_multigraph(x_hv, edge_spatial, attr_spatial,
                             edge_temporal, attr_temporal,
+                            cb_spatial, cb_temporal, w_spatial, w_temporal,
                             num_layers=NUM_LAYERS):
-    """Apply GVFA separately on spatial and temporal graphs, then concat -> [N, 2*D]."""
-    H_spatial = encode_nodes(x_hv, edge_spatial, attr_spatial, num_layers)
-    H_temporal = encode_nodes(x_hv, edge_temporal, attr_temporal, num_layers)
+    """GVFA on spatial + temporal graphs; concat -> [N, 2*D]."""
+    H_spatial = encode_nodes(
+        x_hv, edge_spatial, attr_spatial, cb_spatial, w_spatial, "spatial",
+        num_layers)
+    H_temporal = encode_nodes(
+        x_hv, edge_temporal, attr_temporal, cb_temporal, w_temporal, "temporal",
+        num_layers)
     return torch.cat([H_spatial, H_temporal], dim=1)
 
 
@@ -490,6 +534,8 @@ def main():
     ap.add_argument("--window-ms", type=float, default=WINDOW_MS)
     ap.add_argument("--tau", type=float, default=TAU,
                     help="cosine merge threshold (lower -> fewer objects)")
+    ap.add_argument("--num-layers", type=int, default=NUM_LAYERS,
+                    help="GVFA layers incl. input (3 => 2 hops)")
     args = ap.parse_args()
 
     torch.manual_seed(SEED)
@@ -511,13 +557,18 @@ def main():
     comp = connected_components(len(t), rec, src)
     print(f"  {comp.max()+1} spatial connected components")
 
-    print("FPE-encoding nodes (x, y, t) ...")
-    x_hv = fpe_encode(x, y, t)
+    t_span = max((t.max() - t.min()), 1e-9)
+    node_cb, cb_spatial, cb_temporal, w_spatial, w_temporal = make_codebooks(
+        SENSOR, t_span, seed=SEED)
 
-    print(f"running edge-conditioned GVFA ({NUM_LAYERS} layers, "
-          f"hop-bundle sum, no reservoir) on each graph ...")
+    print("FPE codebook-encoding nodes (x, y, t, p) ...")
+    x_hv = fpe_encode(x, y, t, p, node_cb)
+
+    print(f"running FPE-edge GVFA ({args.num_layers} layers, "
+          f"hop-bundle sum, L2 norm) on each graph ...")
     H = encode_nodes_multigraph(
-        x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal)
+        x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal,
+        cb_spatial, cb_temporal, w_spatial, w_temporal, args.num_layers)
     print(f"  concatenated hypervectors: {H.shape[1]} dims ({D} spatial + {D} temporal)")
 
     print(f"streaming assignment (tau={args.tau}) ...")

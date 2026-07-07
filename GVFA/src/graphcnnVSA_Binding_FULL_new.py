@@ -106,24 +106,29 @@ class GraphCNN(nn.Module):
         return graph_pool.to(self.device)
 
     def __preprocess_edges(self, batch_graph):
-        """Batched edge_index [2, E_total] and edge_attr [E_total, F_edge], aligned. start_idx for node offsets."""
+        """Batched edge_index, optional edge_attr, optional precomputed edge_H."""
         start_idx = [0]
         for i, g in enumerate(batch_graph):
             start_idx.append(start_idx[i] + len(g.g))
-        ei_list, ea_list = [], []
+        ei_list, ea_list, eh_list = [], [], []
         for i, g in enumerate(batch_graph):
             ei = getattr(g, "edge_index", None)
             ea = getattr(g, "edge_attr", None)
-            if ei is None or ea is None or ei.numel() == 0 or ea.numel() == 0:
+            eh = getattr(g, "edge_H", None)
+            if ei is None or ei.numel() == 0:
                 continue
             off = start_idx[i]
             ei_list.append(ei.to(self.device) + off)
-            ea_list.append(ea.to(self.device))
+            if ea is not None and ea.numel() > 0:
+                ea_list.append(ea.to(self.device))
+            if eh is not None and eh.numel() > 0:
+                eh_list.append(eh.to(self.device))
         if not ei_list:
-            return None, None, start_idx
+            return None, None, None, start_idx
         batched_ei = torch.cat(ei_list, dim=1)
-        batched_ea = torch.cat(ea_list, dim=0)
-        return batched_ei, batched_ea, start_idx
+        batched_ea = torch.cat(ea_list, dim=0) if ea_list else None
+        batched_eh = torch.cat(eh_list, dim=0) if eh_list else None
+        return batched_ei, batched_ea, batched_eh, start_idx
 
     def _edge_message_pool(self, h_to_pool, edge_index, edge_H, num_nodes, average=False):
         """
@@ -389,11 +394,10 @@ class GraphCNN(nn.Module):
             pooled = torch.roll(pooled, shifts=shift, dims=1)
             
 
-        pre_bin = pooled
-        # print(pooled)
-        pooled = torch.sign(pooled)
+        pre_norm = pooled
+        pooled = F.normalize(pooled, p=2, dim=1)
         if return_pre_sign:
-            return pooled, pre_bin
+            return pooled, pre_norm
         return pooled
 
 
@@ -417,13 +421,20 @@ class GraphCNN(nn.Module):
         graph_pool = self.__preprocess_graphpool(batch_graph)
         Adj_block = self.__preprocess_neighbors_sumavepool(batch_graph)
 
-        batched_ei, batched_ea, _ = self.__preprocess_edges(batch_graph)
+        batched_ei, batched_ea, batched_eh, _ = self.__preprocess_edges(batch_graph)
         num_nodes = start_idx[-1]
         edge_index = None
         edge_H = None
-        if batched_ei is not None and batched_ea is not None and self.edge_feat_dim > 0 and hasattr(self, "W_edge"):
+        if batched_ei is not None:
             edge_index = batched_ei
-            edge_H = torch.mm(batched_ea.to(X_concat.dtype), self.W_edge)
+            if batched_eh is not None:
+                edge_H = batched_eh.to(X_concat.dtype)
+            elif (
+                batched_ea is not None
+                and self.edge_feat_dim > 0
+                and hasattr(self, "W_edge")
+            ):
+                edge_H = torch.mm(batched_ea.to(X_concat.dtype), self.W_edge)
 
         hidden_rep = [X_concat]
         h = X_concat
