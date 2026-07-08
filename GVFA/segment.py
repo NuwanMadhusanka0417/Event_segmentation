@@ -56,7 +56,7 @@ from gvfa_encoder import encode_graph
 # ----------------------------------------------------------------------------
 # PARAMETERS
 # ----------------------------------------------------------------------------
-WINDOW_MS  = 60.0     # time slice to process (ms); None = whole file
+WINDOW_MS  = 1000.0   # time slice to process (ms); None = whole file
 SENSOR     = (346, 260)   # (W, H) in pixels
 
 # Spatial graph: ellipsoid elongated in (x, y) — local spatial structure
@@ -77,10 +77,14 @@ ALPHA      = 0.15     # prototype update rate (tunable)
 MIN_EVENTS = 150      # min cluster size; smaller -> background (tunable)
 
 # === FPE CODEBOOK CONFIG (tunable) ===
-# Per-feature bandwidth (length-scale / kernel decay rate)
-BW_X, BW_Y, BW_T, BW_P = 1.0, 1.0, 0.5, 1.0
-BW_DX, BW_DY, BW_DT = 1.0, 1.0, 0.5
-BW_VX, BW_VY, BW_DP = 2.0, 2.0, 1.0
+# Per-feature bandwidth (Gaussian kernel length-scale = 1/bandwidth)
+BW_X, BW_Y = 0.0333, 0.0333      # scale ~30 px
+BW_T       = 1e-5                # scale ~100 ms (over 0..1e6 us)
+BW_P       = 1.43                # 2 polarities kept distinct
+BW_DX, BW_DY = 0.1, 0.1          # scale ~10 px
+BW_DT      = 3.3e-4              # scale ~3 ms
+BW_VX, BW_VY = 0.1, 0.1          # scale ~1 signed-log unit
+BW_DP      = 1.43
 
 # Node bundle weights (absolute x, y, t, p only)
 W_NODE_X, W_NODE_Y, W_NODE_T, W_NODE_P = 1.0, 1.0, 0.5, 0.4
@@ -338,38 +342,45 @@ def node_flow(t, x, y, edge_index, min_pts=5, ridge=1e-9, clip_pct=99.0):
 def make_codebooks(sensor=SENSOR, t_span_s=0.06, seed=SEED):
     """Build node and edge FPE codebooks for one processing window."""
     W, H = sensor
-    t_us_max = max(int(t_span_s * 1e6) + 1, 1)
     dt_s_max = int(SPATIAL_R_T_MS * 1000) + 1
     dt_t_max = int(TEMPORAL_R_T_MS * 1000) + 1
-    umax = VEL_LOG_UMAX
 
     node = {
-        "x": FPECodebook("x", D, BW_X, "integer", vmin=0, vmax=W - 1, seed=seed + 1),
-        "y": FPECodebook("y", D, BW_Y, "integer", vmin=0, vmax=H - 1, seed=seed + 2),
-        "t": FPECodebook("t", D, BW_T, "radix", radix_S=RADIX_S_T,
-                         vmin=0, vmax=t_us_max, value_grid_step=1.0, seed=seed + 3),
-        "p": FPECodebook("p", D, BW_P, "integer", vmin=0, vmax=1, seed=seed + 4),
+        "x": FPECodebook("x", D, BW_X, "integer", vmin=0, vmax=W - 1,
+                         phase_dist="gaussian", seed=seed + 1),
+        "y": FPECodebook("y", D, BW_Y, "integer", vmin=0, vmax=H - 1,
+                         phase_dist="gaussian", seed=seed + 2),
+        "t": FPECodebook("t", D, BW_T, "radix", radix_S=1000, vmin=0,
+                         vmax=1_000_000, value_grid_step=1.0,
+                         phase_dist="gaussian", seed=seed + 3),
+        "p": FPECodebook("p", D, BW_P, "integer", vmin=0, vmax=1,
+                         phase_dist="gaussian", seed=seed + 4),
     }
-    edge_dx = FPECodebook("dx", D, BW_DX, "integer", vmin=-W, vmax=W, seed=seed + 10)
-    edge_dy = FPECodebook("dy", D, BW_DY, "integer", vmin=-H, vmax=H, seed=seed + 11)
+    edge_dx = FPECodebook("dx", D, BW_DX, "integer", vmin=-W, vmax=W,
+                          phase_dist="gaussian", seed=seed + 10)
+    edge_dy = FPECodebook("dy", D, BW_DY, "integer", vmin=-H, vmax=H,
+                          phase_dist="gaussian", seed=seed + 11)
     edge_spatial = {
         "dx": edge_dx,
         "dy": edge_dy,
-        "dt": FPECodebook("dt_s", D, BW_DT, "radix", radix_S=RADIX_S_DT_SPATIAL,
-                          vmin=0, vmax=dt_s_max, value_grid_step=1.0, seed=seed + 12),
+        "dt": FPECodebook("dt_s", D, BW_DT, "radix", radix_S=100,
+                          vmin=0, vmax=dt_s_max, value_grid_step=1.0,
+                          phase_dist="gaussian", seed=seed + 12),
     }
     edge_temporal = {
         "dx": edge_dx,
         "dy": edge_dy,
-        "dt": FPECodebook("dt_t", D, BW_DT, "radix", radix_S=RADIX_S_DT_TEMPORAL,
-                          vmin=0, vmax=dt_t_max, value_grid_step=1.0, seed=seed + 13),
-        "vx": FPECodebook("vx", D, BW_VX, "signed_log_radix", radix_S=64,
-                          vmin=-umax, vmax=umax, value_grid_step=VEL_LOG_GRID,
-                          signed_log_v0=SIGNED_LOG_V0, seed=seed + 14),
-        "vy": FPECodebook("vy", D, BW_VY, "signed_log_radix", radix_S=64,
-                          vmin=-umax, vmax=umax, value_grid_step=VEL_LOG_GRID,
-                          signed_log_v0=SIGNED_LOG_V0, seed=seed + 15),
-        "dp": FPECodebook("dp", D, BW_DP, "integer", vmin=-1, vmax=1, seed=seed + 16),
+        "dt": FPECodebook("dt_t", D, BW_DT, "radix", radix_S=200,
+                          vmin=0, vmax=dt_t_max, value_grid_step=1.0,
+                          phase_dist="gaussian", seed=seed + 13),
+        "vx": FPECodebook("vx", D, BW_VX, "signed_log_radix", radix_S=16,
+                          vmin=-25, vmax=25, value_grid_step=0.1,
+                          signed_log_v0=100.0, phase_dist="gaussian", seed=seed + 14),
+        "vy": FPECodebook("vy", D, BW_VY, "signed_log_radix", radix_S=16,
+                          vmin=-25, vmax=25, value_grid_step=0.1,
+                          signed_log_v0=100.0, phase_dist="gaussian", seed=seed + 15),
+        "dp": FPECodebook("dp", D, BW_DP, "integer", vmin=-1, vmax=1,
+                          phase_dist="gaussian", seed=seed + 16),
     }
     w_spatial = {"dx": W_EDGE_S_DX, "dy": W_EDGE_S_DY, "dt": W_EDGE_S_DT}
     w_temporal = {
@@ -433,7 +444,8 @@ def assign(H, t, components, tau=TAU, alpha=ALPHA, min_events=MIN_EVENTS):
     else open a new object. Update the matched prototype with a decayed bundle
     P <- normalize((1-alpha) P + alpha h). Objects smaller than `min_events` are
     relabeled to background (-1). Returns an object id per event (0..K-1, or -1)."""
-    Hn = torch.nn.functional.normalize(H, p=2, dim=1).numpy().astype(np.float32)
+    Hc = H - H.mean(dim=0, keepdim=True)   # remove common-mode / consensus
+    Hn = torch.nn.functional.normalize(Hc, p=2, dim=1).numpy().astype(np.float32)
     order = np.argsort(t, kind="stable")
 
     protos = []                 # list of unit vectors [D]

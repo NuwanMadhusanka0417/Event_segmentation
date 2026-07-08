@@ -13,22 +13,31 @@ def bind_hv(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.fft.ifft(fa * fb, dim=-1).real
 
 
-def _make_hermitian_phases(D: int, rng: np.random.Generator) -> np.ndarray:
-    """Conjugate-symmetric phases -> ifft(exp(i*v*phase)) is exactly real."""
+def _make_hermitian_phases(
+    D: int, rng: np.random.Generator, *, dist: str = "gaussian"
+) -> np.ndarray:
+    """Conjugate-symmetric phases -> ifft(exp(i*v*phase)) is exactly real.
+
+    dist='gaussian': N(0,1) phases -> Gaussian similarity kernel.
+    dist='uniform':  U(-pi,pi) phases -> sinc similarity kernel.
+    """
     phase = np.zeros(D, dtype=np.float64)
     if D % 2 == 0:
         phase[0] = 0.0
         phase[D // 2] = 0.0
-        for k in range(1, D // 2):
-            p = rng.uniform(-np.pi, np.pi)
-            phase[k] = p
-            phase[D - k] = -p
+        half = range(1, D // 2)
     else:
         phase[0] = 0.0
-        for k in range(1, (D + 1) // 2):
+        half = range(1, (D + 1) // 2)
+    for k in half:
+        if dist == "gaussian":
+            p = rng.normal(0.0, 1.0)
+        elif dist == "uniform":
             p = rng.uniform(-np.pi, np.pi)
-            phase[k] = p
-            phase[D - k] = -p
+        else:
+            raise ValueError(f"Unknown phase dist: {dist!r}")
+        phase[k] = p
+        phase[D - k] = -p
     return phase.astype(np.float32)
 
 
@@ -52,6 +61,7 @@ class FPECodebook:
         signed_log_v0: float | None = None,
         vmin: int | None = None,
         vmax: int | None = None,
+        phase_dist: str = "gaussian",
         seed: int = 0,
     ):
         self.name = name
@@ -61,12 +71,13 @@ class FPECodebook:
         self.value_grid_step = value_grid_step
         self.radix_S = int(radix_S) if radix_S is not None else None
         self.signed_log_v0 = float(signed_log_v0) if signed_log_v0 is not None else None
+        self.phase_dist = phase_dist
         self.seed = int(seed)
         self.vmin = 0 if vmin is None else int(vmin)
         self.vmax = 0 if vmax is None else int(vmax)
 
         rng = np.random.default_rng(seed)
-        self.phase = torch.from_numpy(_make_hermitian_phases(self.D, rng))
+        self.phase = torch.from_numpy(_make_hermitian_phases(self.D, rng, dist=phase_dist))
 
         self._table: torch.Tensor | None = None
         self._fine: torch.Tensor | None = None
