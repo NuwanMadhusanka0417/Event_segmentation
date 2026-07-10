@@ -9,7 +9,7 @@ cd /g/data/jq77/nuwan/Event_segmentation/GVFA
 python segment.py
 
 
-python segment.py --tau 0.12  --window-ms 30    # even fewer objects (~5)
+python segment.py --tau 0.08  --window-ms 30  --num-layers 2  # even fewer objects (~5)
 
 python segment.py --tau 0.18  --window-ms 30    # slightly more objects (~8)
 
