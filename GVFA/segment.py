@@ -52,6 +52,16 @@ from sklearn.neighbors import NearestNeighbors
 
 from fpe_codebook import FPECodebook, bundle_weighted
 from gvfa_encoder import encode_graph
+from motion_pooling import (
+    bundle_hypervectors,
+    diagnose_bundling_cosine,
+    diagnose_clustering,
+    diagnose_node_flow,
+    motion_coarsen,
+    save_supernodes_png,
+    supernode_aggregates,
+    unpool,
+)
 
 # ----------------------------------------------------------------------------
 # PARAMETERS
@@ -75,6 +85,14 @@ USE_RESERVOIR = False # no tap buffer / Sigma-Pi
 TAU        = 0.15     # cosine merge threshold (tunable)
 ALPHA      = 0.15     # prototype update rate (tunable)
 MIN_EVENTS = 150      # min cluster size; smaller -> background (tunable)
+
+# === MOTION-COHERENT HIERARCHICAL POOLING (tunable) ===
+SIGMA_V          = None   # None => auto (median edge ||v_i-v_j||)
+W_MIN            = 0.3    # refuse Graclus merges below this motion affinity
+N_COARSEN_LEVELS = 5      # ~27k events -> ~800 supernodes
+SUPER_R_XY       = 40.0   # supernode graph spatial radius (px)
+SUPER_R_T_MS     = 30.0   # supernode graph temporal radius (ms)
+MIN_SUPER_SIZE   = 3      # mark supernodes with fewer members as background
 
 # === FPE CODEBOOK CONFIG (tunable) ===
 # Per-feature bandwidth (Gaussian kernel length-scale = 1/bandwidth)
@@ -538,6 +556,38 @@ def save(t, x, y, p, obj_id, parquet="events_labeled.parquet", png="seg.png",
 
 
 # ----------------------------------------------------------------------------
+# SUPERNODE MULTIGRAPH (reuse causal ellipsoid builders on centroids)
+# ----------------------------------------------------------------------------
+def build_supernode_multigraph(t_s, x_s, y_s, p_s,
+                               super_r_xy=SUPER_R_XY,
+                               super_r_t_ms=SUPER_R_T_MS,
+                               spatial_mmax=SPATIAL_MMAX,
+                               temporal_mmax=TEMPORAL_MMAX):
+    """Causal ellipsoid multigraph over supernode centroids.
+
+    Spatial / temporal axes keep the same aspect as the event-level graphs,
+    scaled so the spatial R_XY and temporal R_t match the exposed SUPER_* knobs.
+    Edge attributes use the same definitions as the event graphs.
+    """
+    # Preserve event-level ellipsoid aspect: spatial wide+short-t, temporal narrow+long-t
+    r_xy_s = super_r_xy
+    r_t_s = super_r_t_ms * (SPATIAL_R_T_MS / TEMPORAL_R_T_MS)
+    r_xy_t = super_r_xy * (TEMPORAL_R_XY_FRAC / SPATIAL_R_XY_FRAC)
+    r_t_t = super_r_t_ms
+
+    edge_spatial, rec_s, src_s = _build_causal_ellipsoid_edges(
+        t_s, x_s, y_s, r_xy_s, r_t_s, spatial_mmax)
+    edge_temporal, rec_t, src_t = _build_causal_ellipsoid_edges(
+        t_s, x_s, y_s, r_xy_t, r_t_t, temporal_mmax)
+
+    attr_spatial = edge_features_spatial(rec_s, src_s, x_s, y_s, t_s)
+    attr_temporal = edge_features_temporal(rec_t, src_t, x_s, y_s, t_s, p_s)
+    return (edge_spatial, edge_temporal,
+            attr_spatial, attr_temporal,
+            rec_s, src_s)
+
+
+# ----------------------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------------------
 def main():
@@ -548,8 +598,18 @@ def main():
                     help="cosine merge threshold (lower -> fewer objects)")
     ap.add_argument("--num-layers", type=int, default=NUM_LAYERS,
                     help="GVFA layers incl. input (3 => 2 hops)")
+    ap.add_argument("--flat", action="store_true",
+                    help="bypass hierarchical pooling; old per-event clustering")
+    ap.add_argument("--n-coarsen-levels", type=int, default=N_COARSEN_LEVELS)
+    ap.add_argument("--w-min", type=float, default=W_MIN,
+                    help="refuse Graclus merges below this motion affinity")
+    ap.add_argument("--sigma-v", type=float, default=None,
+                    help="velocity length-scale; default=auto median edge ||dv||")
+    ap.add_argument("--super-r-xy", type=float, default=SUPER_R_XY)
+    ap.add_argument("--super-r-t-ms", type=float, default=SUPER_R_T_MS)
     args = ap.parse_args()
 
+    sigma_v = args.sigma_v if args.sigma_v is not None else SIGMA_V
     torch.manual_seed(SEED)
 
     print(f"loading {args.input} (window={args.window_ms} ms) ...")
@@ -578,13 +638,99 @@ def main():
 
     print(f"running FPE-edge GVFA ({args.num_layers} layers, "
           f"hop-bundle sum, L2 norm) on each graph ...")
-    H = encode_nodes_multigraph(
+    H_events = encode_nodes_multigraph(
         x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal,
         cb_spatial, cb_temporal, w_spatial, w_temporal, args.num_layers)
-    print(f"  concatenated hypervectors: {H.shape[1]} dims ({D} spatial + {D} temporal)")
+    print(f"  concatenated hypervectors: {H_events.shape[1]} dims "
+          f"({D} spatial + {D} temporal)")
 
-    print(f"streaming assignment (tau={args.tau}) ...")
-    obj_id = assign(H, t, comp, tau=args.tau)
+    if args.flat:
+        print("[flat] bypassing motion pooling — per-event clustering")
+        print(f"streaming assignment (tau={args.tau}) ...")
+        obj_id = assign(H_events, t, comp, tau=args.tau)
+        save(t, x, y, p, obj_id, tau=args.tau)
+        return
+
+    # --- hierarchical path ---
+    print("estimating per-event normal flow (node_flow on temporal graph) ...")
+    vx, vy = node_flow(t, x, y, edge_temporal)
+    diagnose_node_flow(vx, vy)
+
+    print("motion-coherent Graclus coarsening ...")
+    cluster_id, _cinfo = motion_coarsen(
+        len(t), edge_spatial, edge_temporal, vx, vy,
+        n_levels=args.n_coarsen_levels,
+        sigma_v=sigma_v,
+        w_min=args.w_min,
+        seed=SEED,
+    )
+    save_supernodes_png(x, y, cluster_id, path="supernodes.png")
+
+    print("bundling event hypervectors into supernodes ...")
+    # Bundle each graph branch separately so dims stay D (edge_H bind requires matching D)
+    H_s_bundle = bundle_hypervectors(H_events[:, :D], cluster_id)
+    H_t_bundle = bundle_hypervectors(H_events[:, D:], cluster_id)
+    H_bundle = torch.cat([H_s_bundle, H_t_bundle], dim=1)
+    agg = supernode_aggregates(x, y, t, p, vx, vy, cluster_id)
+    diagnose_bundling_cosine(H_bundle, seed=SEED, label="bundling")
+    C = H_bundle.shape[0]
+    print(f"  H_super (bundled): {H_bundle.shape}  "
+          f"dropped-size threshold MIN_SUPER_SIZE={MIN_SUPER_SIZE}")
+
+    print(f"building supernode multigraph "
+          f"(R_xy={args.super_r_xy}, R_t={args.super_r_t_ms} ms) ...")
+    (edge_s_super, edge_t_super,
+     attr_s_super, attr_t_super,
+     rec_s, src_s) = build_supernode_multigraph(
+        agg["t"], agg["x"], agg["y"], agg["p"],
+        super_r_xy=args.super_r_xy,
+        super_r_t_ms=args.super_r_t_ms,
+    )
+    print(f"  supernode spatial:  {edge_s_super.shape[1]} edges")
+    print(f"  supernode temporal: {edge_t_super.shape[1]} edges")
+    comp_super = connected_components(C, rec_s, src_s)
+    print(f"  {comp_super.max()+1} supernode spatial connected components")
+
+    print(f"re-encoding supernodes with frozen GVFA ({args.num_layers} layers) ...")
+    H_s_super = encode_nodes(
+        H_s_bundle, edge_s_super, attr_s_super, cb_spatial, w_spatial,
+        "spatial", args.num_layers)
+    H_t_super = encode_nodes(
+        H_t_bundle, edge_t_super, attr_t_super, cb_temporal, w_temporal,
+        "temporal", args.num_layers)
+    H_super = torch.cat([H_s_super, H_t_super], dim=1)
+    print(f"  H_super (re-encoded): {H_super.shape}")
+    diagnose_bundling_cosine(H_super, seed=SEED, label="re-encode")
+
+    print(f"streaming assignment on supernodes (tau={args.tau}) ...")
+    # assign() mean-centers internally; pass re-encoded H_super as-is
+    labels_super = assign(H_super, agg["t"], comp_super, tau=args.tau,
+                          min_events=0)  # size filter applied after unpool
+    small = agg["counts"] < MIN_SUPER_SIZE
+    if small.any():
+        n_small = int(small.sum())
+        labels_super = labels_super.copy()
+        labels_super[small] = -1
+        print(f"  marked {n_small} supernodes with <{MIN_SUPER_SIZE} members "
+              f"as background")
+    diagnose_clustering(H_super, labels_super)
+
+    obj_id = unpool(labels_super, cluster_id)
+    assert np.all(obj_id == labels_super[cluster_id]), \
+        "unpool coherence violated: event label != supernode label"
+    print("[unpool] assert ok — every event label equals its supernode label")
+
+    # noise cleanup at event level (same min_events policy as flat path)
+    if MIN_EVENTS > 0:
+        ids, counts = np.unique(obj_id, return_counts=True)
+        small_obj = set(ids[(ids >= 0) & (counts < MIN_EVENTS)].tolist())
+        if small_obj:
+            obj_id = np.array([-1 if o in small_obj else o for o in obj_id],
+                              dtype=np.int64)
+            keep = obj_id >= 0
+            if keep.any():
+                _, compact = np.unique(obj_id[keep], return_inverse=True)
+                obj_id[keep] = compact
 
     save(t, x, y, p, obj_id, tau=args.tau)
 
