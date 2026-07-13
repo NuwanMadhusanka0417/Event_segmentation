@@ -87,14 +87,14 @@ BW_VX, BW_VY = 0.1, 0.1          # scale ~1 signed-log unit
 BW_DP      = 1.43
 
 # Node bundle weights (absolute x, y, t, p only)
-W_NODE_X, W_NODE_Y, W_NODE_T, W_NODE_P = 0, 0, 0.1, 0.4
+W_NODE_X, W_NODE_Y, W_NODE_T, W_NODE_P = 0, 0, 0.1, 0.2
 
 # Spatial edge bundle weights
-W_EDGE_S_DX, W_EDGE_S_DY, W_EDGE_S_DT = 1.0, 1.0, 0.5
+W_EDGE_S_DX, W_EDGE_S_DY, W_EDGE_S_DT = 0.5, 0.5, 0.3  #                Short-range displacement
 
 # Temporal edge bundle weights (velocity weighted up for motion cue)
-W_EDGE_T_DX, W_EDGE_T_DY, W_EDGE_T_DT = 1, 1, 1  # 0.5, 0.5, 0.5
-W_EDGE_T_VX, W_EDGE_T_VY, W_EDGE_T_DP = 2.5, 2.5, 1.0  # 2.5, 2.5, 1.0
+W_EDGE_T_DX, W_EDGE_T_DY, W_EDGE_T_DT = 0.5, 0.5, 0.3  # 0.5, 0.5, 0.5        Displacement over longer Δt
+W_EDGE_T_VX, W_EDGE_T_VY, W_EDGE_T_DP = 5.0, 5.0, 0.5  # 2.5, 2.5, 1.0   Speed + direction (px/s)
 
 # Radix / signed-log grid params
 RADIX_S_T = 250           # sqrt-scale fine radix for time (µs)
