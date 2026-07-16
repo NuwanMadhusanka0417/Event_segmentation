@@ -52,15 +52,30 @@ from sklearn.neighbors import NearestNeighbors
 
 from fpe_codebook import FPECodebook, bundle_weighted
 from gvfa_encoder import encode_graph
+from ego_motion import fit_ego_motion, residual_split
+from graph_smoothing import (
+    compute_prototypes,
+    drop_tiny_clusters,
+    smooth_labels,
+)
 from motion_pooling import (
     bundle_hypervectors,
     diagnose_bundling_cosine,
     diagnose_clustering,
     diagnose_node_flow,
+    induce_subgraph,
     motion_coarsen,
-    save_supernodes_png,
     supernode_aggregates,
     unpool,
+)
+from viz_diagnostics import (
+    plot_ego_fit,
+    plot_flow_raw,
+    plot_flow_smoothed,
+    plot_residual_split,
+    plot_segmentation,
+    plot_summary,
+    plot_supernodes,
 )
 
 # ----------------------------------------------------------------------------
@@ -84,15 +99,27 @@ NUM_LAYERS = 3        # GraphCNN layers incl. input (tunable via --num-layers)
 USE_RESERVOIR = False # no tap buffer / Sigma-Pi
 TAU        = 0.15     # cosine merge threshold (tunable)
 ALPHA      = 0.15     # prototype update rate (tunable)
-MIN_EVENTS = 150      # min cluster size; smaller -> background (tunable)
+MIN_EVENTS = 150      # min cluster size (flat path); smaller -> background
 
-# === MOTION-COHERENT HIERARCHICAL POOLING (tunable) ===
+# === STAGE 1: flow regularization ===
+FLOW_SMOOTH_ITERS = 4      # smoothing iterations
+FLOW_KEEP         = 0.5    # self weight per iteration
+
+# === STAGE 2: ego-motion + residual split ===
+RES_K      = 3.0           # residual threshold in robust sigmas
+IRLS_ITERS = 10
+
+# === STAGE 3: motion-coherent pooling on IMO residuals ===
 SIGMA_V          = None   # None => auto (median edge ||v_i-v_j||)
-W_MIN            = 0.3    # refuse Graclus merges below this motion affinity
-N_COARSEN_LEVELS = 5      # ~27k events -> ~800 supernodes
-SUPER_R_XY       = 40.0   # supernode graph spatial radius (px)
-SUPER_R_T_MS     = 30.0   # supernode graph temporal radius (ms)
-MIN_SUPER_SIZE   = 3      # mark supernodes with fewer members as background
+W_MIN            = 0.1    # refuse Graclus merges below this motion affinity
+N_COARSEN_LEVELS = 7      # coarsening depth on IMO subgraph
+SUPER_R_XY       = 40.0   # (kept for --flat / legacy supernode path)
+SUPER_R_T_MS     = 30.0
+MIN_SUPER_SIZE   = 3      # mark supernodes with fewer members as noise
+LAM              = 1.5    # graph label-smoothing strength
+SMOOTH_ITERS     = 5
+MIN_CLUSTER_SIZE = 200    # final objects smaller than this -> background
+OUT_DIR          = "diag"
 
 # === FPE CODEBOOK CONFIG (tunable) ===
 # Per-feature bandwidth (Gaussian kernel length-scale = 1/bandwidth)
@@ -105,7 +132,7 @@ BW_VX, BW_VY = 0.1, 0.1          # scale ~1 signed-log unit
 BW_DP      = 1.43
 
 # Node bundle weights (absolute x, y, t, p only)
-W_NODE_X, W_NODE_Y, W_NODE_T, W_NODE_P = 0, 0, 0.1, 0.2
+W_NODE_X, W_NODE_Y, W_NODE_T, W_NODE_P = 0, 0, 0.1, 0
 
 # Spatial edge bundle weights
 W_EDGE_S_DX, W_EDGE_S_DY, W_EDGE_S_DT = 0.5, 0.5, 0.3  #                Short-range displacement
@@ -354,6 +381,57 @@ def node_flow(t, x, y, edge_index, min_pts=5, ridge=1e-9, clip_pct=99.0):
     return vx, vy   # px/s
 
 
+def smooth_flow(vx, vy, edge_index_spatial, n_iters=4, keep=0.5):
+    """Graph-neighbour regularization of normal flow (Stage 1).
+
+    Each iteration: v_i <- keep * v_i + (1-keep) * mean(v_j over valid spatial nbrs).
+    Events with no valid neighbours keep their value. Vectorized via np.add.at.
+
+    Returns (vx_s, vy_s, n_valid_before, n_valid_after).
+    """
+    vx_s = np.asarray(vx, dtype=np.float64).copy()
+    vy_s = np.asarray(vy, dtype=np.float64).copy()
+    n = len(vx_s)
+    n_valid_before = int((np.hypot(vx_s, vy_s) > 1e-12).sum())
+
+    if edge_index_spatial is None or edge_index_spatial.numel() == 0 or n_iters <= 0:
+        return vx_s, vy_s, n_valid_before, n_valid_before
+
+    rec = edge_index_spatial[0].numpy().astype(np.int64)
+    src = edge_index_spatial[1].numpy().astype(np.int64)
+    # undirected: both directions
+    a = np.concatenate([rec, src])
+    b = np.concatenate([src, rec])
+
+    for _ in range(n_iters):
+        valid = np.hypot(vx_s, vy_s) > 1e-12
+        # only aggregate from valid neighbours
+        nbr_ok = valid[b]
+        aa, bb = a[nbr_ok], b[nbr_ok]
+        sx = np.zeros(n, dtype=np.float64)
+        sy = np.zeros(n, dtype=np.float64)
+        cnt = np.zeros(n, dtype=np.float64)
+        if aa.size:
+            np.add.at(sx, aa, vx_s[bb])
+            np.add.at(sy, aa, vy_s[bb])
+            np.add.at(cnt, aa, 1.0)
+        has = cnt > 0
+        mean_x = np.zeros(n, dtype=np.float64)
+        mean_y = np.zeros(n, dtype=np.float64)
+        mean_x[has] = sx[has] / cnt[has]
+        mean_y[has] = sy[has] / cnt[has]
+        new_x = vx_s.copy()
+        new_y = vy_s.copy()
+        new_x[has] = keep * vx_s[has] + (1.0 - keep) * mean_x[has]
+        new_y[has] = keep * vy_s[has] + (1.0 - keep) * mean_y[has]
+        vx_s, vy_s = new_x, new_y
+
+    n_valid_after = int((np.hypot(vx_s, vy_s) > 1e-12).sum())
+    print(f"[smooth_flow] iters={n_iters} keep={keep}  "
+          f"valid {n_valid_before} -> {n_valid_after}")
+    return vx_s, vy_s, n_valid_before, n_valid_after
+
+
 # ----------------------------------------------------------------------------
 # 4. FPE CODEBOOK NODE / EDGE ENCODING
 # ----------------------------------------------------------------------------
@@ -527,18 +605,20 @@ def save(t, x, y, p, obj_id, parquet="events_labeled.parquet", png="seg.png",
         print(f"[warn] parquet unavailable ({e}); wrote {parquet}")
 
     ids, counts = np.unique(obj_id, return_counts=True)
-    n_obj = int((ids >= 0).sum())
-    n_bg = int(counts[ids == -1].sum()) if (ids == -1).any() else 0
+    # background is label 0 (new path) or -1 (flat path)
+    is_bg = ids <= 0
+    n_obj = int((~is_bg).sum())
+    n_bg = int(counts[is_bg].sum()) if is_bg.any() else 0
     order = np.argsort(-counts)
     print(f"\n#objects found: {n_obj}  (+ {n_bg} background/noise events)  "
           f"over {len(obj_id)} events")
     for k in order:
-        tag = "  <- background/noise" if ids[k] == -1 else ""
+        tag = "  <- background/noise" if ids[k] <= 0 else ""
         print(f"  object {ids[k]:3d}: {counts[k]:6d} events{tag}")
 
     # scatter coloured by object id (background drawn first, in grey)
     plt.figure(figsize=(9, 7))
-    bg = obj_id < 0
+    bg = obj_id <= 0
     if bg.any():
         plt.scatter(x[bg], y[bg], c="0.82", s=2, linewidths=0, label="background")
     fg = ~bg
@@ -591,6 +671,8 @@ def build_supernode_multigraph(t_s, x_s, y_s, p_s,
 # MAIN
 # ----------------------------------------------------------------------------
 def main():
+    import time as _time
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", default="events_filtered.txt")
     ap.add_argument("--window-ms", type=float, default=WINDOW_MS)
@@ -599,7 +681,7 @@ def main():
     ap.add_argument("--num-layers", type=int, default=NUM_LAYERS,
                     help="GVFA layers incl. input (3 => 2 hops)")
     ap.add_argument("--flat", action="store_true",
-                    help="bypass hierarchical pooling; old per-event clustering")
+                    help="bypass ego-motion + pooling; old per-event clustering")
     ap.add_argument("--n-coarsen-levels", type=int, default=N_COARSEN_LEVELS)
     ap.add_argument("--w-min", type=float, default=W_MIN,
                     help="refuse Graclus merges below this motion affinity")
@@ -607,10 +689,25 @@ def main():
                     help="velocity length-scale; default=auto median edge ||dv||")
     ap.add_argument("--super-r-xy", type=float, default=SUPER_R_XY)
     ap.add_argument("--super-r-t-ms", type=float, default=SUPER_R_T_MS)
+    ap.add_argument("--res-k", type=float, default=RES_K,
+                    help="residual threshold in robust sigmas")
+    ap.add_argument("--flow-smooth-iters", type=int, default=FLOW_SMOOTH_ITERS)
+    ap.add_argument("--lam", type=float, default=LAM,
+                    help="graph label-smoothing strength")
+    ap.add_argument("--out-dir", default=OUT_DIR,
+                    help="diagnostic figure output directory")
     args = ap.parse_args()
 
     sigma_v = args.sigma_v if args.sigma_v is not None else SIGMA_V
     torch.manual_seed(SEED)
+    t0 = _time.time()
+
+    print(
+        f"[config] window={args.window_ms}ms  layers={args.num_layers}  "
+        f"tau={args.tau}  res_k={args.res_k}  flow_iters={args.flow_smooth_iters}  "
+        f"w_min={args.w_min}  coarsen={args.n_coarsen_levels}  "
+        f"lam={args.lam}  out={args.out_dir}  flat={args.flat}"
+    )
 
     print(f"loading {args.input} (window={args.window_ms} ms) ...")
     t, x, y, p = load_events(args.input, args.window_ms)
@@ -645,94 +742,143 @@ def main():
           f"({D} spatial + {D} temporal)")
 
     if args.flat:
-        print("[flat] bypassing motion pooling — per-event clustering")
+        print("[flat] bypassing ego-motion + pooling — per-event clustering")
         print(f"streaming assignment (tau={args.tau}) ...")
         obj_id = assign(H_events, t, comp, tau=args.tau)
         save(t, x, y, p, obj_id, tau=args.tau)
         return
 
-    # --- hierarchical path ---
-    print("estimating per-event normal flow (node_flow on temporal graph) ...")
+    # ==================================================================
+    # STAGE 1 — flow regularization
+    # ==================================================================
+    print("STAGE 1: estimating + regularizing normal flow ...")
     vx, vy = node_flow(t, x, y, edge_temporal)
     diagnose_node_flow(vx, vy)
+    p1 = plot_flow_raw(x, y, vx, vy, args.out_dir)
 
-    print("motion-coherent Graclus coarsening ...")
-    cluster_id, _cinfo = motion_coarsen(
-        len(t), edge_spatial, edge_temporal, vx, vy,
-        n_levels=args.n_coarsen_levels,
-        sigma_v=sigma_v,
-        w_min=args.w_min,
-        seed=SEED,
+    vx_s, vy_s, n_vb, n_va = smooth_flow(
+        vx, vy, edge_spatial,
+        n_iters=args.flow_smooth_iters, keep=FLOW_KEEP)
+    p2 = plot_flow_smoothed(
+        x, y, vx_s, vy_s, args.out_dir,
+        n_iters=args.flow_smooth_iters, keep=FLOW_KEEP,
+        n_valid_before=n_vb, n_valid_after=n_va)
+
+    # ==================================================================
+    # STAGE 2 — ego-motion fit + residual split
+    # ==================================================================
+    print("STAGE 2: ego-motion IRLS fit + residual split ...")
+    valid_flow = np.hypot(vx_s, vy_s) > 1e-12
+    params, residual, ego_info = fit_ego_motion(
+        x, y, vx_s, vy_s, SENSOR, n_iters=IRLS_ITERS, valid_mask=valid_flow)
+    is_imo, residual, thresh = residual_split(
+        residual, edge_spatial, res_k=args.res_k, valid_mask=valid_flow)
+
+    p3 = plot_ego_fit(
+        x, y, params, residual, SENSOR, args.out_dir,
+        res_k=args.res_k, thresh=thresh,
+        inlier_rms=ego_info["inlier_rms"], info=ego_info)
+    p4 = plot_residual_split(x, y, is_imo, residual, thresh, args.out_dir)
+
+    # ==================================================================
+    # STAGE 3 — VSA pooling on IMO residuals only
+    # ==================================================================
+    print("STAGE 3: residual-affinity coarsening on IMO subgraph ...")
+    labels = np.zeros(len(t), dtype=np.int64)  # 0 = background
+    rx, ry = residual[:, 0], residual[:, 1]
+    cluster_full = np.full(len(t), -1, dtype=np.int64)
+    cinfo = {
+        "sigma_v": float("nan"), "w_min": args.w_min,
+        "n_levels": args.n_coarsen_levels, "C": 0,
+        "sizes": np.array([0]), "n_rejected_total": 0,
+    }
+
+    n_imo = int(is_imo.sum())
+    if n_imo == 0:
+        print("[stage3] no IMO candidates — all background")
+    else:
+        edge_s_imo, sub_idx, _ = induce_subgraph(edge_spatial, is_imo)
+        edge_t_imo, _, _ = induce_subgraph(edge_temporal, is_imo)
+        rx_imo, ry_imo = rx[sub_idx], ry[sub_idx]
+        t_imo = t[sub_idx]
+        H_imo = H_events[sub_idx]
+
+        cluster_id, cinfo = motion_coarsen(
+            n_imo, edge_s_imo, edge_t_imo, rx_imo, ry_imo,
+            n_levels=args.n_coarsen_levels,
+            sigma_v=sigma_v,
+            w_min=args.w_min,
+            seed=SEED,
+        )
+        cinfo["w_min"] = args.w_min
+        cinfo["n_levels"] = args.n_coarsen_levels
+        cluster_full[sub_idx] = cluster_id
+
+        print("bundling IMO hypervectors into supernodes ...")
+        H_s_bundle = bundle_hypervectors(H_imo[:, :D], cluster_id)
+        H_t_bundle = bundle_hypervectors(H_imo[:, D:], cluster_id)
+        H_super = torch.cat([H_s_bundle, H_t_bundle], dim=1)
+        diagnose_bundling_cosine(H_super, seed=SEED, label="bundling")
+
+        # components on supernodes via projected IMO spatial edges
+        C = H_super.shape[0]
+        if edge_s_imo.numel() > 0:
+            rec_s = cluster_id[edge_s_imo[0].numpy()]
+            src_s = cluster_id[edge_s_imo[1].numpy()]
+            comp_super = connected_components(C, rec_s, src_s)
+        else:
+            comp_super = np.zeros(C, dtype=np.int64)
+
+        # supernode times = mean member time
+        agg = supernode_aggregates(
+            x[sub_idx], y[sub_idx], t_imo, p[sub_idx],
+            rx_imo, ry_imo, cluster_id)
+        print(f"streaming assignment on IMO supernodes (tau={args.tau}) ...")
+        labels_super = assign(
+            H_super, agg["t"], comp_super, tau=args.tau, min_events=0)
+        # mark tiny supernodes as noise (-1), then shift to 1..K (0=background)
+        small = agg["counts"] < MIN_SUPER_SIZE
+        if small.any():
+            labels_super = labels_super.copy()
+            labels_super[small] = -1
+            print(f"  marked {int(small.sum())} tiny supernodes as noise")
+        diagnose_clustering(H_super, labels_super)
+
+        # map: -1 -> 0 (noise/bg), 0..K-1 -> 1..K
+        labels_imo_events = unpool(labels_super, cluster_id)
+        out = np.zeros(n_imo, dtype=np.int64)
+        keep = labels_imo_events >= 0
+        if keep.any():
+            _, compact = np.unique(labels_imo_events[keep], return_inverse=True)
+            out[keep] = compact + 1  # start at 1
+        labels[sub_idx] = out
+        assert np.all(labels[sub_idx] == out)
+        print("[unpool] IMO events labelled; background stays 0")
+
+    p5 = plot_supernodes(x, y, cluster_full[is_imo] if n_imo else np.array([]),
+                         is_imo, args.out_dir, cinfo)
+
+    # graph-smoothing cleanup on full event graph
+    print(f"graph label smoothing (lam={args.lam}, iters={SMOOTH_ITERS}) ...")
+    protos = compute_prototypes(H_events, labels)
+    labels = smooth_labels(
+        labels, H_events, protos,
+        edge_index_list=[edge_spatial, edge_temporal],
+        lam=args.lam, n_iters=SMOOTH_ITERS,
     )
-    save_supernodes_png(x, y, cluster_id, path="supernodes.png")
+    labels = drop_tiny_clusters(labels, MIN_CLUSTER_SIZE, background=0)
+    assert len(labels) == len(t)
+    assert not np.isnan(labels.astype(np.float64)).any()
 
-    print("bundling event hypervectors into supernodes ...")
-    # Bundle each graph branch separately so dims stay D (edge_H bind requires matching D)
-    H_s_bundle = bundle_hypervectors(H_events[:, :D], cluster_id)
-    H_t_bundle = bundle_hypervectors(H_events[:, D:], cluster_id)
-    H_bundle = torch.cat([H_s_bundle, H_t_bundle], dim=1)
-    agg = supernode_aggregates(x, y, t, p, vx, vy, cluster_id)
-    diagnose_bundling_cosine(H_bundle, seed=SEED, label="bundling")
-    C = H_bundle.shape[0]
-    print(f"  H_super (bundled): {H_bundle.shape}  "
-          f"dropped-size threshold MIN_SUPER_SIZE={MIN_SUPER_SIZE}")
+    runtime = _time.time() - t0
+    p6 = plot_segmentation(
+        x, y, labels, args.out_dir,
+        tau=args.tau, num_layers=args.num_layers,
+        lam=args.lam, smooth_iters=SMOOTH_ITERS, runtime_s=runtime)
+    plot_summary([p1, p2, p3, p4, p5, p6], args.out_dir)
 
-    print(f"building supernode multigraph "
-          f"(R_xy={args.super_r_xy}, R_t={args.super_r_t_ms} ms) ...")
-    (edge_s_super, edge_t_super,
-     attr_s_super, attr_t_super,
-     rec_s, src_s) = build_supernode_multigraph(
-        agg["t"], agg["x"], agg["y"], agg["p"],
-        super_r_xy=args.super_r_xy,
-        super_r_t_ms=args.super_r_t_ms,
-    )
-    print(f"  supernode spatial:  {edge_s_super.shape[1]} edges")
-    print(f"  supernode temporal: {edge_t_super.shape[1]} edges")
-    comp_super = connected_components(C, rec_s, src_s)
-    print(f"  {comp_super.max()+1} supernode spatial connected components")
-
-    print(f"re-encoding supernodes with frozen GVFA ({args.num_layers} layers) ...")
-    H_s_super = encode_nodes(
-        H_s_bundle, edge_s_super, attr_s_super, cb_spatial, w_spatial,
-        "spatial", args.num_layers)
-    H_t_super = encode_nodes(
-        H_t_bundle, edge_t_super, attr_t_super, cb_temporal, w_temporal,
-        "temporal", args.num_layers)
-    H_super = torch.cat([H_s_super, H_t_super], dim=1)
-    print(f"  H_super (re-encoded): {H_super.shape}")
-    diagnose_bundling_cosine(H_super, seed=SEED, label="re-encode")
-
-    print(f"streaming assignment on supernodes (tau={args.tau}) ...")
-    # assign() mean-centers internally; pass re-encoded H_super as-is
-    labels_super = assign(H_super, agg["t"], comp_super, tau=args.tau,
-                          min_events=0)  # size filter applied after unpool
-    small = agg["counts"] < MIN_SUPER_SIZE
-    if small.any():
-        n_small = int(small.sum())
-        labels_super = labels_super.copy()
-        labels_super[small] = -1
-        print(f"  marked {n_small} supernodes with <{MIN_SUPER_SIZE} members "
-              f"as background")
-    diagnose_clustering(H_super, labels_super)
-
-    obj_id = unpool(labels_super, cluster_id)
-    assert np.all(obj_id == labels_super[cluster_id]), \
-        "unpool coherence violated: event label != supernode label"
-    print("[unpool] assert ok — every event label equals its supernode label")
-
-    # noise cleanup at event level (same min_events policy as flat path)
-    if MIN_EVENTS > 0:
-        ids, counts = np.unique(obj_id, return_counts=True)
-        small_obj = set(ids[(ids >= 0) & (counts < MIN_EVENTS)].tolist())
-        if small_obj:
-            obj_id = np.array([-1 if o in small_obj else o for o in obj_id],
-                              dtype=np.int64)
-            keep = obj_id >= 0
-            if keep.any():
-                _, compact = np.unique(obj_id[keep], return_inverse=True)
-                obj_id[keep] = compact
-
-    save(t, x, y, p, obj_id, tau=args.tau)
+    save(t, x, y, p, labels, tau=args.tau)
+    print(f"done in {runtime:.1f}s  -> diagnostics in {args.out_dir}/")
 
 
 if __name__ == "__main__":

@@ -49,6 +49,33 @@ def _undirected_edge_union(edge_a, edge_b):
     return uniq[:, 0].astype(np.int64), uniq[:, 1].astype(np.int64)
 
 
+def induce_subgraph(edge_index, node_mask):
+    """Keep edges whose both ends are in node_mask; remap endpoints to 0..n_sub-1.
+
+    Returns
+        edge_sub : LongTensor [2, E'] (empty if none)
+        sub_idx  : int [n_sub] original indices of kept nodes
+        old_to_new : int [N] map original -> new (-1 if not kept)
+    """
+    node_mask = np.asarray(node_mask, dtype=bool)
+    n = len(node_mask)
+    sub_idx = np.where(node_mask)[0].astype(np.int64)
+    old_to_new = np.full(n, -1, dtype=np.int64)
+    old_to_new[sub_idx] = np.arange(len(sub_idx), dtype=np.int64)
+    if edge_index is None or (
+            isinstance(edge_index, torch.Tensor) and edge_index.numel() == 0):
+        return torch.zeros(2, 0, dtype=torch.long), sub_idx, old_to_new
+    rec = edge_index[0].numpy()
+    src = edge_index[1].numpy()
+    keep = node_mask[rec] & node_mask[src]
+    if not keep.any():
+        return torch.zeros(2, 0, dtype=torch.long), sub_idx, old_to_new
+    rec_n = old_to_new[rec[keep]]
+    src_n = old_to_new[src[keep]]
+    edge_sub = torch.from_numpy(np.stack([rec_n, src_n], axis=0)).long()
+    return edge_sub, sub_idx, old_to_new
+
+
 # ----------------------------------------------------------------------------
 # Graclus / heavy-edge matching
 # ----------------------------------------------------------------------------
@@ -137,6 +164,9 @@ def motion_coarsen(n_events, edge_spatial, edge_temporal, vx, vy,
             "levels": [n_events],
             "n_rejected_total": 0,
             "sizes": np.ones(n_events, dtype=np.int64),
+            "w_min": w_min,
+            "n_levels": n_levels,
+            "C": n_events,
         }
 
     # sigma_v from fine-level edge motion distances
@@ -179,6 +209,9 @@ def motion_coarsen(n_events, edge_spatial, edge_temporal, vx, vy,
         "levels": level_counts,
         "n_rejected_total": n_rejected_total,
         "sizes": sizes,
+        "w_min": w_min,
+        "n_levels": n_levels,
+        "C": C,
     }
     return event_to_node.astype(np.int64), info
 
