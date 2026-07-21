@@ -8,41 +8,23 @@ coherence encoded as hypervectors (VSA / HRR) and refined by a few hops of the
 GVFA GraphCNN, then clustered online by cosine similarity inside each spatial
 connected component.
 
-NODE FEATURES (both graphs): absolute {x, y, t, p} via FPE codebooks.  Relative
-position/motion appears only in edge Δ terms (Eq. 5 / Eq. 6).
+NODE FEATURES (both graphs): absolute {x, y, t, p} plus residual motion
+{|r|, angle(r)} via FPE codebooks (motion-dominant bundle). Relative
+position/motion still appears in edge Δ terms (Eq. 5 / Eq. 6).
 
 PIPELINE
-    load_events      -> read txt, take a time WINDOW (fast)
-    build_multigraph -> spatial + temporal ellipsoid graphs (causal, past-only)
-    fpe_encode       -> FPE codebook node hypervectors from {x, y, t, p}
-    encode_nodes     -> FPE codebook edge_H + GVFA per graph; hop-bundle; concat
-    assign           -> streaming prototype clustering, factored by component
-    save             -> events_labeled.parquet + seg.png + console summary
-
-PARAMETERS (constants below; edit them in place)
-    WINDOW_MS   time slice processed, in milliseconds (default 30).
-                Increase to see more motion / more objects; cost grows with the
-                number of events in the slice. Set to None for the whole file.
-    SENSOR      sensor size (W, H) in pixels; spatial R_XY scales from W.
-    SPATIAL_*   ellipsoid axes for the spatial graph (4% W, 5 ms, max 16 nbrs).
-    TEMPORAL_*  ellipsoid axes for the temporal graph (1% W, 40 ms, max 12 nbrs).
-    D           hypervector dimensionality per graph branch (default 4000);
-                final node vectors are concat(H_spatial, H_temporal) -> 2*D.
-    NUM_LAYERS  GraphCNN layers INCLUDING the input layer; 3 => 2 hops. Kept
-                small on purpose so each node's vector stays local to its object.
-    TAU         cosine threshold to join an existing object (default 0.15).
-                Lower => fewer, larger objects (more merging); higher => more
-                objects (more splitting).
-    ALPHA       prototype update rate for the decayed bundle (default 0.10).
-    MIN_EVENTS  objects smaller than this are treated as noise and relabeled to
-                background id -1 (default 80). Set to 0 to keep every object.
-
-    Secondary FPE codebook bandwidths / bundle weights — see FPE CODEBOOK CONFIG.
+    load_events / build_multigraph
+    Stage 1: node_flow -> smooth_flow
+    Stage 2: fit_ego_motion -> residual_split -> dilate/erode -> fit_object_models
+    fpe_encode(x,y,t,p,rx,ry) -> GVFA
+    Stage 3: motion_coarsen(IMO, residual, model_id gate) -> assign -> unpool
+    smooth_labels -> drop_tiny_clusters -> diagnostics
 
 USAGE
     python segment.py --window-ms 60 --num-layers 3
     python segment.py --input events_filtered.txt --tau 0.12 --num-layers 4
-Outputs events_labeled.parquet and seg.png in the working directory.
+    python segment.py --flat   # old whole-scene path (no residual / models)
+Outputs events_labeled.parquet and diag/*.png in the working directory.
 """
 
 import argparse
@@ -50,9 +32,14 @@ import numpy as np
 import torch
 from sklearn.neighbors import NearestNeighbors
 
-from fpe_codebook import FPECodebook, bundle_weighted
+from fpe_codebook import FPECodebook, bundle_weighted, bind_hv, PHASE_INT_KMAX
 from gvfa_encoder import encode_graph
-from ego_motion import fit_ego_motion, residual_split
+from ego_motion import (
+    fit_ego_motion,
+    residual_split,
+    refine_imo_mask,
+    fit_object_models,
+)
 from graph_smoothing import (
     compute_prototypes,
     drop_tiny_clusters,
@@ -72,6 +59,8 @@ from viz_diagnostics import (
     plot_ego_fit,
     plot_flow_raw,
     plot_flow_smoothed,
+    plot_motion_kernels,
+    plot_motion_models,
     plot_residual_split,
     plot_segmentation,
     plot_summary,
@@ -106,8 +95,15 @@ FLOW_SMOOTH_ITERS = 4      # smoothing iterations
 FLOW_KEEP         = 0.5    # self weight per iteration
 
 # === STAGE 2: ego-motion + residual split ===
-RES_K      = 3.0           # residual threshold in robust sigmas
+RES_K      = 2.0           # residual threshold in robust sigmas
 IRLS_ITERS = 10
+DILATE_ITERS = 2           # recover motion-parallel contours (aperture)
+DILATE_FRAC  = 0.5         # neighbour IMO fraction to flip BG->IMO / erode
+
+# === STAGE 2b: multi-model fitting on IMO ===
+MAX_MODELS        = 4      # upper bound; stop by inlier count
+MIN_MODEL_INLIERS = 300
+MODEL_RES_K       = 2.5
 
 # === STAGE 3: motion-coherent pooling on IMO residuals ===
 SIGMA_V          = None   # None => auto (median edge ||v_i-v_j||)
@@ -130,9 +126,15 @@ BW_DX, BW_DY = 0.1, 0.1          # scale ~10 px
 BW_DT      = 3.3e-4              # scale ~3 ms
 BW_VX, BW_VY = 0.1, 0.1          # scale ~1 signed-log unit
 BW_DP      = 1.43
+BW_SPEED   = 0.1                 # residual speed codebook
+SPEED_V0   = 50.0                # px/s signed-log knee for |r|
+N_ANGLE_BINS = 720               # 0.5 deg resolution for direction
 
-# Node bundle weights (absolute x, y, t, p only)
-W_NODE_X, W_NODE_Y, W_NODE_T, W_NODE_P = 0, 0, 0.1, 0
+# Node bundle weights — motion dominant; polarity off (contrast ≠ identity)
+W_NODE_X, W_NODE_Y = 0.3, 0.3
+W_NODE_T           = 0.5
+W_NODE_P           = 0.0
+W_NODE_MOTION      = 2.0      # ~3x position: residual motion is the cue
 
 # Spatial edge bundle weights
 W_EDGE_S_DX, W_EDGE_S_DY, W_EDGE_S_DT = 0.5, 0.5, 0.3  #                Short-range displacement
@@ -451,6 +453,17 @@ def make_codebooks(sensor=SENSOR, t_span_s=0.06, seed=SEED):
                          phase_dist="gaussian", seed=seed + 3),
         "p": FPECodebook("p", D, BW_P, "integer", vmin=0, vmax=1,
                          phase_dist="gaussian", seed=seed + 4),
+        # residual motion: speed (|r|) + periodic direction (angle)
+        "speed": FPECodebook(
+            "speed", D, BW_SPEED, "signed_log_radix", radix_S=16,
+            vmin=0, vmax=60, value_grid_step=0.1,
+            signed_log_v0=SPEED_V0, phase_dist="gaussian", seed=seed + 20,
+        ),
+        "dir": FPECodebook(
+            "dir", D, 1.0, "periodic", n_angle_bins=N_ANGLE_BINS,
+            phase_dist="integer", phase_int_kmax=PHASE_INT_KMAX,
+            seed=seed + 21,
+        ),
     }
     edge_dx = FPECodebook("dx", D, BW_DX, "integer", vmin=-W, vmax=W,
                           phase_dist="gaussian", seed=seed + 10)
@@ -486,8 +499,13 @@ def make_codebooks(sensor=SENSOR, t_span_s=0.06, seed=SEED):
     return node, edge_spatial, edge_temporal, w_spatial, w_temporal
 
 
-def fpe_encode(x, y, t, p, codebooks):
-    """FPE-codebook node features {x, y, t, p} -> L2-normalized [N, D]."""
+def fpe_encode(x, y, t, p, codebooks, *, rx=None, ry=None, motion_valid=None):
+    """FPE node features {x,y,t,p} plus optional residual motion (|r|, angle).
+
+    Keyword-only rx, ry keep existing callers working. When residual is provided,
+    speed and direction are BOUND (conjunctive) then bundled with motion-dominant
+    weight. Events with undefined residual get a zero motion sub-symbol.
+    """
     t_us = (t - t[0]) * 1e6
     terms = [
         (codebooks["x"].encode(x), W_NODE_X),
@@ -495,6 +513,30 @@ def fpe_encode(x, y, t, p, codebooks):
         (codebooks["t"].encode(t_us, interpolate=True), W_NODE_T),
         (codebooks["p"].encode(p), W_NODE_P),
     ]
+
+    if rx is not None and ry is not None and "speed" in codebooks and "dir" in codebooks:
+        rx = np.asarray(rx, dtype=np.float64).ravel()
+        ry = np.asarray(ry, dtype=np.float64).ravel()
+        n = len(rx)
+        if motion_valid is None:
+            motion_valid = np.isfinite(rx) & np.isfinite(ry)
+        else:
+            motion_valid = np.asarray(motion_valid, dtype=bool).ravel()
+        n_undef = int((~motion_valid).sum())
+        print(f"[fpe] residual motion channel: {int(motion_valid.sum())}/{n} valid; "
+              f"{n_undef} events get zero z_motion")
+
+        speed = np.hypot(rx, ry)
+        ang = np.arctan2(ry, rx)
+        z_speed = codebooks["speed"].encode(speed, interpolate=True)
+        z_dir = codebooks["dir"].encode(ang, interpolate=True)
+        z_motion = bind_hv(z_speed, z_dir)
+        if n_undef:
+            z_motion = z_motion.clone()
+            bad = torch.from_numpy(~motion_valid)
+            z_motion[bad] = 0.0
+        terms.append((z_motion, W_NODE_MOTION))
+
     return bundle_weighted(terms)
 
 
@@ -730,18 +772,15 @@ def main():
     node_cb, cb_spatial, cb_temporal, w_spatial, w_temporal = make_codebooks(
         SENSOR, t_span, seed=SEED)
 
-    print("FPE codebook-encoding nodes (x, y, t, p) ...")
-    x_hv = fpe_encode(x, y, t, p, node_cb)
-
-    print(f"running FPE-edge GVFA ({args.num_layers} layers, "
-          f"hop-bundle sum, L2 norm) on each graph ...")
-    H_events = encode_nodes_multigraph(
-        x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal,
-        cb_spatial, cb_temporal, w_spatial, w_temporal, args.num_layers)
-    print(f"  concatenated hypervectors: {H_events.shape[1]} dims "
-          f"({D} spatial + {D} temporal)")
-
     if args.flat:
+        # old whole-scene path: encode without residual, skip Stages 1–3
+        print("[flat] FPE codebook-encoding nodes (x, y, t, p) — no residual")
+        x_hv = fpe_encode(x, y, t, p, node_cb)
+        print(f"running FPE-edge GVFA ({args.num_layers} layers) ...")
+        H_events = encode_nodes_multigraph(
+            x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal,
+            cb_spatial, cb_temporal, w_spatial, w_temporal, args.num_layers)
+        print(f"  concatenated hypervectors: {H_events.shape[1]} dims")
         print("[flat] bypassing ego-motion + pooling — per-event clustering")
         print(f"streaming assignment (tau={args.tau}) ...")
         obj_id = assign(H_events, t, comp, tau=args.tau)
@@ -765,7 +804,7 @@ def main():
         n_valid_before=n_vb, n_valid_after=n_va)
 
     # ==================================================================
-    # STAGE 2 — ego-motion fit + residual split
+    # STAGE 2 — ego-motion fit + residual split + dilate/erode + models
     # ==================================================================
     print("STAGE 2: ego-motion IRLS fit + residual split ...")
     valid_flow = np.hypot(vx_s, vy_s) > 1e-12
@@ -774,18 +813,56 @@ def main():
     is_imo, residual, thresh = residual_split(
         residual, edge_spatial, res_k=args.res_k, valid_mask=valid_flow)
 
+    print("STAGE 2b: dilate/erode IMO mask (aperture recovery) ...")
+    is_imo, dilate_info = refine_imo_mask(
+        is_imo, [edge_spatial], n_dilate=DILATE_ITERS, frac=DILATE_FRAC)
+
+    rx, ry = residual[:, 0], residual[:, 1]
+    print("STAGE 2c: recursive multi-model fitting on IMO ...")
+    model_id, models = fit_object_models(
+        x, y, rx, ry, is_imo, SENSOR,
+        max_models=MAX_MODELS,
+        min_inliers=MIN_MODEL_INLIERS,
+        res_k=MODEL_RES_K,
+        n_iters=IRLS_ITERS,
+    )
+
     p3 = plot_ego_fit(
         x, y, params, residual, SENSOR, args.out_dir,
         res_k=args.res_k, thresh=thresh,
         inlier_rms=ego_info["inlier_rms"], info=ego_info)
-    p4 = plot_residual_split(x, y, is_imo, residual, thresh, args.out_dir)
+    p4 = plot_residual_split(
+        x, y, is_imo, residual, thresh, args.out_dir,
+        res_k=args.res_k, dilate_info=dilate_info)
+    p9 = plot_motion_models(
+        x, y, is_imo, model_id, models, args.out_dir,
+        max_models=MAX_MODELS, model_res_k=MODEL_RES_K,
+        min_model_inliers=MIN_MODEL_INLIERS)
+
+    # ==================================================================
+    # Encode AFTER residual (motion enters node hypervector)
+    # ==================================================================
+    print("FPE codebook-encoding nodes (x, y, t, p, |r|, angle(r)) ...")
+    x_hv = fpe_encode(
+        x, y, t, p, node_cb, rx=rx, ry=ry, motion_valid=valid_flow)
+    p8 = plot_motion_kernels(
+        node_cb["dir"], node_cb["speed"], args.out_dir,
+        bw_speed=BW_SPEED, speed_v0=SPEED_V0,
+        n_angle_bins=N_ANGLE_BINS, phase_int_kmax=PHASE_INT_KMAX)
+
+    print(f"running FPE-edge GVFA ({args.num_layers} layers, "
+          f"hop-bundle sum, L2 norm) on each graph ...")
+    H_events = encode_nodes_multigraph(
+        x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal,
+        cb_spatial, cb_temporal, w_spatial, w_temporal, args.num_layers)
+    print(f"  concatenated hypervectors: {H_events.shape[1]} dims "
+          f"({D} spatial + {D} temporal)")
 
     # ==================================================================
     # STAGE 3 — VSA pooling on IMO residuals only
     # ==================================================================
     print("STAGE 3: residual-affinity coarsening on IMO subgraph ...")
     labels = np.zeros(len(t), dtype=np.int64)  # 0 = background
-    rx, ry = residual[:, 0], residual[:, 1]
     cluster_full = np.full(len(t), -1, dtype=np.int64)
     cinfo = {
         "sigma_v": float("nan"), "w_min": args.w_min,
@@ -800,15 +877,20 @@ def main():
         edge_s_imo, sub_idx, _ = induce_subgraph(edge_spatial, is_imo)
         edge_t_imo, _, _ = induce_subgraph(edge_temporal, is_imo)
         rx_imo, ry_imo = rx[sub_idx], ry[sub_idx]
+        model_imo = model_id[sub_idx]
         t_imo = t[sub_idx]
         H_imo = H_events[sub_idx]
 
+        print(f"[stage3] inducing IMO subgraph: {n_imo} events; "
+              f"coarsening with RESIDUAL (rx, ry) + model_id gate")
         cluster_id, cinfo = motion_coarsen(
             n_imo, edge_s_imo, edge_t_imo, rx_imo, ry_imo,
             n_levels=args.n_coarsen_levels,
             sigma_v=sigma_v,
             w_min=args.w_min,
             seed=SEED,
+            model_id=model_imo,
+            velocity_name="residual",
         )
         cinfo["w_min"] = args.w_min
         cinfo["n_levels"] = args.n_coarsen_levels
@@ -869,16 +951,25 @@ def main():
     labels = drop_tiny_clusters(labels, MIN_CLUSTER_SIZE, background=0)
     assert len(labels) == len(t)
     assert not np.isnan(labels.astype(np.float64)).any()
+    assert np.all(np.isfinite(labels))
 
     runtime = _time.time() - t0
+    ids, counts = np.unique(labels, return_counts=True)
+    object_counts = [(int(i), int(c)) for i, c in zip(ids, counts) if i > 0]
     p6 = plot_segmentation(
         x, y, labels, args.out_dir,
         tau=args.tau, num_layers=args.num_layers,
-        lam=args.lam, smooth_iters=SMOOTH_ITERS, runtime_s=runtime)
-    plot_summary([p1, p2, p3, p4, p5, p6], args.out_dir)
+        lam=args.lam, smooth_iters=SMOOTH_ITERS, runtime_s=runtime,
+        w_node_motion=W_NODE_MOTION, n_models=len(models),
+        object_counts=object_counts)
+    # 3x3 summary: 01..06 + 08, 09 (slot order)
+    plot_summary([p1, p2, p3, p4, p5, p6, p8, p9], args.out_dir)
 
     save(t, x, y, p, labels, tau=args.tau)
+    n_obj = int(len(np.unique(labels[labels > 0]))) if (labels > 0).any() else 0
     print(f"done in {runtime:.1f}s  -> diagnostics in {args.out_dir}/")
+    print(f"[summary] models={len(models)}  objects={n_obj}  "
+          f"bg={int((labels == 0).sum())}")
 
 
 if __name__ == "__main__":

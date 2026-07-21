@@ -171,7 +171,8 @@ def plot_ego_fit(x, y, params, residual, sensor, out_dir, res_k, thresh,
     return path
 
 
-def plot_residual_split(x, y, is_imo, residual, thresh, out_dir):
+def plot_residual_split(x, y, is_imo, residual, thresh, out_dir,
+                        res_k=None, dilate_info=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -183,6 +184,7 @@ def plot_residual_split(x, y, is_imo, residual, thresh, out_dir):
     n_imo = int(is_imo.sum())
     n_bg = n - n_imo
     frac = 100.0 * n_imo / max(n, 1)
+    dilate_info = dilate_info or {}
 
     fig, ax = plt.subplots(figsize=(9, 7))
     bg = ~is_imo
@@ -200,12 +202,18 @@ def plot_residual_split(x, y, is_imo, residual, thresh, out_dir):
     ax.set_ylabel("y")
     ax.set_title("Stage 2: residual split (background vs IMO)", fontweight="bold")
     ax.set_aspect("equal", adjustable="box")
-    _annotate(ax, [
+    box = [
         f"thresh: {thresh:.4g} px/s",
+        f"RES_K: {res_k if res_k is not None else '?'}",
+        f"dilate iters: {dilate_info.get('n_dilate', '?')}",
+        f"dilate frac: {dilate_info.get('frac', '?')}",
+        f"#added by dilation: {dilate_info.get('n_added', 0)}",
+        f"#removed by erosion: {dilate_info.get('n_removed', 0)}",
         f"#background: {n_bg}",
         f"#IMO: {n_imo}",
         f"IMO %: {frac:.1f}",
-    ])
+    ]
+    _annotate(ax, box)
     fig.tight_layout()
     fig.savefig(path, dpi=140)
     plt.close(fig)
@@ -256,7 +264,8 @@ def plot_supernodes(x, y, cluster_id, is_imo, out_dir, info):
 
 
 def plot_segmentation(x, y, labels, out_dir, tau, num_layers, lam, smooth_iters,
-                      runtime_s):
+                      runtime_s, w_node_motion=None, n_models=None,
+                      object_counts=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -266,6 +275,8 @@ def plot_segmentation(x, y, labels, out_dir, tau, num_layers, lam, smooth_iters,
     ids, counts = np.unique(labels, return_counts=True)
     n_obj = int((ids > 0).sum())
     count_lines = [f"  id {i}: {c}" for i, c in zip(ids, counts)]
+    if object_counts is not None:
+        count_lines = [f"  id {i}: {c}" for i, c in object_counts]
 
     fig, ax = plt.subplots(figsize=(9, 7))
     bg = labels == 0
@@ -286,6 +297,8 @@ def plot_segmentation(x, y, labels, out_dir, tau, num_layers, lam, smooth_iters,
         f"num_layers: {num_layers}",
         f"lam: {lam}",
         f"smooth_iters: {smooth_iters}",
+        f"W_NODE_MOTION: {w_node_motion if w_node_motion is not None else '?'}",
+        f"#models found: {n_models if n_models is not None else '?'}",
         f"#objects: {n_obj}",
         f"runtime: {runtime_s:.1f}s",
     ] + count_lines[:8]
@@ -297,8 +310,131 @@ def plot_segmentation(x, y, labels, out_dir, tau, num_layers, lam, smooth_iters,
     return path
 
 
+def plot_motion_kernels(dir_cb, speed_cb, out_dir, bw_speed, speed_v0,
+                        n_angle_bins, phase_int_kmax):
+    """08_motion_kernels.png — periodic direction + log-speed codebook sims."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import torch
+
+    out_dir = _ensure_dir(out_dir)
+    path = os.path.join(out_dir, "08_motion_kernels.png")
+
+    # direction heatmap over [0, 2pi]
+    n_th = 72
+    thetas = np.linspace(0.0, 2.0 * np.pi, n_th, endpoint=False)
+    Zdir = dir_cb.encode(thetas, interpolate=True)
+    Zdir = torch.nn.functional.normalize(Zdir, p=2, dim=1)
+    Gdir = (Zdir @ Zdir.T).detach().cpu().numpy()
+
+    # speed heatmap over a useful range
+    n_s = 48
+    speeds = np.linspace(0.0, 200.0, n_s)
+    Zsp = speed_cb.encode(speeds, interpolate=True)
+    Zsp = torch.nn.functional.normalize(Zsp, p=2, dim=1)
+    Gsp = (Zsp @ Zsp.T).detach().cpu().numpy()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+    ax = axes[0]
+    im0 = ax.imshow(Gdir, origin="lower", cmap="viridis",
+                    extent=[0, 360, 0, 360], vmin=-0.2, vmax=1.0)
+    ax.set_xlabel("theta (deg)")
+    ax.set_ylabel("theta (deg)")
+    ax.set_title("dir codebook cosine")
+    fig.colorbar(im0, ax=ax, fraction=0.046)
+
+    ax = axes[1]
+    im1 = ax.imshow(Gsp, origin="lower", cmap="magma",
+                    extent=[speeds[0], speeds[-1], speeds[0], speeds[-1]],
+                    vmin=-0.2, vmax=1.0)
+    ax.set_xlabel("|r| (px/s)")
+    ax.set_ylabel("|r| (px/s)")
+    ax.set_title("speed codebook cosine")
+    fig.colorbar(im1, ax=ax, fraction=0.046)
+
+    fig.suptitle("Motion codebooks: periodic direction + log speed",
+                 fontweight="bold")
+    _annotate(axes[0], [
+        f"BW_SPEED: {bw_speed}",
+        f"SPEED_V0: {speed_v0}",
+        f"N_ANGLE_BINS: {n_angle_bins}",
+        f"PHASE_INT_KMAX: {phase_int_kmax}",
+        "bandwidth_dir: 1.0",
+    ], loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
+def plot_motion_models(x, y, is_imo, model_id, models, out_dir,
+                       max_models, model_res_k, min_model_inliers):
+    """09_motion_models.png — IMO coloured by model_id + centroid quivers."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = _ensure_dir(out_dir)
+    path = os.path.join(out_dir, "09_motion_models.png")
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    bg = ~is_imo
+    if bg.any():
+        ax.scatter(x[bg], y[bg], c="0.82", s=1, linewidths=0)
+    fg = is_imo
+    if fg.any():
+        mid = model_id[fg].astype(np.float64)
+        # unassigned IMO (-1) in dark gray
+        sc = ax.scatter(x[fg], y[fg], c=mid, s=2, cmap="tab10",
+                        linewidths=0, vmin=-1)
+        fig.colorbar(sc, ax=ax, label="model_id")
+
+    for m in models:
+        mid = m["id"]
+        mask = model_id == mid
+        if not mask.any():
+            continue
+        cx = float(np.mean(x[mask]))
+        cy = float(np.mean(y[mask]))
+        tx, ty = m["tx"], m["ty"]
+        # screen y inverted for quiver
+        ax.quiver([cx], [cy], [tx], [-ty],
+                  angles="xy", scale_units="xy", scale=None,
+                  width=0.006, color="black", zorder=5)
+        ax.scatter([cx], [cy], c="black", s=30, zorder=6)
+
+    ax.invert_yaxis()
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Multi-model fitting: independently moving objects",
+                 fontweight="bold")
+    ax.set_aspect("equal", adjustable="box")
+
+    box = [
+        f"MAX_MODELS: {max_models}",
+        f"MODEL_RES_K: {model_res_k}",
+        f"MIN_MODEL_INLIERS: {min_model_inliers}",
+        f"#models: {len(models)}",
+    ]
+    for m in models:
+        box.append(
+            f"m{m['id']}: n={m['n_inliers']}  "
+            f"tx={m['tx']:.3g} ty={m['ty']:.3g}  "
+            f"w={m['w']:.3g} s={m['s']:.3g}  "
+            f"RMS={m['rms']:.3g}"
+        )
+    _annotate(ax, box, loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
 def plot_summary(paths, out_dir):
-    """2x3 grid of stages 1–6 for one-glance reporting."""
+    """3x3 grid of stages + motion diagnostics for one-glance reporting."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -306,8 +442,11 @@ def plot_summary(paths, out_dir):
 
     out_dir = _ensure_dir(out_dir)
     path = os.path.join(out_dir, "07_summary.png")
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
-    for ax, p in zip(axes.ravel(), paths):
+    # pad to 9 slots
+    slots = list(paths) + [None] * max(0, 9 - len(paths))
+    slots = slots[:9]
+    fig, axes = plt.subplots(3, 3, figsize=(15, 13))
+    for ax, p in zip(axes.ravel(), slots):
         if p and os.path.isfile(p):
             img = mpimg.imread(p)
             ax.imshow(img)

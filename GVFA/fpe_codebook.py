@@ -5,6 +5,9 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+# Default max |integer phase| for circular (periodic) kernels.
+PHASE_INT_KMAX = 8
+
 
 def bind_hv(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Circular convolution (VSA bind) on last dimension; returns real tensor."""
@@ -14,12 +17,18 @@ def bind_hv(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def _make_hermitian_phases(
-    D: int, rng: np.random.Generator, *, dist: str = "gaussian"
+    D: int,
+    rng: np.random.Generator,
+    *,
+    dist: str = "gaussian",
+    k_max: int = PHASE_INT_KMAX,
 ) -> np.ndarray:
     """Conjugate-symmetric phases -> ifft(exp(i*v*phase)) is exactly real.
 
     dist='gaussian': N(0,1) phases -> Gaussian similarity kernel.
     dist='uniform':  U(-pi,pi) phases -> sinc similarity kernel.
+    dist='integer':  integer phases in {-K..K} -> exact 2*pi periodicity when
+                     bandwidth=1 (direction codebook).
     """
     phase = np.zeros(D, dtype=np.float64)
     if D % 2 == 0:
@@ -34,6 +43,8 @@ def _make_hermitian_phases(
             p = rng.normal(0.0, 1.0)
         elif dist == "uniform":
             p = rng.uniform(-np.pi, np.pi)
+        elif dist == "integer":
+            p = int(rng.integers(-int(k_max), int(k_max) + 1))
         else:
             raise ValueError(f"Unknown phase dist: {dist!r}")
         phase[k] = p
@@ -62,6 +73,8 @@ class FPECodebook:
         vmin: int | None = None,
         vmax: int | None = None,
         phase_dist: str = "gaussian",
+        n_angle_bins: int | None = None,
+        phase_int_kmax: int = PHASE_INT_KMAX,
         seed: int = 0,
     ):
         self.name = name
@@ -72,12 +85,18 @@ class FPECodebook:
         self.radix_S = int(radix_S) if radix_S is not None else None
         self.signed_log_v0 = float(signed_log_v0) if signed_log_v0 is not None else None
         self.phase_dist = phase_dist
+        self.n_angle_bins = int(n_angle_bins) if n_angle_bins is not None else None
+        self.phase_int_kmax = int(phase_int_kmax)
         self.seed = int(seed)
         self.vmin = 0 if vmin is None else int(vmin)
         self.vmax = 0 if vmax is None else int(vmax)
 
         rng = np.random.default_rng(seed)
-        self.phase = torch.from_numpy(_make_hermitian_phases(self.D, rng, dist=phase_dist))
+        self.phase = torch.from_numpy(
+            _make_hermitian_phases(
+                self.D, rng, dist=phase_dist, k_max=self.phase_int_kmax
+            )
+        )
 
         self._table: torch.Tensor | None = None
         self._fine: torch.Tensor | None = None
@@ -85,6 +104,19 @@ class FPECodebook:
 
         if kind == "integer":
             self._build_integer_table()
+        elif kind == "periodic":
+            if self.n_angle_bins is None or self.n_angle_bins < 2:
+                raise ValueError(f"n_angle_bins required for '{name}' (periodic)")
+            if abs(self.bandwidth - 1.0) > 1e-12:
+                raise ValueError(
+                    f"periodic codebook '{name}' requires bandwidth=1.0 "
+                    f"(got {self.bandwidth})"
+                )
+            if phase_dist != "integer":
+                raise ValueError(
+                    f"periodic codebook '{name}' requires phase_dist='integer'"
+                )
+            self._build_periodic_table()
         elif kind in ("radix", "signed_log_radix"):
             if self.radix_S is None:
                 raise ValueError(f"radix_S required for '{name}' ({kind})")
@@ -98,6 +130,15 @@ class FPECodebook:
         rows = [
             _z_from_phase(self.phase, self.bandwidth, float(v))
             for v in range(self.vmin, self.vmax + 1)
+        ]
+        self._table = torch.stack(rows, dim=0)
+
+    def _build_periodic_table(self) -> None:
+        """Lookup table over [0, 2*pi): table[i] = z(2*pi*i / N)."""
+        n = self.n_angle_bins
+        rows = [
+            _z_from_phase(self.phase, self.bandwidth, 2.0 * np.pi * i / n)
+            for i in range(n)
         ]
         self._table = torch.stack(rows, dim=0)
 
@@ -115,6 +156,8 @@ class FPECodebook:
         )
 
     def z(self, v: float) -> torch.Tensor:
+        if self.kind == "periodic":
+            return self.encode(np.array([v], dtype=np.float64), interpolate=False)[0]
         if self.kind == "integer":
             idx = int(np.clip(round(v), self.vmin, self.vmax)) - self.vmin
             return self._table[idx].clone()
@@ -147,6 +190,28 @@ class FPECodebook:
             ).squeeze(0)
         return out
 
+    def _wrap_angle(self, values: np.ndarray) -> np.ndarray:
+        two_pi = 2.0 * np.pi
+        return np.mod(values, two_pi)
+
+    def _encode_periodic(
+        self, values: np.ndarray, *, interpolate: bool
+    ) -> torch.Tensor:
+        n = self.n_angle_bins
+        theta = self._wrap_angle(values)
+        # continuous bin coordinate in [0, n)
+        cont = theta / (2.0 * np.pi) * n
+        if interpolate:
+            i0 = np.floor(cont).astype(np.int64) % n
+            frac = (cont - np.floor(cont)).astype(np.float32)
+            i1 = (i0 + 1) % n
+            c0 = self._table[i0]
+            c1 = self._table[i1]
+            f = torch.from_numpy(frac[:, None])
+            return (1.0 - f) * c0 + f * c1
+        idx = np.round(cont).astype(np.int64) % n
+        return self._table[idx].clone()
+
     def encode(
         self,
         values: np.ndarray | torch.Tensor,
@@ -156,7 +221,12 @@ class FPECodebook:
         """Vectorized encode -> [N, D] float32 real hypervectors."""
         if isinstance(values, torch.Tensor):
             values = values.detach().cpu().numpy()
-        values = self._precondition(np.asarray(values, dtype=np.float64).ravel())
+        values = np.asarray(values, dtype=np.float64).ravel()
+
+        if self.kind == "periodic":
+            return self._encode_periodic(values, interpolate=interpolate)
+
+        values = self._precondition(values)
 
         if self.kind == "integer":
             idx = np.round(values).astype(np.int64)
@@ -179,6 +249,57 @@ class FPECodebook:
 
     def self_test(self, tol_real: float = 1e-6, tol_bind: float = 1e-4) -> bool:
         ok = True
+
+        if self.kind == "periodic":
+            z0 = self.encode(np.array([0.0]), interpolate=False)[0]
+            z2pi = self.encode(np.array([2.0 * np.pi]), interpolate=False)[0]
+            cos_wrap = torch.nn.functional.cosine_similarity(
+                z0.unsqueeze(0), z2pi.unsqueeze(0)
+            ).item()
+            if cos_wrap <= 0.999:
+                ok = False
+                print(f"[{self.name}] wrap-around fail: cos(z(0), z(2pi))={cos_wrap:.6f}")
+
+            # sample circle; opposite directions should be near-minimal similarity
+            n_samp = 36
+            thetas = np.linspace(0.0, np.pi, n_samp, endpoint=True)
+            sims = []
+            base = self.encode(np.array([0.0]), interpolate=True)[0]
+            for th in thetas:
+                zt = self.encode(np.array([th]), interpolate=True)[0]
+                sims.append(
+                    torch.nn.functional.cosine_similarity(
+                        base.unsqueeze(0), zt.unsqueeze(0)
+                    ).item()
+                )
+            sims = np.asarray(sims, dtype=np.float64)
+            # overall decrease 0 -> pi (finite-D kernels have sidelobes;
+            # require a clear descending trend, not bit-perfect pairwise mono)
+            if sims[0] <= sims[-1] + 0.05:
+                ok = False
+                print(f"[{self.name}] expected cos(0)>>cos(pi): "
+                      f"{sims[0]:.4f} vs {sims[-1]:.4f}")
+            half = n_samp // 2
+            if float(sims[:half].mean()) <= float(sims[half:].mean()):
+                ok = False
+                print(f"[{self.name}] kernel not decreasing on average 0..pi: "
+                      f"early={sims[:half].mean():.4f} late={sims[half:].mean():.4f}")
+            # opposite (pi) strongly dissimilar vs aligned (0) and mid-angle
+            i_half = int(np.argmin(np.abs(thetas - np.pi / 2)))
+            if sims[-1] >= 0.25 or sims[-1] >= 0.5 * sims[0]:
+                ok = False
+                print(
+                    f"[{self.name}] cos(z(0), z(pi))={sims[-1]:.4f} too high "
+                    f"(cos(0)={sims[0]:.4f})"
+                )
+            if sims[-1] >= sims[i_half] + 0.05:
+                ok = False
+                print(
+                    f"[{self.name}] cos(pi)={sims[-1]:.4f} not below "
+                    f"cos(pi/2)={sims[i_half]:.4f}"
+                )
+            return ok
+
         for v in (0.0, 2.0, 7.0):
             zv = self.z(v)
             if not torch.isreal(zv).all() and zv.imag.abs().max().item() > tol_real:
@@ -216,5 +337,18 @@ def bundle_weighted(terms: list[tuple[torch.Tensor, float]]) -> torch.Tensor:
 if __name__ == "__main__":
     cb = FPECodebook("test", 512, 0.5, "radix", radix_S=32, vmin=0, vmax=1023, seed=0)
     ok = cb.self_test()
-    print("self_test:", "PASS" if ok else "FAIL")
-    raise SystemExit(0 if ok else 1)
+    print("radix self_test:", "PASS" if ok else "FAIL")
+
+    cbp = FPECodebook(
+        "dir",
+        4000,
+        1.0,
+        "periodic",
+        n_angle_bins=720,
+        phase_dist="integer",
+        phase_int_kmax=PHASE_INT_KMAX,
+        seed=21,
+    )
+    okp = cbp.self_test()
+    print("periodic self_test:", "PASS" if okp else "FAIL")
+    raise SystemExit(0 if (ok and okp) else 1)

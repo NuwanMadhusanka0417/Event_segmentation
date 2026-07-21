@@ -16,10 +16,12 @@ import torch
 # ----------------------------------------------------------------------------
 # Motion affinity
 # ----------------------------------------------------------------------------
-def motion_affinity_weights(vx, vy, ei, ej, sigma_v=None):
+def motion_affinity_weights(vx, vy, ei, ej, sigma_v=None, model_id=None):
     """w_ij = exp(-||v_i - v_j||^2 / (2 sigma_v^2)) for each undirected edge.
 
     If sigma_v is None, use the median of ||v_i - v_j|| over edges (printed by caller).
+    If model_id is given, hard-gate: w_ij = 0 whenever model_id[i] != model_id[j]
+    (different independently-moving-object models must never merge).
     Returns (weights [E], sigma_v_used).
     """
     dv = np.hypot(vx[ei] - vx[ej], vy[ei] - vy[ej])
@@ -28,6 +30,9 @@ def motion_affinity_weights(vx, vy, ei, ej, sigma_v=None):
         sigma_v = float(np.median(pos)) if pos.size else 1.0
         sigma_v = max(sigma_v, 1e-6)
     w = np.exp(-(dv * dv) / (2.0 * sigma_v * sigma_v))
+    if model_id is not None:
+        mid = np.asarray(model_id)
+        w = np.where(mid[ei] == mid[ej], w, 0.0)
     return w.astype(np.float64), float(sigma_v)
 
 
@@ -122,6 +127,19 @@ def _graclus_one_level(n, ei, ej, w, w_min, rng):
     return matched, n_rejected
 
 
+def _aggregate_model_id(model_id, cluster_id, n_super):
+    """Majority model_id per supernode (members share id when gate is on)."""
+    out = np.full(n_super, -1, dtype=np.int64)
+    mid = np.asarray(model_id)
+    for c in range(n_super):
+        members = mid[cluster_id == c]
+        if members.size == 0:
+            continue
+        vals, counts = np.unique(members, return_counts=True)
+        out[c] = int(vals[np.argmax(counts)])
+    return out
+
+
 def _aggregate_velocities(vx, vy, cluster_id, n_super):
     """Mean (vx, vy) per supernode."""
     vx_s = np.zeros(n_super, dtype=np.float64)
@@ -149,13 +167,34 @@ def _project_edges(ei, ej, cluster_id):
 
 
 def motion_coarsen(n_events, edge_spatial, edge_temporal, vx, vy,
-                   n_levels=5, sigma_v=None, w_min=0.3, seed=0):
+                   n_levels=5, sigma_v=None, w_min=0.3, seed=0,
+                   model_id=None, velocity_name="residual"):
     """Multilevel motion-coherent Graclus coarsening.
+
+    Parameters
+    ----------
+    vx, vy : velocity field used for affinity (must be residual on IMO subset)
+    model_id : optional int [N]; hard-gates merges across different models
+    velocity_name : label printed for verification (expect \"residual\")
 
     Returns
         cluster_id : int [N] event -> supernode index in 0..C-1
         info       : dict with per-level counts, rejections, sigma_v, sizes
     """
+    assert len(vx) == n_events and len(vy) == n_events, (
+        f"[coarsen] velocity length mismatch: n={n_events} "
+        f"vx={len(vx)} vy={len(vy)}"
+    )
+    if model_id is not None:
+        assert len(model_id) == n_events, (
+            f"[coarsen] model_id length {len(model_id)} != n_events {n_events}"
+        )
+
+    print(f"[coarsen] VERIFY: coarsening {n_events} nodes with velocity="
+          f"'{velocity_name}' (expect residual on IMO subset)"
+          + (f"; model_id gate ON ({len(np.unique(model_id))} ids)"
+             if model_id is not None else "; model_id gate OFF"))
+
     ei0, ej0 = _undirected_edge_union(edge_spatial, edge_temporal)
     if ei0.size == 0:
         print("[coarsen] no edges — every event is its own supernode")
@@ -167,10 +206,12 @@ def motion_coarsen(n_events, edge_spatial, edge_temporal, vx, vy,
             "w_min": w_min,
             "n_levels": n_levels,
             "C": n_events,
+            "velocity_name": velocity_name,
         }
 
     # sigma_v from fine-level edge motion distances
-    w0, sigma_v_used = motion_affinity_weights(vx, vy, ei0, ej0, sigma_v)
+    w0, sigma_v_used = motion_affinity_weights(
+        vx, vy, ei0, ej0, sigma_v, model_id=model_id)
     print(f"[coarsen] sigma_v = {sigma_v_used:.6g}  "
           f"({'auto=median edge ||v_i-v_j||' if sigma_v is None else 'user'})  "
           f"w_min={w_min}  levels={n_levels}")
@@ -179,13 +220,15 @@ def motion_coarsen(n_events, edge_spatial, edge_temporal, vx, vy,
     # event -> current-level node
     event_to_node = np.arange(n_events, dtype=np.int64)
     vx_c, vy_c = vx.copy(), vy.copy()
+    mid_c = None if model_id is None else np.asarray(model_id).copy()
     ei, ej = ei0, ej0
     level_counts = [n_events]
     n_rejected_total = 0
 
     for lev in range(n_levels):
         n_cur = int(event_to_node.max()) + 1
-        w, _ = motion_affinity_weights(vx_c, vy_c, ei, ej, sigma_v_used)
+        w, _ = motion_affinity_weights(
+            vx_c, vy_c, ei, ej, sigma_v_used, model_id=mid_c)
         match, n_rej = _graclus_one_level(n_cur, ei, ej, w, w_min, rng)
         n_rejected_total += n_rej
         n_next = int(match.max()) + 1
@@ -197,6 +240,8 @@ def motion_coarsen(n_events, edge_spatial, edge_temporal, vx, vy,
             print(f"[coarsen] stopping early (no further reduction)")
             break
         vx_c, vy_c = _aggregate_velocities(vx, vy, event_to_node, n_next)
+        if mid_c is not None:
+            mid_c = _aggregate_model_id(model_id, event_to_node, n_next)
         ei, ej = _project_edges(ei0, ej0, event_to_node)
 
     C = int(event_to_node.max()) + 1
@@ -212,6 +257,7 @@ def motion_coarsen(n_events, edge_spatial, edge_temporal, vx, vy,
         "w_min": w_min,
         "n_levels": n_levels,
         "C": C,
+        "velocity_name": velocity_name,
     }
     return event_to_node.astype(np.int64), info
 
