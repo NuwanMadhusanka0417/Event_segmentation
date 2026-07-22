@@ -60,26 +60,20 @@ def _merged_undirected_edges(edge_index_list):
     return uniq[:, 0].astype(np.int64), uniq[:, 1].astype(np.int64)
 
 
-def smooth_labels(labels, H, protos, edge_index_list, lam=1.5, n_iters=5):
-    """ICM label smoothing: data term + lam * disagreeing neighbours.
+def smooth_labels(labels, H, protos, edge_index_list, lam=1.5, n_iters=5,
+                  *, use_graph_cut=False):
+    """ICM (default) or optional alpha-expansion graph-cut label smoothing.
 
-    Parameters
-    ----------
-    labels : int [N]
-    H : [N, D] hypervectors
-    protos : dict {label_id: unit vector [D]} or None (recomputed each iter)
-    edge_index_list : list of edge_index [2, E]
-    lam, n_iters : smoothing strength / iterations
-
-    Returns
-    -------
-    labels : int [N] (copy, possibly updated)
+    Energy: E = sum_i (1 - cos(H_i, proto_l)) + lam * sum_ij [l_i != l_j]
     """
+    if use_graph_cut:
+        return smooth_labels_graph_cut(
+            labels, H, protos, edge_index_list, lam=lam, n_iters=n_iters)
+
     labels = np.asarray(labels, dtype=np.int64).copy()
     Hn = _normalize_rows(_as_numpy(H))
     n = len(labels)
     ei, ej = _merged_undirected_edges(edge_index_list)
-    # undirected adjacency as two directed copies for voting
     if ei.size:
         src = np.concatenate([ei, ej])
         dst = np.concatenate([ej, ei])
@@ -88,33 +82,22 @@ def smooth_labels(labels, H, protos, edge_index_list, lam=1.5, n_iters=5):
         dst = np.empty(0, np.int64)
 
     for it in range(n_iters):
-        if protos is None:
-            P = compute_prototypes(Hn, labels)
-        else:
-            P = protos
-            # refresh means lightly from current labels
-            P = compute_prototypes(Hn, labels)
-
+        P = compute_prototypes(Hn, labels)
         ids = sorted(P.keys())
         if not ids:
             break
         id_to_col = {lid: c for c, lid in enumerate(ids)}
         K = len(ids)
-        Pmat = np.stack([P[lid] for lid in ids], axis=0)  # [K, D]
+        Pmat = np.stack([P[lid] for lid in ids], axis=0)
 
-        # data cost [N, K]: 1 - cos
         cos = Hn @ Pmat.T
         data = 1.0 - cos
 
-        # neighbour disagreement votes: for each node, count of neighbours per label
-        # cost_pair[i,k] = lam * (#nbrs whose label != ids[k])
-        #               = lam * (deg_i - count_nbrs_with_label_k)
         deg = np.zeros(n, dtype=np.float64)
         if src.size:
             np.add.at(deg, dst, 1.0)
             counts = np.zeros((n, K), dtype=np.float64)
             nbr_lab = labels[src]
-            # only count known labels
             for lid, col in id_to_col.items():
                 mask = nbr_lab == lid
                 if mask.any():
@@ -128,8 +111,82 @@ def smooth_labels(labels, H, protos, edge_index_list, lam=1.5, n_iters=5):
         new_labels = np.array([ids[c] for c in best_col], dtype=np.int64)
         n_flip = int((new_labels != labels).sum())
         labels = new_labels
-        print(f"[smooth] iter {it + 1}/{n_iters}: flipped {n_flip} labels")
+        print(f"[smooth] ICM iter {it + 1}/{n_iters}: flipped {n_flip} labels")
         if n_flip == 0:
+            break
+
+    return labels
+
+
+def smooth_labels_graph_cut(labels, H, protos, edge_index_list, lam=1.5, n_iters=5):
+    """Alpha-expansion graph cut (Boykov-Veksler-Zabih 2001) via PyMaxflow.
+
+    Falls back to ICM if maxflow is not installed.
+    """
+    try:
+        import maxflow  # noqa: F401  — PyMaxflow
+    except ImportError:
+        print("[smooth] WARNING: PyMaxflow not installed — falling back to ICM")
+        return smooth_labels(labels, H, None, edge_index_list, lam=lam,
+                             n_iters=n_iters, use_graph_cut=False)
+
+    import maxflow
+
+    labels = np.asarray(labels, dtype=np.int64).copy()
+    Hn = _normalize_rows(_as_numpy(H))
+    n = len(labels)
+    ei, ej = _merged_undirected_edges(edge_index_list)
+
+    for it in range(n_iters):
+        P = compute_prototypes(Hn, labels)
+        ids = sorted(P.keys())
+        if len(ids) <= 1:
+            break
+        data = {lid: 1.0 - (Hn @ P[lid]) for lid in ids}
+        n_flip_total = 0
+
+        for alpha in ids:
+            g = maxflow.Graph[float](n, max(int(ei.size), 1))
+            nodes = g.add_nodes(n)
+
+            # Binary: source = keep current label, sink = take alpha
+            # add_tedge(i, cap_source, cap_sink):
+            #   cap_source = cost of sink (alpha), cap_sink = cost of source (keep)
+            for i in range(n):
+                if labels[i] == alpha:
+                    # already alpha — force source (keep) with huge sink cost
+                    g.add_tedge(nodes[i], 0.0, 1e9)
+                else:
+                    g.add_tedge(
+                        nodes[i],
+                        float(data[alpha][i]),
+                        float(data[int(labels[i])][i]),
+                    )
+
+            # Potts pairwise on undirected edges
+            for a, b in zip(ei.tolist(), ej.tolist()):
+                la, lb = int(labels[a]), int(labels[b])
+                if la == alpha and lb == alpha:
+                    continue
+                # Encourage same binary decision; approximate Potts with weight lam
+                g.add_edge(nodes[a], nodes[b], float(lam), float(lam))
+
+            g.maxflow()
+            new_lab = labels.copy()
+            for i in range(n):
+                if labels[i] == alpha:
+                    continue
+                # segment 1 = sink => take alpha
+                if g.get_segment(nodes[i]) == 1:
+                    new_lab[i] = alpha
+            n_flip = int((new_lab != labels).sum())
+            if n_flip:
+                labels = new_lab
+                n_flip_total += n_flip
+
+        print(f"[smooth] graph-cut iter {it + 1}/{n_iters}: "
+              f"flipped {n_flip_total} labels")
+        if n_flip_total == 0:
             break
 
     return labels
@@ -144,9 +201,8 @@ def drop_tiny_clusters(labels, min_size, background=0):
             continue
         if cnt < min_size:
             labels[labels == lid] = background
-    # compact remaining non-background ids to 1..K
     keep = labels != background
     if keep.any():
         _, compact = np.unique(labels[keep], return_inverse=True)
-        labels[keep] = compact + 1  # 1..K
+        labels[keep] = compact + 1
     return labels

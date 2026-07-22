@@ -36,6 +36,7 @@ from fpe_codebook import FPECodebook, bundle_weighted, bind_hv, PHASE_INT_KMAX
 from gvfa_encoder import encode_graph
 from ego_motion import (
     fit_ego_motion,
+    fit_ego_motion_ransac,
     residual_split,
     refine_imo_mask,
     fit_object_models,
@@ -57,6 +58,7 @@ from motion_pooling import (
 )
 from viz_diagnostics import (
     plot_ego_fit,
+    plot_ego_inliers,
     plot_flow_raw,
     plot_flow_smoothed,
     plot_motion_kernels,
@@ -100,10 +102,19 @@ IRLS_ITERS = 10
 DILATE_ITERS = 2           # recover motion-parallel contours (aperture)
 DILATE_FRAC  = 0.5         # neighbour IMO fraction to flip BG->IMO / erode
 
+# RANSAC ego (largest consensus = background; avoids person contamination)
+EGO_RANSAC        = True
+RANSAC_HYPOTHESES = 200
+RANSAC_SAMPLE     = 8
+RANSAC_INLIER_K   = 2.5
+
 # === STAGE 2b: multi-model fitting on IMO ===
-MAX_MODELS        = 4      # upper bound; stop by inlier count
-MIN_MODEL_INLIERS = 300
+OBJECT_MODEL_KIND = "affine"   # "similarity" | "affine"
+MAX_MODELS        = 4
+MIN_MODEL_INLIERS = 600
 MODEL_RES_K       = 2.5
+MERGE_COS         = 0.9
+MERGE_SPEED_RATIO = 0.5
 
 # === STAGE 3: motion-coherent pooling on IMO residuals ===
 SIGMA_V          = None   # None => auto (median edge ||v_i-v_j||)
@@ -112,9 +123,10 @@ N_COARSEN_LEVELS = 7      # coarsening depth on IMO subgraph
 SUPER_R_XY       = 40.0   # (kept for --flat / legacy supernode path)
 SUPER_R_T_MS     = 30.0
 MIN_SUPER_SIZE   = 3      # mark supernodes with fewer members as noise
-LAM              = 1.5    # graph label-smoothing strength
+LAM              = 3.0    # graph label-smoothing strength
 SMOOTH_ITERS     = 5
-MIN_CLUSTER_SIZE = 200    # final objects smaller than this -> background
+USE_GRAPH_CUT    = False  # optional alpha-expansion (needs PyMaxflow)
+MIN_CLUSTER_SIZE = 400    # final objects smaller than this -> background
 OUT_DIR          = "diag"
 
 # === FPE CODEBOOK CONFIG (tunable) ===
@@ -738,6 +750,22 @@ def main():
                     help="graph label-smoothing strength")
     ap.add_argument("--out-dir", default=OUT_DIR,
                     help="diagnostic figure output directory")
+    ap.add_argument("--ego-ransac", type=lambda s: str(s).lower() not in
+                    ("0", "false", "no", "off"), default=EGO_RANSAC,
+                    help="use RANSAC consensus for global ego fit")
+    ap.add_argument("--ransac-hypotheses", type=int, default=RANSAC_HYPOTHESES)
+    ap.add_argument("--ransac-sample", type=int, default=RANSAC_SAMPLE)
+    ap.add_argument("--ransac-inlier-k", type=float, default=RANSAC_INLIER_K)
+    ap.add_argument("--object-model-kind", choices=("affine", "similarity"),
+                    default=OBJECT_MODEL_KIND)
+    ap.add_argument("--max-models", type=int, default=MAX_MODELS)
+    ap.add_argument("--min-model-inliers", type=int, default=MIN_MODEL_INLIERS)
+    ap.add_argument("--model-res-k", type=float, default=MODEL_RES_K)
+    ap.add_argument("--merge-cos", type=float, default=MERGE_COS)
+    ap.add_argument("--merge-speed-ratio", type=float, default=MERGE_SPEED_RATIO)
+    ap.add_argument("--use-graph-cut", type=lambda s: str(s).lower() not in
+                    ("0", "false", "no", "off"), default=USE_GRAPH_CUT)
+    ap.add_argument("--min-cluster-size", type=int, default=MIN_CLUSTER_SIZE)
     args = ap.parse_args()
 
     sigma_v = args.sigma_v if args.sigma_v is not None else SIGMA_V
@@ -745,10 +773,12 @@ def main():
     t0 = _time.time()
 
     print(
-        f"[config] window={args.window_ms}ms  layers={args.num_layers}  "
-        f"tau={args.tau}  res_k={args.res_k}  flow_iters={args.flow_smooth_iters}  "
-        f"w_min={args.w_min}  coarsen={args.n_coarsen_levels}  "
-        f"lam={args.lam}  out={args.out_dir}  flat={args.flat}"
+        f"[config] window={args.window_ms}ms layers={args.num_layers} "
+        f"tau={args.tau} res_k={args.res_k} ego_ransac={args.ego_ransac} "
+        f"obj={args.object_model_kind} max_models={args.max_models} "
+        f"min_inl={args.min_model_inliers} merge_cos={args.merge_cos} "
+        f"lam={args.lam} graph_cut={args.use_graph_cut} "
+        f"min_cluster={args.min_cluster_size} out={args.out_dir} flat={args.flat}"
     )
 
     print(f"loading {args.input} (window={args.window_ms} ms) ...")
@@ -806,10 +836,28 @@ def main():
     # ==================================================================
     # STAGE 2 — ego-motion fit + residual split + dilate/erode + models
     # ==================================================================
-    print("STAGE 2: ego-motion IRLS fit + residual split ...")
+    print("STAGE 2: ego-motion fit + residual split ...")
     valid_flow = np.hypot(vx_s, vy_s) > 1e-12
-    params, residual, ego_info = fit_ego_motion(
-        x, y, vx_s, vy_s, SENSOR, n_iters=IRLS_ITERS, valid_mask=valid_flow)
+    if args.ego_ransac:
+        # RANSAC recovers background as LARGEST consensus motion
+        params, residual, ego_info = fit_ego_motion_ransac(
+            x, y, vx_s, vy_s, SENSOR,
+            n_hypotheses=args.ransac_hypotheses,
+            sample_size=args.ransac_sample,
+            inlier_k=args.ransac_inlier_k,
+            n_iters_polish=IRLS_ITERS,
+            valid_mask=valid_flow,
+            seed=SEED,
+        )
+    else:
+        params, residual, ego_info = fit_ego_motion(
+            x, y, vx_s, vy_s, SENSOR, n_iters=IRLS_ITERS, valid_mask=valid_flow)
+        ego_info = dict(ego_info)
+        ego_info.setdefault("ransac", False)
+        ego_info.setdefault("n_ransac_inliers", 0)
+        ego_info.setdefault("n_hypotheses", 0)
+        ego_info.setdefault("ransac_inlier_mask", valid_flow)
+
     is_imo, residual, thresh = residual_split(
         residual, edge_spatial, res_k=args.res_k, valid_mask=valid_flow)
 
@@ -818,26 +866,32 @@ def main():
         is_imo, [edge_spatial], n_dilate=DILATE_ITERS, frac=DILATE_FRAC)
 
     rx, ry = residual[:, 0], residual[:, 1]
-    print("STAGE 2c: recursive multi-model fitting on IMO ...")
-    model_id, models = fit_object_models(
+    print(f"STAGE 2c: multi-model fitting on IMO ({args.object_model_kind}) ...")
+    model_id, models, merge_info = fit_object_models(
         x, y, rx, ry, is_imo, SENSOR,
-        max_models=MAX_MODELS,
-        min_inliers=MIN_MODEL_INLIERS,
-        res_k=MODEL_RES_K,
+        max_models=args.max_models,
+        min_inliers=args.min_model_inliers,
+        res_k=args.model_res_k,
         n_iters=IRLS_ITERS,
+        model_kind=args.object_model_kind,
+        merge_cos=args.merge_cos,
+        merge_speed_ratio=args.merge_speed_ratio,
     )
 
     p3 = plot_ego_fit(
         x, y, params, residual, SENSOR, args.out_dir,
         res_k=args.res_k, thresh=thresh,
         inlier_rms=ego_info["inlier_rms"], info=ego_info)
+    p10 = plot_ego_inliers(
+        x, y, params, ego_info, SENSOR, args.out_dir)
     p4 = plot_residual_split(
         x, y, is_imo, residual, thresh, args.out_dir,
         res_k=args.res_k, dilate_info=dilate_info)
     p9 = plot_motion_models(
         x, y, is_imo, model_id, models, args.out_dir,
-        max_models=MAX_MODELS, model_res_k=MODEL_RES_K,
-        min_model_inliers=MIN_MODEL_INLIERS)
+        max_models=args.max_models, model_res_k=args.model_res_k,
+        min_model_inliers=args.min_model_inliers,
+        merge_info=merge_info, model_kind=args.object_model_kind)
 
     # ==================================================================
     # Encode AFTER residual (motion enters node hypervector)
@@ -941,14 +995,16 @@ def main():
                          is_imo, args.out_dir, cinfo)
 
     # graph-smoothing cleanup on full event graph
-    print(f"graph label smoothing (lam={args.lam}, iters={SMOOTH_ITERS}) ...")
+    print(f"graph label smoothing (lam={args.lam}, iters={SMOOTH_ITERS}, "
+          f"graph_cut={args.use_graph_cut}) ...")
     protos = compute_prototypes(H_events, labels)
     labels = smooth_labels(
         labels, H_events, protos,
         edge_index_list=[edge_spatial, edge_temporal],
         lam=args.lam, n_iters=SMOOTH_ITERS,
+        use_graph_cut=args.use_graph_cut,
     )
-    labels = drop_tiny_clusters(labels, MIN_CLUSTER_SIZE, background=0)
+    labels = drop_tiny_clusters(labels, args.min_cluster_size, background=0)
     assert len(labels) == len(t)
     assert not np.isnan(labels.astype(np.float64)).any()
     assert np.all(np.isfinite(labels))
@@ -962,8 +1018,8 @@ def main():
         lam=args.lam, smooth_iters=SMOOTH_ITERS, runtime_s=runtime,
         w_node_motion=W_NODE_MOTION, n_models=len(models),
         object_counts=object_counts)
-    # 3x3 summary: 01..06 + 08, 09 (slot order)
-    plot_summary([p1, p2, p3, p4, p5, p6, p8, p9], args.out_dir)
+    # 3x3 summary: include ego-inliers (10) and motion models (09)
+    plot_summary([p1, p2, p3, p4, p5, p6, p8, p9, p10], args.out_dir)
 
     save(t, x, y, p, labels, tau=args.tau)
     n_obj = int(len(np.unique(labels[labels > 0]))) if (labels > 0).any() else 0

@@ -127,25 +127,35 @@ def plot_ego_fit(x, y, params, residual, sensor, out_dir, res_k, thresh,
     W, H = sensor
     cx, cy = info.get("cx", 0.5 * (W - 1)), info.get("cy", 0.5 * (H - 1))
     tx, ty, w, s = params
+    ransac = bool(info.get("ransac", False))
+    n_ransac = int(info.get("n_ransac_inliers", 0))
+    n_valid = int(info.get("n_valid", max(len(x), 1)))
+    n_hyp = int(info.get("n_hypotheses", 0))
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
 
-    # (a) ego field on grid
     ax = axes[0]
+    # optional RANSAC inlier/outlier scatter under quiver
+    mask = info.get("ransac_inlier_mask")
+    if ransac and mask is not None and np.any(mask):
+        out = ~np.asarray(mask, dtype=bool)
+        if out.any():
+            ax.scatter(x[out], y[out], c="0.85", s=1, linewidths=0, zorder=0)
+        ax.scatter(x[mask], y[mask], c="steelblue", s=1, linewidths=0,
+                   alpha=0.5, zorder=1, label="RANSAC inliers")
     gx = np.linspace(0, W - 1, 18)
     gy = np.linspace(0, H - 1, 14)
     GX, GY = np.meshgrid(gx, gy)
     pvx, pvy = ego_field(GX.ravel(), GY.ravel(), params, cx, cy)
     ax.quiver(GX.ravel(), GY.ravel(), pvx, -pvy,
               angles="xy", scale_units="xy", scale=None,
-              width=0.003, color="steelblue")
+              width=0.003, color="crimson", zorder=2)
     ax.invert_yaxis()
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_title("fitted ego field v_pred")
     ax.set_aspect("equal", adjustable="box")
 
-    # (b) residual histogram
     ax = axes[1]
     rn = np.hypot(residual[:, 0], residual[:, 1])
     rn_pos = rn[rn > 1e-12]
@@ -156,13 +166,74 @@ def plot_ego_fit(x, y, params, residual, sensor, out_dir, res_k, thresh,
     ax.set_title("residual magnitude histogram")
     ax.legend(fontsize=8)
 
-    fig.suptitle("Stage 2: ego-motion fit (4-param IRLS)", fontweight="bold")
-    _annotate(axes[0], [
+    title = ("Stage 2: ego-motion fit (RANSAC + IRLS polish)" if ransac
+             else "Stage 2: ego-motion fit (4-param IRLS)")
+    fig.suptitle(title, fontweight="bold")
+    box = [
+        f"EGO_RANSAC: {ransac}",
+        f"n_hypotheses: {n_hyp}",
+        f"RANSAC inliers: {n_ransac}/{n_valid}",
         f"tx={tx:.4g}  ty={ty:.4g}",
         f"w={w:.4g}  s={s:.4g}",
-        f"inlier RMS={inlier_rms:.4g}",
+        f"polished inlier RMS={inlier_rms:.4g}",
         f"RES_K={res_k}",
         f"thresh={thresh:.4g} px/s",
+    ]
+    _annotate(axes[0], box)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
+def plot_ego_inliers(x, y, params, info, sensor, out_dir):
+    """10_ego_inliers.png — RANSAC consensus (background) vs outliers + ego quiver."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from ego_motion import ego_field
+
+    out_dir = _ensure_dir(out_dir)
+    path = os.path.join(out_dir, "10_ego_inliers.png")
+    W, H = sensor
+    cx, cy = info.get("cx", 0.5 * (W - 1)), info.get("cy", 0.5 * (H - 1))
+    tx, ty, w, s = params
+    mask = info.get("ransac_inlier_mask")
+    if mask is None:
+        mask = np.ones(len(x), dtype=bool)
+    else:
+        mask = np.asarray(mask, dtype=bool)
+    n_inl = int(mask.sum())
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    out = ~mask
+    if out.any():
+        ax.scatter(x[out], y[out], c="tomato", s=1, linewidths=0,
+                   alpha=0.6, label="outlier / IMO")
+    if mask.any():
+        ax.scatter(x[mask], y[mask], c="steelblue", s=1, linewidths=0,
+                   alpha=0.7, label="ego consensus (BG)")
+    gx = np.linspace(0, W - 1, 16)
+    gy = np.linspace(0, H - 1, 12)
+    GX, GY = np.meshgrid(gx, gy)
+    pvx, pvy = ego_field(GX.ravel(), GY.ravel(), params, cx, cy)
+    ax.quiver(GX.ravel(), GY.ravel(), pvx, -pvy,
+              angles="xy", scale_units="xy", scale=None,
+              width=0.003, color="black", alpha=0.8)
+    ax.invert_yaxis()
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Ego consensus inliers (should be BACKGROUND, not a person)",
+                 fontweight="bold")
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend(loc="lower right", fontsize=8, markerscale=4)
+    _annotate(ax, [
+        f"tx={tx:.4g}  ty={ty:.4g}",
+        f"w={w:.4g}  s={s:.4g}",
+        f"inliers: {n_inl}/{len(x)}",
+        f"inlier RMS: {info.get('inlier_rms', float('nan')):.4g}",
+        f"RANSAC: {bool(info.get('ransac', False))}",
     ])
     fig.tight_layout()
     fig.savefig(path, dpi=140)
@@ -370,7 +441,8 @@ def plot_motion_kernels(dir_cb, speed_cb, out_dir, bw_speed, speed_v0,
 
 
 def plot_motion_models(x, y, is_imo, model_id, models, out_dir,
-                       max_models, model_res_k, min_model_inliers):
+                       max_models, model_res_k, min_model_inliers,
+                       merge_info=None, model_kind="affine"):
     """09_motion_models.png — IMO coloured by model_id + centroid quivers."""
     import matplotlib
     matplotlib.use("Agg")
@@ -378,6 +450,7 @@ def plot_motion_models(x, y, is_imo, model_id, models, out_dir,
 
     out_dir = _ensure_dir(out_dir)
     path = os.path.join(out_dir, "09_motion_models.png")
+    merge_info = merge_info or {}
 
     fig, ax = plt.subplots(figsize=(9, 7))
     bg = ~is_imo
@@ -386,7 +459,6 @@ def plot_motion_models(x, y, is_imo, model_id, models, out_dir,
     fg = is_imo
     if fg.any():
         mid = model_id[fg].astype(np.float64)
-        # unassigned IMO (-1) in dark gray
         sc = ax.scatter(x[fg], y[fg], c=mid, s=2, cmap="tab10",
                         linewidths=0, vmin=-1)
         fig.colorbar(sc, ax=ax, label="model_id")
@@ -398,8 +470,7 @@ def plot_motion_models(x, y, is_imo, model_id, models, out_dir,
             continue
         cx = float(np.mean(x[mask]))
         cy = float(np.mean(y[mask]))
-        tx, ty = m["tx"], m["ty"]
-        # screen y inverted for quiver
+        tx, ty = m.get("tx", 0.0), m.get("ty", 0.0)
         ax.quiver([cx], [cy], [tx], [-ty],
                   angles="xy", scale_units="xy", scale=None,
                   width=0.006, color="black", zorder=5)
@@ -408,21 +479,23 @@ def plot_motion_models(x, y, is_imo, model_id, models, out_dir,
     ax.invert_yaxis()
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title("Multi-model fitting: independently moving objects",
-                 fontweight="bold")
+    ax.set_title(f"Multi-model fitting ({model_kind}, merged)", fontweight="bold")
     ax.set_aspect("equal", adjustable="box")
 
     box = [
+        f"kind: {model_kind}",
         f"MAX_MODELS: {max_models}",
         f"MODEL_RES_K: {model_res_k}",
         f"MIN_MODEL_INLIERS: {min_model_inliers}",
-        f"#models: {len(models)}",
+        f"MERGE_COS: {merge_info.get('merge_cos', '?')}",
+        f"pre-merge: {merge_info.get('n_pre', '?')}",
+        f"post-merge: {merge_info.get('n_post', len(models))}",
+        f"#final models: {len(models)}",
     ]
     for m in models:
         box.append(
             f"m{m['id']}: n={m['n_inliers']}  "
-            f"tx={m['tx']:.3g} ty={m['ty']:.3g}  "
-            f"w={m['w']:.3g} s={m['s']:.3g}  "
+            f"tx={m.get('tx', 0):.3g} ty={m.get('ty', 0):.3g}  "
             f"RMS={m['rms']:.3g}"
         )
     _annotate(ax, box, loc="upper left")
