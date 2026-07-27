@@ -4,7 +4,7 @@ qsub -I  -l walltime=3:00:00,mem=190GB,ncpus=12,jobfs=50GB -P mi23 -l storage=gd
 
 module load python3/3.9.2
 source /scratch/jq77/nk8155/seg/bin/activate
-cd /g/data/jq77/nuwan/Event_segmentation/GVFA
+cd /scratch/mi23/nuwan/Event_segmentation/GVFA_BG
 
 python segment.py
 
