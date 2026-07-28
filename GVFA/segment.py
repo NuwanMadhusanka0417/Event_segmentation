@@ -50,8 +50,9 @@ import numpy as np
 import torch
 from sklearn.neighbors import NearestNeighbors
 
-from fpe_codebook import FPECodebook, bundle_weighted
+from fpe_codebook import FPECodebook, bundle_weighted, bind_hv
 from gvfa_encoder import encode_graph
+from aperture import resolve_flow, extract_constraints
 from ego_motion import fit_ego_motion, residual_split
 from graph_smoothing import (
     compute_prototypes,
@@ -72,6 +73,11 @@ from viz_diagnostics import (
     plot_ego_fit,
     plot_flow_raw,
     plot_flow_smoothed,
+    plot_flow_resolved,
+    plot_orientation_check,
+    plot_constraint_votes,
+    plot_vsa_vs_hough,
+    plot_resolver_comparison,
     plot_residual_split,
     plot_segmentation,
     plot_summary,
@@ -105,6 +111,33 @@ MIN_EVENTS = 150      # min cluster size (flat path); smaller -> background
 FLOW_SMOOTH_ITERS = 4      # smoothing iterations
 FLOW_KEEP         = 0.5    # self weight per iteration
 
+# === APERTURE RESOLVER (Track A / Track B) ===
+MOTION_RESOLVER    = "lk"        # "none" | "lk" | "affine" | "vsa"
+COMPARE_METHODS    = ["none", "lk", "vsa"]
+U_MIN              = 1e-6
+SPEED_V0           = 50.0        # signed-log knee, px/s
+BW_R               = 0.1         # node Cartesian motion codebook bandwidth
+W_NODE_MOTION      = 1.0
+# Track A
+LK_MIN_SUPPORT     = 6
+AFFINE_MIN_SUPPORT = 12
+CONDITION_MIN_EIG  = 1e-3
+LK_HUBER_ITERS     = 3
+# Track B
+D_VEL              = 512
+VEL_GRID_N         = 48
+VEL_MAX            = 1500.0
+VEL_SIGNED_LOG     = True
+BW_VEL             = 0.15
+BAND_SIGMA         = 0.08
+WEIGHT_FLOOR       = 1e-3
+SELF_WEIGHT        = 1.0
+CLEANUP_TOPK       = 5
+CLEANUP_MIN_CONF   = 0.05
+READOUT_CHUNK      = 4096
+VSA_VALIDATE       = True
+VSA_RESOLVE_IMO_ONLY = False  # optional cost cut (not used unless True + pre-mask)
+
 # === STAGE 2: ego-motion + residual split ===
 RES_K      = 3.0           # residual threshold in robust sigmas
 IRLS_ITERS = 10
@@ -131,8 +164,12 @@ BW_DT      = 3.3e-4              # scale ~3 ms
 BW_VX, BW_VY = 0.1, 0.1          # scale ~1 signed-log unit
 BW_DP      = 1.43
 
-# Node bundle weights (absolute x, y, t, p only)
-W_NODE_X, W_NODE_Y, W_NODE_T, W_NODE_P = 0, 0, 0.1, 0
+# Node bundle weights — motion-dominant; graph carries space (x/y unused)
+# Position in the node HV is redundant (edges already connect neighbours) AND
+# harmful: proximity bias pulls apart opposite ends of one person.
+W_NODE_X, W_NODE_Y = 0.0, 0.0    # kept at 0; re-enable via CLI for ablations
+W_NODE_T           = 0.1
+W_NODE_P           = 0.0         # polarity is contrast, not identity
 
 # Spatial edge bundle weights
 W_EDGE_S_DX, W_EDGE_S_DY, W_EDGE_S_DT = 0.5, 0.5, 0.3  #                Short-range displacement
@@ -441,6 +478,10 @@ def make_codebooks(sensor=SENSOR, t_span_s=0.06, seed=SEED):
     dt_s_max = int(SPATIAL_R_T_MS * 1000) + 1
     dt_t_max = int(TEMPORAL_R_T_MS * 1000) + 1
 
+    # Signed-log residual components span roughly ±log1p(VEL_MAX/SPEED_V0)
+    s_max = float(np.log1p(VEL_MAX / SPEED_V0)) + 0.5
+    s_idx = int(np.ceil(s_max / 0.1)) + 2
+
     node = {
         "x": FPECodebook("x", D, BW_X, "integer", vmin=0, vmax=W - 1,
                          phase_dist="gaussian", seed=seed + 1),
@@ -451,6 +492,13 @@ def make_codebooks(sensor=SENSOR, t_span_s=0.06, seed=SEED):
                          phase_dist="gaussian", seed=seed + 3),
         "p": FPECodebook("p", D, BW_P, "integer", vmin=0, vmax=1,
                          phase_dist="gaussian", seed=seed + 4),
+        # Cartesian residual motion in signed-log space (no polar singularity at |r|~0)
+        "rx": FPECodebook("rx", D, BW_R, "radix", radix_S=16,
+                          vmin=-s_idx, vmax=s_idx, value_grid_step=0.1,
+                          phase_dist="gaussian", seed=seed + 5),
+        "ry": FPECodebook("ry", D, BW_R, "radix", radix_S=16,
+                          vmin=-s_idx, vmax=s_idx, value_grid_step=0.1,
+                          phase_dist="gaussian", seed=seed + 6),
     }
     edge_dx = FPECodebook("dx", D, BW_DX, "integer", vmin=-W, vmax=W,
                           phase_dist="gaussian", seed=seed + 10)
@@ -486,15 +534,55 @@ def make_codebooks(sensor=SENSOR, t_span_s=0.06, seed=SEED):
     return node, edge_spatial, edge_temporal, w_spatial, w_temporal
 
 
-def fpe_encode(x, y, t, p, codebooks):
-    """FPE-codebook node features {x, y, t, p} -> L2-normalized [N, D]."""
+def _slog(w, v0=SPEED_V0):
+    w = np.asarray(w, dtype=np.float64)
+    return np.sign(w) * np.log1p(np.abs(w) / v0)
+
+
+def fpe_encode(x, y, t, p, codebooks, rx=None, ry=None, motion_valid=None,
+               *, w_motion=None, w_t=None, w_x=None, w_y=None, w_p=None):
+    """FPE node features -> L2-normalized [N, D].
+
+    Motion uses 2D Cartesian SSP on signed-log residual components:
+        z_motion = bind(encode(slog(rx)), encode(slog(ry)))
+    Unresolved / invalid motion -> z_motion = 0.
+    """
+    # REASON: polar (speed, direction) has a singularity at |r|~0 — direction is
+    # pure noise for every near-zero-residual BACKGROUND event (largest class).
+    # Cartesian SSP has no singularity.
     t_us = (t - t[0]) * 1e6
+    wm = W_NODE_MOTION if w_motion is None else w_motion
+    wt = W_NODE_T if w_t is None else w_t
+    wx = W_NODE_X if w_x is None else w_x
+    wy = W_NODE_Y if w_y is None else w_y
+    wp = W_NODE_P if w_p is None else w_p
+
     terms = [
-        (codebooks["x"].encode(x), W_NODE_X),
-        (codebooks["y"].encode(y), W_NODE_Y),
-        (codebooks["t"].encode(t_us, interpolate=True), W_NODE_T),
-        (codebooks["p"].encode(p), W_NODE_P),
+        (codebooks["x"].encode(x), wx),
+        (codebooks["y"].encode(y), wy),
+        (codebooks["t"].encode(t_us, interpolate=True), wt),
+        (codebooks["p"].encode(p), wp),
     ]
+
+    n = len(t)
+    if rx is not None and ry is not None and "rx" in codebooks and wm != 0:
+        rx = np.asarray(rx, dtype=np.float64)
+        ry = np.asarray(ry, dtype=np.float64)
+        if motion_valid is None:
+            motion_valid = np.isfinite(rx) & np.isfinite(ry)
+        motion_valid = np.asarray(motion_valid, dtype=bool)
+        z_motion = torch.zeros((n, D), dtype=torch.float32)
+        if motion_valid.any():
+            sx = _slog(rx[motion_valid])
+            sy = _slog(ry[motion_valid])
+            zx = codebooks["rx"].encode(sx, interpolate=True)
+            zy = codebooks["ry"].encode(sy, interpolate=True)
+            z_motion[motion_valid] = bind_hv(zx, zy)
+        n_zero = int((~motion_valid).sum())
+        print(f"[fpe_encode] Cartesian motion: valid={int(motion_valid.sum())}  "
+              f"zeroed={n_zero}  W_NODE_MOTION={wm}")
+        terms.append((z_motion, wm))
+
     return bundle_weighted(terms)
 
 
@@ -670,32 +758,68 @@ def build_supernode_multigraph(t_s, x_s, y_s, p_s,
 # ----------------------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------------------
+def _resolver_cfg(args):
+    return {
+        "U_MIN": U_MIN,
+        "SPEED_V0": SPEED_V0,
+        "LK_MIN_SUPPORT": args.lk_min_support,
+        "AFFINE_MIN_SUPPORT": AFFINE_MIN_SUPPORT,
+        "CONDITION_MIN_EIG": args.condition_min_eig,
+        "LK_HUBER_ITERS": LK_HUBER_ITERS,
+        "D_VEL": args.d_vel,
+        "VEL_GRID_N": args.vel_grid_n,
+        "VEL_MAX": VEL_MAX,
+        "VEL_SIGNED_LOG": VEL_SIGNED_LOG,
+        "BW_VEL": BW_VEL,
+        "BAND_SIGMA": args.band_sigma,
+        "WEIGHT_FLOOR": WEIGHT_FLOOR,
+        "SELF_WEIGHT": SELF_WEIGHT,
+        "CLEANUP_TOPK": args.cleanup_topk,
+        "CLEANUP_MIN_CONF": args.cleanup_min_conf,
+        "READOUT_CHUNK": READOUT_CHUNK,
+        "VSA_VALIDATE": args.vsa_validate,
+        "SEED": SEED,
+    }
+
+
 def main():
     import time as _time
+    import csv
+    import os
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", default="events_filtered.txt")
     ap.add_argument("--window-ms", type=float, default=WINDOW_MS)
-    ap.add_argument("--tau", type=float, default=TAU,
-                    help="cosine merge threshold (lower -> fewer objects)")
-    ap.add_argument("--num-layers", type=int, default=NUM_LAYERS,
-                    help="GVFA layers incl. input (3 => 2 hops)")
-    ap.add_argument("--flat", action="store_true",
-                    help="bypass ego-motion + pooling; old per-event clustering")
+    ap.add_argument("--tau", type=float, default=TAU)
+    ap.add_argument("--num-layers", type=int, default=NUM_LAYERS)
+    ap.add_argument("--flat", action="store_true")
     ap.add_argument("--n-coarsen-levels", type=int, default=N_COARSEN_LEVELS)
-    ap.add_argument("--w-min", type=float, default=W_MIN,
-                    help="refuse Graclus merges below this motion affinity")
-    ap.add_argument("--sigma-v", type=float, default=None,
-                    help="velocity length-scale; default=auto median edge ||dv||")
+    ap.add_argument("--w-min", type=float, default=W_MIN)
+    ap.add_argument("--sigma-v", type=float, default=None)
     ap.add_argument("--super-r-xy", type=float, default=SUPER_R_XY)
     ap.add_argument("--super-r-t-ms", type=float, default=SUPER_R_T_MS)
-    ap.add_argument("--res-k", type=float, default=RES_K,
-                    help="residual threshold in robust sigmas")
+    ap.add_argument("--res-k", type=float, default=RES_K)
     ap.add_argument("--flow-smooth-iters", type=int, default=FLOW_SMOOTH_ITERS)
-    ap.add_argument("--lam", type=float, default=LAM,
-                    help="graph label-smoothing strength")
-    ap.add_argument("--out-dir", default=OUT_DIR,
-                    help="diagnostic figure output directory")
+    ap.add_argument("--lam", type=float, default=LAM)
+    ap.add_argument("--out-dir", default=OUT_DIR)
+    ap.add_argument("--motion-resolver", default=MOTION_RESOLVER,
+                    choices=["none", "lk", "affine", "vsa"])
+    ap.add_argument("--compare-resolvers", action="store_true",
+                    help="A/B all COMPARE_METHODS on the same window")
+    ap.add_argument("--lk-min-support", type=int, default=LK_MIN_SUPPORT)
+    ap.add_argument("--condition-min-eig", type=float, default=CONDITION_MIN_EIG)
+    ap.add_argument("--d-vel", type=int, default=D_VEL)
+    ap.add_argument("--vel-grid-n", type=int, default=VEL_GRID_N)
+    ap.add_argument("--vsa-validate", type=lambda s: str(s).lower() not in
+                    ("0", "false", "no"), default=VSA_VALIDATE)
+    ap.add_argument("--band-sigma", type=float, default=BAND_SIGMA)
+    ap.add_argument("--cleanup-topk", type=int, default=CLEANUP_TOPK)
+    ap.add_argument("--cleanup-min-conf", type=float, default=CLEANUP_MIN_CONF)
+    ap.add_argument("--w-node-motion", type=float, default=W_NODE_MOTION)
+    ap.add_argument("--w-node-t", type=float, default=W_NODE_T)
+    ap.add_argument("--w-node-x", type=float, default=W_NODE_X)
+    ap.add_argument("--w-node-y", type=float, default=W_NODE_Y)
+    ap.add_argument("--w-node-p", type=float, default=W_NODE_P)
     args = ap.parse_args()
 
     sigma_v = args.sigma_v if args.sigma_v is not None else SIGMA_V
@@ -703,182 +827,246 @@ def main():
     t0 = _time.time()
 
     print(
-        f"[config] window={args.window_ms}ms  layers={args.num_layers}  "
-        f"tau={args.tau}  res_k={args.res_k}  flow_iters={args.flow_smooth_iters}  "
-        f"w_min={args.w_min}  coarsen={args.n_coarsen_levels}  "
-        f"lam={args.lam}  out={args.out_dir}  flat={args.flat}"
+        f"[config] resolver={args.motion_resolver}  compare={args.compare_resolvers}  "
+        f"window={args.window_ms}ms  layers={args.num_layers}  tau={args.tau}  "
+        f"W_motion={args.w_node_motion}  out={args.out_dir}"
     )
 
     print(f"loading {args.input} (window={args.window_ms} ms) ...")
     t, x, y, p = load_events(args.input, args.window_ms)
-    print(f"  {len(t)} events  x:[{x.min():.0f},{x.max():.0f}]  "
-          f"y:[{y.min():.0f},{y.max():.0f}]  span={ (t.max()-t.min())*1e3:.2f} ms")
+    print(f"  {len(t)} events  span={(t.max()-t.min())*1e3:.2f} ms")
 
     print("building spatial + temporal ellipsoid multigraph ...")
     (edge_spatial, edge_temporal,
      attr_spatial, attr_temporal,
      rec, src) = build_multigraph(t, x, y, p)
-    print(f"  spatial:  {edge_spatial.shape[1]} edges  "
-          f"(attr dim=3: dx,dy,dt)")
-    print(f"  temporal: {edge_temporal.shape[1]} edges  "
-          f"(attr dim=6: dx,dy,dt,dx/dt,dy/dt,dp)")
-
+    print(f"  spatial: {edge_spatial.shape[1]}  temporal: {edge_temporal.shape[1]}")
     comp = connected_components(len(t), rec, src)
-    print(f"  {comp.max()+1} spatial connected components")
 
     t_span = max((t.max() - t.min()), 1e-9)
     node_cb, cb_spatial, cb_temporal, w_spatial, w_temporal = make_codebooks(
         SENSOR, t_span, seed=SEED)
 
-    print("FPE codebook-encoding nodes (x, y, t, p) ...")
-    x_hv = fpe_encode(x, y, t, p, node_cb)
-
-    print(f"running FPE-edge GVFA ({args.num_layers} layers, "
-          f"hop-bundle sum, L2 norm) on each graph ...")
-    H_events = encode_nodes_multigraph(
-        x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal,
-        cb_spatial, cb_temporal, w_spatial, w_temporal, args.num_layers)
-    print(f"  concatenated hypervectors: {H_events.shape[1]} dims "
-          f"({D} spatial + {D} temporal)")
-
     if args.flat:
-        print("[flat] bypassing ego-motion + pooling — per-event clustering")
-        print(f"streaming assignment (tau={args.tau}) ...")
+        print("[flat] FPE encode without residual motion ...")
+        x_hv = fpe_encode(x, y, t, p, node_cb, w_motion=0.0)
+        H_events = encode_nodes_multigraph(
+            x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal,
+            cb_spatial, cb_temporal, w_spatial, w_temporal, args.num_layers)
         obj_id = assign(H_events, t, comp, tau=args.tau)
         save(t, x, y, p, obj_id, tau=args.tau)
         return
 
-    # ==================================================================
-    # STAGE 1 — flow regularization
-    # ==================================================================
-    print("STAGE 1: estimating + regularizing normal flow ...")
-    vx, vy = node_flow(t, x, y, edge_temporal)
-    diagnose_node_flow(vx, vy)
-    p1 = plot_flow_raw(x, y, vx, vy, args.out_dir)
+    # Shared raw normal flow (same for all resolvers / compare)
+    print("STAGE 0: node_flow (RAW normal flow) ...")
+    vx_raw, vy_raw = node_flow(t, x, y, edge_temporal)
+    diagnose_node_flow(vx_raw, vy_raw)
+    p1 = plot_flow_raw(x, y, vx_raw, vy_raw, args.out_dir)
 
-    vx_s, vy_s, n_vb, n_va = smooth_flow(
-        vx, vy, edge_spatial,
-        n_iters=args.flow_smooth_iters, keep=FLOW_KEEP)
-    p2 = plot_flow_smoothed(
-        x, y, vx_s, vy_s, args.out_dir,
-        n_iters=args.flow_smooth_iters, keep=FLOW_KEEP,
-        n_valid_before=n_vb, n_valid_after=n_va)
+    methods = list(COMPARE_METHODS) if args.compare_resolvers else [args.motion_resolver]
+    compare_rows = []
+    fig_paths_by_method = {}
 
-    # ==================================================================
-    # STAGE 2 — ego-motion fit + residual split
-    # ==================================================================
-    print("STAGE 2: ego-motion IRLS fit + residual split ...")
-    valid_flow = np.hypot(vx_s, vy_s) > 1e-12
-    params, residual, ego_info = fit_ego_motion(
-        x, y, vx_s, vy_s, SENSOR, n_iters=IRLS_ITERS, valid_mask=valid_flow)
-    is_imo, residual, thresh = residual_split(
-        residual, edge_spatial, res_k=args.res_k, valid_mask=valid_flow)
-
-    p3 = plot_ego_fit(
-        x, y, params, residual, SENSOR, args.out_dir,
-        res_k=args.res_k, thresh=thresh,
-        inlier_rms=ego_info["inlier_rms"], info=ego_info)
-    p4 = plot_residual_split(x, y, is_imo, residual, thresh, args.out_dir)
-
-    # ==================================================================
-    # STAGE 3 — VSA pooling on IMO residuals only
-    # ==================================================================
-    print("STAGE 3: residual-affinity coarsening on IMO subgraph ...")
-    labels = np.zeros(len(t), dtype=np.int64)  # 0 = background
-    rx, ry = residual[:, 0], residual[:, 1]
-    cluster_full = np.full(len(t), -1, dtype=np.int64)
-    cinfo = {
-        "sigma_v": float("nan"), "w_min": args.w_min,
-        "n_levels": args.n_coarsen_levels, "C": 0,
-        "sizes": np.array([0]), "n_rejected_total": 0,
-    }
-
-    n_imo = int(is_imo.sum())
-    if n_imo == 0:
-        print("[stage3] no IMO candidates — all background")
-    else:
-        edge_s_imo, sub_idx, _ = induce_subgraph(edge_spatial, is_imo)
-        edge_t_imo, _, _ = induce_subgraph(edge_temporal, is_imo)
-        rx_imo, ry_imo = rx[sub_idx], ry[sub_idx]
-        t_imo = t[sub_idx]
-        H_imo = H_events[sub_idx]
-
-        cluster_id, cinfo = motion_coarsen(
-            n_imo, edge_s_imo, edge_t_imo, rx_imo, ry_imo,
-            n_levels=args.n_coarsen_levels,
-            sigma_v=sigma_v,
-            w_min=args.w_min,
-            seed=SEED,
+    for method in methods:
+        mt0 = _time.time()
+        cfg = _resolver_cfg(args)
+        print(f"\n===== RESOLVER = {method} =====")
+        print("[flow] resolve_flow consumes RAW normal flow")
+        vx_res, vy_res, resolved_mask, rinfo = resolve_flow(
+            x, y, vx_raw, vy_raw, [edge_spatial, edge_temporal],
+            method=method, cfg=cfg,
         )
-        cinfo["w_min"] = args.w_min
-        cinfo["n_levels"] = args.n_coarsen_levels
-        cluster_full[sub_idx] = cluster_id
+        print("[flow] smooth_flow consumes RESOLVED flow")
+        vx_s, vy_s, n_vb, n_va = smooth_flow(
+            vx_res, vy_res, edge_spatial,
+            n_iters=args.flow_smooth_iters, keep=FLOW_KEEP)
 
-        print("bundling IMO hypervectors into supernodes ...")
-        H_s_bundle = bundle_hypervectors(H_imo[:, :D], cluster_id)
-        H_t_bundle = bundle_hypervectors(H_imo[:, D:], cluster_id)
-        H_super = torch.cat([H_s_bundle, H_t_bundle], dim=1)
-        diagnose_bundling_cosine(H_super, seed=SEED, label="bundling")
+        sub = args.out_dir if not args.compare_resolvers else os.path.join(
+            args.out_dir, f"resolver_{method}")
+        os.makedirs(sub, exist_ok=True)
 
-        # components on supernodes via projected IMO spatial edges
-        C = H_super.shape[0]
-        if edge_s_imo.numel() > 0:
-            rec_s = cluster_id[edge_s_imo[0].numpy()]
-            src_s = cluster_id[edge_s_imo[1].numpy()]
-            comp_super = connected_components(C, rec_s, src_s)
-        else:
-            comp_super = np.zeros(C, dtype=np.int64)
+        p2 = plot_flow_smoothed(
+            x, y, vx_s, vy_s, sub,
+            n_iters=args.flow_smooth_iters, keep=FLOW_KEEP,
+            n_valid_before=n_vb, n_valid_after=n_va)
+        p11 = plot_flow_resolved(
+            x, y, vx_res, vy_res, resolved_mask, sub, rinfo)
 
-        # supernode times = mean member time
-        agg = supernode_aggregates(
-            x[sub_idx], y[sub_idx], t_imo, p[sub_idx],
-            rx_imo, ry_imo, cluster_id)
-        print(f"streaming assignment on IMO supernodes (tau={args.tau}) ...")
-        labels_super = assign(
-            H_super, agg["t"], comp_super, tau=args.tau, min_events=0)
-        # mark tiny supernodes as noise (-1), then shift to 1..K (0=background)
-        small = agg["counts"] < MIN_SUPER_SIZE
-        if small.any():
-            labels_super = labels_super.copy()
-            labels_super[small] = -1
-            print(f"  marked {int(small.sum())} tiny supernodes as noise")
-        diagnose_clustering(H_super, labels_super)
+        print("[flow] ego fit consumes SMOOTHED resolved flow")
+        valid_flow = np.hypot(vx_s, vy_s) > 1e-12
+        params, residual, ego_info = fit_ego_motion(
+            x, y, vx_s, vy_s, SENSOR, n_iters=IRLS_ITERS, valid_mask=valid_flow)
+        is_imo, residual, thresh = residual_split(
+            residual, edge_spatial, res_k=args.res_k, valid_mask=valid_flow)
+        rx, ry = residual[:, 0], residual[:, 1]
 
-        # map: -1 -> 0 (noise/bg), 0..K-1 -> 1..K
-        labels_imo_events = unpool(labels_super, cluster_id)
-        out = np.zeros(n_imo, dtype=np.int64)
-        keep = labels_imo_events >= 0
-        if keep.any():
-            _, compact = np.unique(labels_imo_events[keep], return_inverse=True)
-            out[keep] = compact + 1  # start at 1
-        labels[sub_idx] = out
-        assert np.all(labels[sub_idx] == out)
-        print("[unpool] IMO events labelled; background stays 0")
+        # Orientation check on IMO events (primary aperture metric figure)
+        _, n_hat, valid_c = extract_constraints(vx_raw, vy_raw, u_min=U_MIN)
+        ori_mask = valid_c & is_imo
+        if not ori_mask.any():
+            ori_mask = valid_c
+        p12 = plot_orientation_check(
+            n_hat, vx_res, vy_res, ori_mask, sub, rinfo)
 
-    p5 = plot_supernodes(x, y, cluster_full[is_imo] if n_imo else np.array([]),
-                         is_imo, args.out_dir, cinfo)
+        p3 = plot_ego_fit(
+            x, y, params, residual, SENSOR, sub,
+            res_k=args.res_k, thresh=thresh,
+            inlier_rms=ego_info["inlier_rms"], info=ego_info)
+        p4 = plot_residual_split(x, y, is_imo, residual, thresh, sub)
 
-    # graph-smoothing cleanup on full event graph
-    print(f"graph label smoothing (lam={args.lam}, iters={SMOOTH_ITERS}) ...")
-    protos = compute_prototypes(H_events, labels)
-    labels = smooth_labels(
-        labels, H_events, protos,
-        edge_index_list=[edge_spatial, edge_temporal],
-        lam=args.lam, n_iters=SMOOTH_ITERS,
-    )
-    labels = drop_tiny_clusters(labels, MIN_CLUSTER_SIZE, background=0)
-    assert len(labels) == len(t)
-    assert not np.isnan(labels.astype(np.float64)).any()
+        # Track B diagnostics
+        p13 = p14 = None
+        if method == "vsa" and rinfo.get("C_sparse") is not None:
+            p13 = plot_constraint_votes(
+                x, y, is_imo, rinfo, sub)
+            if rinfo.get("v_hough") is not None:
+                p14 = plot_vsa_vs_hough(
+                    np.stack([vx_res, vy_res], 1), rinfo["v_hough"],
+                    resolved_mask, sub, rinfo)
+            # drop heavy matrices after plotting (compare mode runs 3 methods)
+            for k in ("C_sparse", "V_sparse", "Z", "codebook", "grid_coords"):
+                rinfo.pop(k, None)
 
-    runtime = _time.time() - t0
-    p6 = plot_segmentation(
-        x, y, labels, args.out_dir,
-        tau=args.tau, num_layers=args.num_layers,
-        lam=args.lam, smooth_iters=SMOOTH_ITERS, runtime_s=runtime)
-    plot_summary([p1, p2, p3, p4, p5, p6], args.out_dir)
+        motion_ok = resolved_mask & valid_flow & np.isfinite(rx) & np.isfinite(ry)
+        print("[encode] FPE Cartesian residual motion + GVFA")
+        x_hv = fpe_encode(
+            x, y, t, p, node_cb, rx=rx, ry=ry, motion_valid=motion_ok,
+            w_motion=args.w_node_motion, w_t=args.w_node_t,
+            w_x=args.w_node_x, w_y=args.w_node_y, w_p=args.w_node_p,
+        )
+        H_events = encode_nodes_multigraph(
+            x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal,
+            cb_spatial, cb_temporal, w_spatial, w_temporal, args.num_layers)
 
-    save(t, x, y, p, labels, tau=args.tau)
-    print(f"done in {runtime:.1f}s  -> diagnostics in {args.out_dir}/")
+        print("STAGE 3: residual-affinity coarsening on IMO ...")
+        labels = np.zeros(len(t), dtype=np.int64)
+        cluster_full = np.full(len(t), -1, dtype=np.int64)
+        cinfo = {"sigma_v": float("nan"), "w_min": args.w_min,
+                 "n_levels": args.n_coarsen_levels, "C": 0,
+                 "sizes": np.array([0]), "n_rejected_total": 0}
+        n_imo = int(is_imo.sum())
+        if n_imo > 0:
+            edge_s_imo, sub_idx, _ = induce_subgraph(edge_spatial, is_imo)
+            edge_t_imo, _, _ = induce_subgraph(edge_temporal, is_imo)
+            cluster_id, cinfo = motion_coarsen(
+                n_imo, edge_s_imo, edge_t_imo, rx[sub_idx], ry[sub_idx],
+                n_levels=args.n_coarsen_levels, sigma_v=sigma_v,
+                w_min=args.w_min, seed=SEED,
+            )
+            cinfo["w_min"] = args.w_min
+            cinfo["n_levels"] = args.n_coarsen_levels
+            cluster_full[sub_idx] = cluster_id
+            H_imo = H_events[sub_idx]
+            H_s_bundle = bundle_hypervectors(H_imo[:, :D], cluster_id)
+            H_t_bundle = bundle_hypervectors(H_imo[:, D:], cluster_id)
+            H_super = torch.cat([H_s_bundle, H_t_bundle], dim=1)
+            diagnose_bundling_cosine(H_super, seed=SEED, label="bundling")
+            C = H_super.shape[0]
+            if edge_s_imo.numel() > 0:
+                rec_s = cluster_id[edge_s_imo[0].numpy()]
+                src_s = cluster_id[edge_s_imo[1].numpy()]
+                comp_super = connected_components(C, rec_s, src_s)
+            else:
+                comp_super = np.zeros(C, dtype=np.int64)
+            agg = supernode_aggregates(
+                x[sub_idx], y[sub_idx], t[sub_idx], p[sub_idx],
+                rx[sub_idx], ry[sub_idx], cluster_id)
+            labels_super = assign(
+                H_super, agg["t"], comp_super, tau=args.tau, min_events=0)
+            small = agg["counts"] < MIN_SUPER_SIZE
+            if small.any():
+                labels_super = labels_super.copy()
+                labels_super[small] = -1
+            labels_imo = unpool(labels_super, cluster_id)
+            out = np.zeros(n_imo, dtype=np.int64)
+            keep = labels_imo >= 0
+            if keep.any():
+                _, compact = np.unique(labels_imo[keep], return_inverse=True)
+                out[keep] = compact + 1
+            labels[sub_idx] = out
+
+        p5 = plot_supernodes(
+            x, y, cluster_full[is_imo] if n_imo else np.array([]),
+            is_imo, sub, cinfo)
+
+        protos = compute_prototypes(H_events, labels)
+        labels = smooth_labels(
+            labels, H_events, protos,
+            edge_index_list=[edge_spatial, edge_temporal],
+            lam=args.lam, n_iters=SMOOTH_ITERS,
+        )
+        labels = drop_tiny_clusters(labels, MIN_CLUSTER_SIZE, background=0)
+
+        runtime = _time.time() - mt0
+        ids, counts = np.unique(labels, return_counts=True)
+        n_obj = int((ids > 0).sum())
+        largest = float(counts[ids > 0].max() / len(labels)) if n_obj else 0.0
+        p6 = plot_segmentation(
+            x, y, labels, sub,
+            tau=args.tau, num_layers=args.num_layers,
+            lam=args.lam, smooth_iters=SMOOTH_ITERS, runtime_s=runtime,
+            extra_box={
+                "MOTION_RESOLVER": method,
+                "resolved %": f"{100*rinfo['resolved_frac']:.1f}",
+                "orient_corr": f"{rinfo['orientation_corr']:.4f}",
+                "W_NODE_MOTION": args.w_node_motion,
+            })
+
+        paths = [p1, p2, p3, p4, p5, p6, p11, p12]
+        if p13:
+            paths.append(p13)
+        if p14:
+            paths.append(p14)
+        plot_summary(paths, sub)
+
+        if not args.compare_resolvers:
+            save(t, x, y, p, labels, tau=args.tau)
+
+        row = {
+            "method": method,
+            "resolved_frac": rinfo["resolved_frac"],
+            "orientation_corr": rinfo["orientation_corr"],
+            "median_speed": rinfo["median_speed_after"],
+            "ego_inlier_rms": ego_info["inlier_rms"],
+            "imo_frac": float(is_imo.mean()),
+            "n_models_premerge": 0,
+            "n_models_final": 0,
+            "n_objects": n_obj,
+            "largest_object_frac": largest,
+            "resolver_runtime_s": rinfo["runtime_s"],
+            "total_runtime_s": runtime,
+        }
+        compare_rows.append(row)
+        fig_paths_by_method[method] = {
+            "quiver": p11, "split": p4, "seg": p6, "row": row,
+            "vx": vx_res, "vy": vy_res, "resolved": resolved_mask,
+            "is_imo": is_imo, "residual": residual, "labels": labels,
+            "rinfo": rinfo,
+        }
+        print(f"[summary] method={method}  objects={n_obj}  "
+              f"orient_corr={rinfo['orientation_corr']:.4f}  "
+              f"resolved={rinfo['resolved_frac']:.3f}  time={runtime:.1f}s")
+
+    if args.compare_resolvers:
+        csv_path = os.path.join(args.out_dir, "compare_resolvers.csv")
+        os.makedirs(args.out_dir, exist_ok=True)
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(compare_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(compare_rows)
+        print(f"wrote {csv_path}")
+        print("\n=== resolver comparison ===")
+        hdr = f"{'method':8s} {'resol%':>7s} {'orient':>8s} {'imo%':>6s} " \
+              f"{'#obj':>4s} {'t_res':>6s} {'t_tot':>6s}"
+        print(hdr)
+        for r in compare_rows:
+            print(f"{r['method']:8s} {100*r['resolved_frac']:6.1f}% "
+                  f"{r['orientation_corr']:8.4f} {100*r['imo_frac']:5.1f}% "
+                  f"{r['n_objects']:4d} {r['resolver_runtime_s']:6.2f} "
+                  f"{r['total_runtime_s']:6.1f}")
+        plot_resolver_comparison(fig_paths_by_method, args.out_dir)
+
+    print(f"done in {_time.time()-t0:.1f}s  -> {args.out_dir}/")
 
 
 if __name__ == "__main__":

@@ -256,7 +256,7 @@ def plot_supernodes(x, y, cluster_id, is_imo, out_dir, info):
 
 
 def plot_segmentation(x, y, labels, out_dir, tau, num_layers, lam, smooth_iters,
-                      runtime_s):
+                      runtime_s, extra_box=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -288,7 +288,10 @@ def plot_segmentation(x, y, labels, out_dir, tau, num_layers, lam, smooth_iters,
         f"smooth_iters: {smooth_iters}",
         f"#objects: {n_obj}",
         f"runtime: {runtime_s:.1f}s",
-    ] + count_lines[:8]
+    ]
+    if extra_box:
+        box.extend(f"{k}: {v}" for k, v in extra_box.items())
+    box.extend(count_lines[:8])
     _annotate(ax, box)
     fig.tight_layout()
     fig.savefig(path, dpi=140)
@@ -298,7 +301,7 @@ def plot_segmentation(x, y, labels, out_dir, tau, num_layers, lam, smooth_iters,
 
 
 def plot_summary(paths, out_dir):
-    """2x3 grid of stages 1–6 for one-glance reporting."""
+    """Flexible grid summary of diagnostic images."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -306,14 +309,216 @@ def plot_summary(paths, out_dir):
 
     out_dir = _ensure_dir(out_dir)
     path = os.path.join(out_dir, "07_summary.png")
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
-    for ax, p in zip(axes.ravel(), paths):
+    paths = [p for p in paths if p]
+    n = max(len(paths), 1)
+    cols = 3
+    rows = int(np.ceil(n / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows))
+    axes = np.atleast_1d(axes).ravel()
+    for ax, p in zip(axes, paths + [None] * (len(axes) - len(paths))):
         if p and os.path.isfile(p):
-            img = mpimg.imread(p)
-            ax.imshow(img)
+            ax.imshow(mpimg.imread(p))
         ax.axis("off")
-    fig.suptitle("Ego-motion-compensated VSA segmentation — summary",
+    fig.suptitle("Aperture-resolved VSA segmentation — summary", fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
+def plot_flow_resolved(x, y, vx, vy, resolved_mask, out_dir, info, n_sample=2000):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = _ensure_dir(out_dir)
+    path = os.path.join(out_dir, "11_flow_resolved.png")
+    fig, ax = plt.subplots(figsize=(9, 7))
+    _scatter_events(ax, x, y, c="0.9", s=1)
+    idx = _subsample_idx(len(x), n_sample, 0)
+    conf = info.get("confidence")
+    if conf is not None:
+        c = conf[idx]
+        q = ax.quiver(x[idx], y[idx], vx[idx], -vy[idx], c,
+                      angles="xy", scale_units="xy", scale=None,
+                      width=0.0015, cmap="viridis", alpha=0.8)
+        fig.colorbar(q, ax=ax, label="confidence")
+    else:
+        colors = np.where(resolved_mask[idx], "darkgreen", "crimson")
+        for color in ("darkgreen", "crimson"):
+            m = colors == color
+            if m.any():
+                ax.quiver(x[idx][m], y[idx][m], vx[idx][m], -vy[idx][m],
+                          angles="xy", scale_units="xy", scale=None,
+                          width=0.0015, color=color, alpha=0.7)
+    ax.set_title(f"Aperture-resolved flow ({info.get('method', '?')})",
                  fontweight="bold")
+    _annotate(ax, [
+        f"method: {info.get('method')}",
+        f"resolved: {100*info.get('resolved_frac', 0):.1f}%",
+        f"|v| before: {info.get('median_speed_before', 0):.4g}",
+        f"|v| after:  {info.get('median_speed_after', 0):.4g}",
+        f"orient_corr: {info.get('orientation_corr', float('nan')):.4f}",
+        f"unresolved: {info.get('n_unresolved', '?')}",
+        f"runtime: {info.get('runtime_s', 0):.3f}s",
+        f"gate: {info.get('n_conditioning_gate', '-')}",
+    ])
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
+def plot_orientation_check(n_hat, vx, vy, valid, out_dir, info):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = _ensure_dir(out_dir)
+    path = os.path.join(out_dir, "12_orientation_check.png")
+    ang_n = np.arctan2(n_hat[valid, 1], n_hat[valid, 0])
+    ang_v = np.arctan2(vy[valid], vx[valid])
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.scatter(ang_n, ang_v, s=2, alpha=0.3, c="steelblue", linewidths=0)
+    ax.set_xlabel("edge-normal angle")
+    ax.set_ylabel("resolved-flow angle")
+    ax.set_title("Orientation check (flat=resolved, diagonal=locked)",
+                 fontweight="bold")
+    ax.set_aspect("equal")
+    _annotate(ax, [
+        f"method: {info.get('method')}",
+        f"orientation_corr: {info.get('orientation_corr', float('nan')):.4f}",
+        f"N valid: {int(valid.sum())}",
+        "(low corr = aperture resolved)",
+    ])
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
+def plot_constraint_votes(x, y, is_imo, info, out_dir):
+    """13: vote maps before/after bundling for 3 hand-picked events."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    C = info.get("C_sparse")
+    V = info.get("V_sparse")
+    grid = info.get("grid_coords")
+    if C is None or V is None or grid is None:
+        return None
+    out_dir = _ensure_dir(out_dir)
+    path = os.path.join(out_dir, "13_constraint_votes.png")
+    G = grid.shape[0]
+    gn = int(np.sqrt(G))
+    # pick events: strong vertical edge, horizontal, corner-like among IMO
+    cand = np.where(is_imo)[0]
+    if cand.size < 3:
+        cand = np.arange(len(x))
+    # heuristic: use events with diverse positions
+    picks = [cand[0], cand[len(cand)//3], cand[2*len(cand)//3]]
+
+    fig, axes = plt.subplots(3, 2, figsize=(10, 12))
+    for row, i in enumerate(picks):
+        before = C[i].toarray().reshape(gn, gn)
+        after = V[i].toarray().reshape(gn, gn)
+        axes[row, 0].imshow(before, origin="lower", cmap="magma")
+        axes[row, 0].set_title(f"event {i} BEFORE bundle (ridge)")
+        axes[row, 1].imshow(after, origin="lower", cmap="magma")
+        axes[row, 1].set_title(f"event {i} AFTER bundle (peak)")
+        # mark resolved velocity if available
+        conf = info.get("confidence")
+        if conf is not None:
+            axes[row, 1].set_xlabel(f"conf={conf[i]:.3f}")
+    fig.suptitle("VSA constraint votes: ridges → peaks", fontweight="bold")
+    _annotate(axes[0, 1], [
+        f"VEL_GRID_N: {info.get('VEL_GRID_N')}",
+        f"BAND_SIGMA: {info.get('BAND_SIGMA')}",
+        f"D_VEL: {info.get('D_VEL')}",
+        f"G: {info.get('G')}",
+    ])
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
+def plot_vsa_vs_hough(v_vsa, v_hough, mask, out_dir, info):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = _ensure_dir(out_dir)
+    path = os.path.join(out_dir, "14_vsa_vs_hough.png")
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+    m = np.asarray(mask, dtype=bool)
+    for ax, dim, name in zip(axes, (0, 1), ("vx", "vy")):
+        ax.scatter(v_hough[m, dim], v_vsa[m, dim], s=2, alpha=0.3, linewidths=0)
+        lims = [min(ax.get_xlim()[0], ax.get_ylim()[0]),
+                max(ax.get_xlim()[1], ax.get_ylim()[1])]
+        ax.plot(lims, lims, "r--", lw=1)
+        ax.set_xlabel(f"Hough {name}")
+        ax.set_ylabel(f"VSA {name}")
+        ax.set_title(name)
+        ax.set_aspect("equal")
+    fig.suptitle("VSA superposition vs explicit Hough", fontweight="bold")
+    _annotate(axes[1], [
+        f"corr_vx: {info.get('hough_corr_vx', float('nan')):.4f}",
+        f"corr_vy: {info.get('hough_corr_vy', float('nan')):.4f}",
+        f"RMS: {info.get('hough_rms', float('nan')):.4g}",
+        f"D_VEL: {info.get('D_VEL')}",
+        f"G: {info.get('G')}",
+    ])
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
+def plot_resolver_comparison(fig_paths_by_method, out_dir):
+    """15: columns=methods, rows=quiver / residual split / segmentation."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.image as mpimg
+
+    out_dir = _ensure_dir(out_dir)
+    path = os.path.join(out_dir, "15_resolver_comparison.png")
+    methods = list(fig_paths_by_method.keys())
+    nrows, ncols = 3, len(methods)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
+    if ncols == 1:
+        axes = np.array(axes).reshape(nrows, 1)
+    row_keys = ["quiver", "split", "seg"]
+    row_titles = ["resolved flow", "residual split", "segmentation"]
+    for c, m in enumerate(methods):
+        pack = fig_paths_by_method[m]
+        for r, key in enumerate(row_keys):
+            ax = axes[r, c]
+            p = pack.get(key)
+            if p and os.path.isfile(p):
+                ax.imshow(mpimg.imread(p))
+            ax.axis("off")
+            if r == 0:
+                ax.set_title(m, fontweight="bold")
+            if c == 0:
+                ax.set_ylabel(row_titles[r])
+            row = pack.get("row", {})
+            if r == 0 and row:
+                _annotate(ax, [
+                    f"resol%: {100*row.get('resolved_frac', 0):.1f}",
+                    f"orient: {row.get('orientation_corr', float('nan')):.3f}",
+                    f"imo%: {100*row.get('imo_frac', 0):.1f}",
+                    f"#obj: {row.get('n_objects', 0)}",
+                    f"t: {row.get('total_runtime_s', 0):.1f}s",
+                ], loc="lower left")
+    fig.suptitle("Resolver comparison (none / lk / vsa)", fontweight="bold")
     fig.tight_layout()
     fig.savefig(path, dpi=140)
     plt.close(fig)
