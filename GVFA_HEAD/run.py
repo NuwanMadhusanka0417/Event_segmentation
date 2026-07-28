@@ -27,6 +27,7 @@ from dataset import (
     iter_windows_streaming,
     list_clips,
     load_event_file,
+    process_rss_gb,
     summarize_dir,
     _norm_path,
 )
@@ -156,14 +157,21 @@ def run_train(args):
     print("[startup] src/ encoder is imported only — never modified")
     print(f"[startup] out_dir={out_dir}  (scratch/jobfs preferred)")
     print(f"[startup] window_ms={args.window_ms}  sensor={args.width}x{args.height}")
+    print(f"[startup] max_events_per_window={args.max_events_per_window}  "
+          f"index_cache_dir={args.index_cache_dir}")
+    print(f"[startup] RSS={process_rss_gb():.2f} GiB")
 
     train_root = _norm_path(args.train_dir)
-    fmt = summarize_dir(train_root, args.window_ms)
+    fmt = summarize_dir(
+        train_root, args.window_ms,
+        index_cache_dir=args.index_cache_dir,
+        max_events_per_window=args.max_events_per_window,
+    )
     all_files = list_clips(train_root, fmt)
 
     # Prefer DAT header sensor (Prophesee Gen1 = 304x240) when present
     width, height = args.width, args.height
-    sample = load_event_file(all_files[0], require_labels=False)
+    sample = load_event_file(all_files[0], require_labels=False)  # header only
     if "sensor" in sample:
         sw, sh = sample["sensor"]
         if (args.width, args.height) == (346, 260) and (sw, sh) != (346, 260):
@@ -179,32 +187,48 @@ def run_train(args):
     train_files, val_files = clip_train_val_split(
         all_files, val_frac=args.val_frac, seed=args.seed)
 
+    print(f"[startup] RSS before dataset init: {process_rss_gb():.2f} GiB")
     train_ds = EventWindowDataset(
         train_root, cfg, window_ms=args.window_ms,
         stride_ms=args.stride_ms, require_labels=True,
-        clip_files=train_files)
+        clip_files=train_files,
+        index_cache_dir=args.index_cache_dir,
+        max_events_per_window=args.max_events_per_window,
+        subsample_seed=args.seed,
+        deterministic_subsample=False,
+    )
     val_ds = EventWindowDataset(
         train_root, cfg, window_ms=args.window_ms,
         stride_ms=args.stride_ms, require_labels=True,
-        clip_files=val_files)
+        clip_files=val_files,
+        index_cache_dir=args.index_cache_dir,
+        max_events_per_window=args.max_events_per_window,
+        subsample_seed=args.seed,
+        deterministic_subsample=True,
+    )
     print(f"[data] train windows={len(train_ds)}  val windows={len(val_ds)}")
+    print(f"[startup] RSS after dataset init: {process_rss_gb():.2f} GiB")
 
+    nw = int(args.num_workers)
+    pin = bool(args.pin_memory) and device.type == "cuda"
     train_loader = DataLoader(
         train_ds, batch_size=1, shuffle=True,
-        collate_fn=collate_identity, num_workers=0)
+        collate_fn=collate_identity, num_workers=nw, pin_memory=pin)
     val_loader = DataLoader(
         val_ds, batch_size=1, shuffle=False,
-        collate_fn=collate_identity, num_workers=0)
+        collate_fn=collate_identity, num_workers=nw, pin_memory=pin)
 
     model = SegModel(cfg).to(device)
     n_train = model.assert_encoder_frozen()
     print(f"[startup] trainable params (adapter+head only) = {n_train:,}")
     print("[startup] encoder requires_grad=False  (asserted)")
     print(f"[loss] focal α={args.focal_alpha}  γ={args.focal_gamma}")
+    print(f"[startup] RSS after model: {process_rss_gb():.2f} GiB")
 
     opt = torch.optim.Adam(model.trainable_parameters(), lr=args.lr)
     best_iou, best_path = -1.0, out_dir / "best.pt"
     history = []
+    rss_every = max(1, int(args.rss_every))
 
     for epoch in range(1, args.epochs + 1):
         model.adapter.train()
@@ -213,7 +237,7 @@ def run_train(args):
         running = 0.0
         all_logits, all_labels = [], []
 
-        for item in train_loader:
+        for step, item in enumerate(train_loader, start=1):
             opt.zero_grad(set_to_none=True)
             logits = model(item["graph"])
             labels = item["label"].to(logits.device)
@@ -224,6 +248,13 @@ def run_train(args):
             running += float(loss.item())
             all_logits.append(logits.detach().cpu())
             all_labels.append(labels.detach().cpu())
+            if step == 1 or step % rss_every == 0:
+                print(
+                    f"[rss] epoch={epoch} step={step}  "
+                    f"RSS={process_rss_gb():.2f} GiB  "
+                    f"n_events={item.get('n_events')} "
+                    f"(pre-cap={item.get('n_events_pre_cap')})"
+                )
 
         train_logits = torch.cat(all_logits)
         train_labels = torch.cat(all_labels)
@@ -235,7 +266,8 @@ def run_train(args):
         train_m["fg_bg_ratio"] = ratio
         val_m = evaluate(model, val_loader, device)
 
-        row = {"epoch": epoch, "train": train_m, "val": val_m}
+        row = {"epoch": epoch, "train": train_m, "val": val_m,
+               "rss_gb": process_rss_gb()}
         history.append(row)
         print(
             f"[epoch {epoch:03d}] "
@@ -244,7 +276,8 @@ def run_train(args):
             f"IoU={train_m['iou']:.4f} P={train_m['precision']:.4f} "
             f"R={train_m['recall']:.4f} F1={train_m['f1']:.4f} | "
             f"val IoU={val_m['iou']:.4f} P={val_m['precision']:.4f} "
-            f"R={val_m['recall']:.4f} F1={val_m['f1']:.4f}"
+            f"R={val_m['recall']:.4f} F1={val_m['f1']:.4f}  "
+            f"RSS={row['rss_gb']:.2f} GiB"
         )
 
         ckpt = {
@@ -265,7 +298,7 @@ def run_train(args):
     with open(out_dir / "history.json", "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
     print(f"[done] best foreground IoU={best_iou:.4f}  ckpt={best_path}")
-
+    print(f"[done] final RSS={process_rss_gb():.2f} GiB")
 
 # ---------------------------------------------------------------------------
 # Test / visualization
@@ -377,22 +410,40 @@ def run_test(args):
     print("[startup] src/ encoder is imported only — never modified")
     print(f"[startup] ckpt={args.ckpt}")
     print(f"[startup] out_dir={out_dir}")
-    summarize_dir(args.test_dir, args.window_ms)
+    print(f"[startup] RSS={process_rss_gb():.2f} GiB")
+    summarize_dir(
+        args.test_dir, args.window_ms,
+        index_cache_dir=args.index_cache_dir,
+        max_events_per_window=args.max_events_per_window,
+    )
 
     model, _ckpt = load_checkpoint(args.ckpt, device, args)
+    # Prefer DAT header sensor when CLI still has DAVIS defaults
+    test_files = list_clips(_norm_path(args.test_dir))
+    sample = load_event_file(test_files[0], require_labels=False)
+    if "sensor" in sample and (args.width, args.height) == (346, 260):
+        sw, sh = sample["sensor"]
+        if (sw, sh) != (346, 260):
+            print(f"[startup] overriding sensor -> {sw}x{sh} from DAT header")
+            args.width, args.height = sw, sh
+            model.cfg.width, model.cfg.height = sw, sh
     n_train = model.assert_encoder_frozen()
     print(f"[startup] trainable params loaded (adapter+head) = {n_train:,}")
     print("[startup] encoder requires_grad=False  (asserted)")
 
-    files = list_clips(_norm_path(args.test_dir))
+    files = test_files
     totals = {"tp": 0, "fp": 0, "fn": 0}
     any_labels = False
     rows = []
+    rss_every = max(1, int(args.rss_every))
 
     for path in files:
         print(f"[test] {path.name} ...")
         for item in iter_windows_streaming(
             path, model.cfg, window_ms=args.window_ms, stride_ms=args.stride_ms,
+            index_cache_dir=args.index_cache_dir,
+            max_events_per_window=args.max_events_per_window,
+            subsample_seed=args.seed,
         ):
             logits = model(item["graph"])
             pred = (torch.sigmoid(logits) >= args.thr).cpu().numpy().astype(bool)
@@ -408,6 +459,14 @@ def run_test(args):
             render_pred_image(
                 x, y, pred, args.width, args.height, pred_path, title=stem,
             )
+
+            if item["window_index"] == 0 or (item["window_index"] + 1) % rss_every == 0:
+                print(
+                    f"[rss] test window={item['window_index']}  "
+                    f"RSS={process_rss_gb():.2f} GiB  "
+                    f"n_events={item.get('n_events')} "
+                    f"(pre-cap={item.get('n_events_pre_cap')})"
+                )
 
             if item.get("has_labels"):
                 any_labels = True
@@ -441,7 +500,6 @@ def run_test(args):
                 })
             else:
                 print(f"  window {item['window_index']:04d}  (no labels) -> {pred_path.name}")
-
     if any_labels:
         tp, fp, fn = totals["tp"], totals["fp"], totals["fn"]
         prec = tp / max(tp + fp, 1)
@@ -496,8 +554,21 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--smooth_majority", type=float, default=0.6)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--index_cache_dir", default="output/index_cache",
+        help="directory for per-clip window-index .npz sidecars",
+    )
+    ap.add_argument(
+        "--max_events_per_window", type=int, default=20000,
+        help="uniform subsample cap per window (0 = no cap)",
+    )
+    ap.add_argument("--num_workers", type=int, default=0)
+    ap.add_argument("--pin_memory", action="store_true", default=False)
+    ap.add_argument(
+        "--rss_every", type=int, default=50,
+        help="print process RSS every N windows/steps",
+    )
     return ap
-
 
 def main():
     args = build_parser().parse_args()
