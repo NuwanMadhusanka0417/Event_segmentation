@@ -114,6 +114,8 @@ FLOW_KEEP         = 0.5    # self weight per iteration
 # === APERTURE RESOLVER (Track A / Track B) ===
 MOTION_RESOLVER    = "lk"        # "none" | "lk" | "affine" | "vsa"
 COMPARE_METHODS    = ["none", "lk", "vsa"]
+ALL_RESOLVERS      = ["none", "lk", "affine", "vsa"]
+SEGMENT_MS         = 60.0        # tile size for --stream-segments
 U_MIN              = 1e-6
 SPEED_V0           = 50.0        # signed-log knee, px/s
 BW_R               = 0.1         # node Cartesian motion codebook bandwidth
@@ -193,19 +195,56 @@ DEVICE = "cpu"
 # ----------------------------------------------------------------------------
 # 1. LOAD
 # ----------------------------------------------------------------------------
-def load_events(path, window_ms=WINDOW_MS):
-    """Read 'timestamp x y polarity' rows; keep the first window_ms milliseconds.
-    Returns t (seconds, float), x, y (int), p (0/1), all sorted by time."""
+def load_events(path, window_ms=WINDOW_MS, *, t_start_ms=0.0, t_end_ms=None):
+    """Read event rows; optionally slice [t0+t_start_ms, t0+t_start_ms+window_ms).
+
+    t_end_ms overrides window_ms when set (absolute end offset from file t0, ms).
+    Returns t (seconds), x, y, p sorted by time.
+    """
     data = np.loadtxt(path)
     t, x, y, p = data[:, 0], data[:, 1], data[:, 2], data[:, 3]
     order = np.argsort(t, kind="stable")
     t, x, y, p = t[order], x[order], y[order], p[order]
-    if window_ms is not None:
-        keep = t <= (t[0] + window_ms * 1e-3)
-        t, x, y, p = t[keep], x[keep], y[keep], p[keep]
+    t0 = t[0]
+    if t_end_ms is not None:
+        t_lo = t0 + float(t_start_ms) * 1e-3
+        t_hi = t0 + float(t_end_ms) * 1e-3
+        keep = (t >= t_lo) & (t < t_hi)
+    elif window_ms is not None:
+        t_lo = t0 + float(t_start_ms) * 1e-3
+        t_hi = t_lo + float(window_ms) * 1e-3
+        keep = (t >= t_lo) & (t < t_hi)
+    else:
+        keep = np.ones(len(t), dtype=bool)
+    t, x, y, p = t[keep], x[keep], y[keep], p[keep]
     return (t.astype(np.float64),
             x.astype(np.float64), y.astype(np.float64),
             p.astype(np.float64))
+
+
+def file_time_span_ms(path):
+    """Return (t0, span_ms) for the full sorted file (no slicing)."""
+    data = np.loadtxt(path)
+    t = data[:, 0]
+    t = np.sort(t)
+    t0 = float(t[0])
+    span = float((t[-1] - t0) * 1e3) if t.size else 0.0
+    return t0, span
+
+
+def segment_ranges(span_ms, segment_ms):
+    """Non-overlapping [start_ms, end_ms) ranges covering [0, span_ms)."""
+    segment_ms = float(segment_ms)
+    if segment_ms <= 0 or span_ms <= 0:
+        return [(0.0, max(span_ms, segment_ms))]
+    n = int(np.ceil(span_ms / segment_ms))
+    ranges = []
+    for i in range(n):
+        a = i * segment_ms
+        b = min((i + 1) * segment_ms, span_ms)
+        if b > a:
+            ranges.append((a, b))
+    return ranges
 
 
 # ----------------------------------------------------------------------------
@@ -758,7 +797,8 @@ def build_supernode_multigraph(t_s, x_s, y_s, p_s,
 # ----------------------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------------------
-def _resolver_cfg(args):
+def _resolver_cfg(args, *, vsa_validate=None):
+    vv = args.vsa_validate if vsa_validate is None else vsa_validate
     return {
         "U_MIN": U_MIN,
         "SPEED_V0": SPEED_V0,
@@ -777,64 +817,33 @@ def _resolver_cfg(args):
         "CLEANUP_TOPK": args.cleanup_topk,
         "CLEANUP_MIN_CONF": args.cleanup_min_conf,
         "READOUT_CHUNK": READOUT_CHUNK,
-        "VSA_VALIDATE": args.vsa_validate,
+        "VSA_VALIDATE": vv,
         "SEED": SEED,
     }
 
 
-def main():
+def _segment_dir_name(t_start_ms, t_end_ms):
+    return f"t{int(round(t_start_ms)):04d}_{int(round(t_end_ms)):04d}"
+
+
+def _run_window(
+    args,
+    t, x, y, p,
+    methods,
+    out_dir,
+    *,
+    full_diag,
+    compare_resolvers,
+    seg_label=None,
+    save_labels=False,
+):
+    """Ego+VSA pipeline on one event window. Returns compare_rows, fig_paths_by_method."""
     import time as _time
-    import csv
     import os
 
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--input", default="events_filtered.txt")
-    ap.add_argument("--window-ms", type=float, default=WINDOW_MS)
-    ap.add_argument("--tau", type=float, default=TAU)
-    ap.add_argument("--num-layers", type=int, default=NUM_LAYERS)
-    ap.add_argument("--flat", action="store_true")
-    ap.add_argument("--n-coarsen-levels", type=int, default=N_COARSEN_LEVELS)
-    ap.add_argument("--w-min", type=float, default=W_MIN)
-    ap.add_argument("--sigma-v", type=float, default=None)
-    ap.add_argument("--super-r-xy", type=float, default=SUPER_R_XY)
-    ap.add_argument("--super-r-t-ms", type=float, default=SUPER_R_T_MS)
-    ap.add_argument("--res-k", type=float, default=RES_K)
-    ap.add_argument("--flow-smooth-iters", type=int, default=FLOW_SMOOTH_ITERS)
-    ap.add_argument("--lam", type=float, default=LAM)
-    ap.add_argument("--out-dir", default=OUT_DIR)
-    ap.add_argument("--motion-resolver", default=MOTION_RESOLVER,
-                    choices=["none", "lk", "affine", "vsa"])
-    ap.add_argument("--compare-resolvers", action="store_true",
-                    help="A/B all COMPARE_METHODS on the same window")
-    ap.add_argument("--lk-min-support", type=int, default=LK_MIN_SUPPORT)
-    ap.add_argument("--condition-min-eig", type=float, default=CONDITION_MIN_EIG)
-    ap.add_argument("--d-vel", type=int, default=D_VEL)
-    ap.add_argument("--vel-grid-n", type=int, default=VEL_GRID_N)
-    ap.add_argument("--vsa-validate", type=lambda s: str(s).lower() not in
-                    ("0", "false", "no"), default=VSA_VALIDATE)
-    ap.add_argument("--band-sigma", type=float, default=BAND_SIGMA)
-    ap.add_argument("--cleanup-topk", type=int, default=CLEANUP_TOPK)
-    ap.add_argument("--cleanup-min-conf", type=float, default=CLEANUP_MIN_CONF)
-    ap.add_argument("--w-node-motion", type=float, default=W_NODE_MOTION)
-    ap.add_argument("--w-node-t", type=float, default=W_NODE_T)
-    ap.add_argument("--w-node-x", type=float, default=W_NODE_X)
-    ap.add_argument("--w-node-y", type=float, default=W_NODE_Y)
-    ap.add_argument("--w-node-p", type=float, default=W_NODE_P)
-    args = ap.parse_args()
-
-    sigma_v = args.sigma_v if args.sigma_v is not None else SIGMA_V
-    torch.manual_seed(SEED)
-    t0 = _time.time()
-
-    print(
-        f"[config] resolver={args.motion_resolver}  compare={args.compare_resolvers}  "
-        f"window={args.window_ms}ms  layers={args.num_layers}  tau={args.tau}  "
-        f"W_motion={args.w_node_motion}  out={args.out_dir}"
-    )
-
-    print(f"loading {args.input} (window={args.window_ms} ms) ...")
-    t, x, y, p = load_events(args.input, args.window_ms)
-    print(f"  {len(t)} events  span={(t.max()-t.min())*1e3:.2f} ms")
+    if len(t) == 0:
+        print("[skip] empty event window")
+        return [], {}
 
     print("building spatial + temporal ellipsoid multigraph ...")
     (edge_spatial, edge_temporal,
@@ -847,52 +856,54 @@ def main():
     node_cb, cb_spatial, cb_temporal, w_spatial, w_temporal = make_codebooks(
         SENSOR, t_span, seed=SEED)
 
-    if args.flat:
-        print("[flat] FPE encode without residual motion ...")
-        x_hv = fpe_encode(x, y, t, p, node_cb, w_motion=0.0)
-        H_events = encode_nodes_multigraph(
-            x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal,
-            cb_spatial, cb_temporal, w_spatial, w_temporal, args.num_layers)
-        obj_id = assign(H_events, t, comp, tau=args.tau)
-        save(t, x, y, p, obj_id, tau=args.tau)
-        return
+    sigma_v = args.sigma_v if args.sigma_v is not None else SIGMA_V
 
-    # Shared raw normal flow (same for all resolvers / compare)
     print("STAGE 0: node_flow (RAW normal flow) ...")
     vx_raw, vy_raw = node_flow(t, x, y, edge_temporal)
     diagnose_node_flow(vx_raw, vy_raw)
-    p1 = plot_flow_raw(x, y, vx_raw, vy_raw, args.out_dir)
 
-    methods = list(COMPARE_METHODS) if args.compare_resolvers else [args.motion_resolver]
+    p1 = None
+    if full_diag:
+        p1 = plot_flow_raw(x, y, vx_raw, vy_raw, out_dir)
+
     compare_rows = []
     fig_paths_by_method = {}
+    vsa_validate = args.vsa_validate if full_diag else False
 
     for method in methods:
         mt0 = _time.time()
-        cfg = _resolver_cfg(args)
+        cfg = _resolver_cfg(args, vsa_validate=vsa_validate)
         print(f"\n===== RESOLVER = {method} =====")
-        print("[flow] resolve_flow consumes RAW normal flow")
+        if seg_label:
+            print(f"  segment {seg_label}  full_diag={full_diag}")
+
+        if compare_resolvers and not args.stream_segments:
+            sub = os.path.join(out_dir, f"resolver_{method}")
+        elif args.stream_segments or len(methods) > 1:
+            sub = os.path.join(out_dir, method)
+            if seg_label:
+                sub = os.path.join(sub, seg_label)
+        else:
+            sub = out_dir
+        os.makedirs(sub, exist_ok=True)
+
         vx_res, vy_res, resolved_mask, rinfo = resolve_flow(
             x, y, vx_raw, vy_raw, [edge_spatial, edge_temporal],
             method=method, cfg=cfg,
         )
-        print("[flow] smooth_flow consumes RESOLVED flow")
         vx_s, vy_s, n_vb, n_va = smooth_flow(
             vx_res, vy_res, edge_spatial,
             n_iters=args.flow_smooth_iters, keep=FLOW_KEEP)
 
-        sub = args.out_dir if not args.compare_resolvers else os.path.join(
-            args.out_dir, f"resolver_{method}")
-        os.makedirs(sub, exist_ok=True)
+        p2 = p11 = p12 = p3 = p4 = p5 = p13 = p14 = None
+        if full_diag:
+            p2 = plot_flow_smoothed(
+                x, y, vx_s, vy_s, sub,
+                n_iters=args.flow_smooth_iters, keep=FLOW_KEEP,
+                n_valid_before=n_vb, n_valid_after=n_va)
+            p11 = plot_flow_resolved(
+                x, y, vx_res, vy_res, resolved_mask, sub, rinfo)
 
-        p2 = plot_flow_smoothed(
-            x, y, vx_s, vy_s, sub,
-            n_iters=args.flow_smooth_iters, keep=FLOW_KEEP,
-            n_valid_before=n_vb, n_valid_after=n_va)
-        p11 = plot_flow_resolved(
-            x, y, vx_res, vy_res, resolved_mask, sub, rinfo)
-
-        print("[flow] ego fit consumes SMOOTHED resolved flow")
         valid_flow = np.hypot(vx_s, vy_s) > 1e-12
         params, residual, ego_info = fit_ego_motion(
             x, y, vx_s, vy_s, SENSOR, n_iters=IRLS_ITERS, valid_mask=valid_flow)
@@ -900,35 +911,28 @@ def main():
             residual, edge_spatial, res_k=args.res_k, valid_mask=valid_flow)
         rx, ry = residual[:, 0], residual[:, 1]
 
-        # Orientation check on IMO events (primary aperture metric figure)
-        _, n_hat, valid_c = extract_constraints(vx_raw, vy_raw, u_min=U_MIN)
-        ori_mask = valid_c & is_imo
-        if not ori_mask.any():
-            ori_mask = valid_c
-        p12 = plot_orientation_check(
-            n_hat, vx_res, vy_res, ori_mask, sub, rinfo)
-
-        p3 = plot_ego_fit(
-            x, y, params, residual, SENSOR, sub,
-            res_k=args.res_k, thresh=thresh,
-            inlier_rms=ego_info["inlier_rms"], info=ego_info)
-        p4 = plot_residual_split(x, y, is_imo, residual, thresh, sub)
-
-        # Track B diagnostics
-        p13 = p14 = None
-        if method == "vsa" and rinfo.get("C_sparse") is not None:
-            p13 = plot_constraint_votes(
-                x, y, is_imo, rinfo, sub)
-            if rinfo.get("v_hough") is not None:
-                p14 = plot_vsa_vs_hough(
-                    np.stack([vx_res, vy_res], 1), rinfo["v_hough"],
-                    resolved_mask, sub, rinfo)
-            # drop heavy matrices after plotting (compare mode runs 3 methods)
-            for k in ("C_sparse", "V_sparse", "Z", "codebook", "grid_coords"):
-                rinfo.pop(k, None)
+        if full_diag:
+            _, n_hat, valid_c = extract_constraints(vx_raw, vy_raw, u_min=U_MIN)
+            ori_mask = valid_c & is_imo
+            if not ori_mask.any():
+                ori_mask = valid_c
+            p12 = plot_orientation_check(
+                n_hat, vx_res, vy_res, ori_mask, sub, rinfo)
+            p3 = plot_ego_fit(
+                x, y, params, residual, SENSOR, sub,
+                res_k=args.res_k, thresh=thresh,
+                inlier_rms=ego_info["inlier_rms"], info=ego_info)
+            p4 = plot_residual_split(x, y, is_imo, residual, thresh, sub)
+            if method == "vsa" and rinfo.get("C_sparse") is not None:
+                p13 = plot_constraint_votes(x, y, is_imo, rinfo, sub)
+                if rinfo.get("v_hough") is not None:
+                    p14 = plot_vsa_vs_hough(
+                        np.stack([vx_res, vy_res], 1), rinfo["v_hough"],
+                        resolved_mask, sub, rinfo)
+                for k in ("C_sparse", "V_sparse", "Z", "codebook", "grid_coords"):
+                    rinfo.pop(k, None)
 
         motion_ok = resolved_mask & valid_flow & np.isfinite(rx) & np.isfinite(ry)
-        print("[encode] FPE Cartesian residual motion + GVFA")
         x_hv = fpe_encode(
             x, y, t, p, node_cb, rx=rx, ry=ry, motion_valid=motion_ok,
             w_motion=args.w_node_motion, w_t=args.w_node_t,
@@ -938,7 +942,6 @@ def main():
             x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal,
             cb_spatial, cb_temporal, w_spatial, w_temporal, args.num_layers)
 
-        print("STAGE 3: residual-affinity coarsening on IMO ...")
         labels = np.zeros(len(t), dtype=np.int64)
         cluster_full = np.full(len(t), -1, dtype=np.int64)
         cinfo = {"sigma_v": float("nan"), "w_min": args.w_min,
@@ -985,9 +988,10 @@ def main():
                 out[keep] = compact + 1
             labels[sub_idx] = out
 
-        p5 = plot_supernodes(
-            x, y, cluster_full[is_imo] if n_imo else np.array([]),
-            is_imo, sub, cinfo)
+        if full_diag:
+            p5 = plot_supernodes(
+                x, y, cluster_full[is_imo] if n_imo else np.array([]),
+                is_imo, sub, cinfo)
 
         protos = compute_prototypes(H_events, labels)
         labels = smooth_labels(
@@ -1001,6 +1005,7 @@ def main():
         ids, counts = np.unique(labels, return_counts=True)
         n_obj = int((ids > 0).sum())
         largest = float(counts[ids > 0].max() / len(labels)) if n_obj else 0.0
+        seg_extra = {"segment": seg_label} if seg_label else {}
         p6 = plot_segmentation(
             x, y, labels, sub,
             tau=args.tau, num_layers=args.num_layers,
@@ -1010,20 +1015,23 @@ def main():
                 "resolved %": f"{100*rinfo['resolved_frac']:.1f}",
                 "orient_corr": f"{rinfo['orientation_corr']:.4f}",
                 "W_NODE_MOTION": args.w_node_motion,
+                **seg_extra,
             })
 
-        paths = [p1, p2, p3, p4, p5, p6, p11, p12]
-        if p13:
-            paths.append(p13)
-        if p14:
-            paths.append(p14)
-        plot_summary(paths, sub)
+        if full_diag:
+            paths = [p1, p2, p3, p4, p5, p6, p11, p12]
+            if p13:
+                paths.append(p13)
+            if p14:
+                paths.append(p14)
+            plot_summary(paths, sub)
 
-        if not args.compare_resolvers:
+        if save_labels and not compare_resolvers:
             save(t, x, y, p, labels, tau=args.tau)
 
         row = {
             "method": method,
+            "segment": seg_label or "",
             "resolved_frac": rinfo["resolved_frac"],
             "orientation_corr": rinfo["orientation_corr"],
             "median_speed": rinfo["median_speed_after"],
@@ -1039,32 +1047,175 @@ def main():
         compare_rows.append(row)
         fig_paths_by_method[method] = {
             "quiver": p11, "split": p4, "seg": p6, "row": row,
-            "vx": vx_res, "vy": vy_res, "resolved": resolved_mask,
-            "is_imo": is_imo, "residual": residual, "labels": labels,
-            "rinfo": rinfo,
         }
         print(f"[summary] method={method}  objects={n_obj}  "
-              f"orient_corr={rinfo['orientation_corr']:.4f}  "
-              f"resolved={rinfo['resolved_frac']:.3f}  time={runtime:.1f}s")
+              f"orient_corr={rinfo['orientation_corr']:.4f}  time={runtime:.1f}s")
 
-    if args.compare_resolvers:
-        csv_path = os.path.join(args.out_dir, "compare_resolvers.csv")
+    return compare_rows, fig_paths_by_method
+
+
+def main():
+    import time as _time
+    import csv
+    import os
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--input", default="events_filtered.txt")
+    ap.add_argument("--window-ms", type=float, default=WINDOW_MS)
+    ap.add_argument("--tau", type=float, default=TAU)
+    ap.add_argument("--num-layers", type=int, default=NUM_LAYERS)
+    ap.add_argument("--flat", action="store_true")
+    ap.add_argument("--n-coarsen-levels", type=int, default=N_COARSEN_LEVELS)
+    ap.add_argument("--w-min", type=float, default=W_MIN)
+    ap.add_argument("--sigma-v", type=float, default=None)
+    ap.add_argument("--super-r-xy", type=float, default=SUPER_R_XY)
+    ap.add_argument("--super-r-t-ms", type=float, default=SUPER_R_T_MS)
+    ap.add_argument("--res-k", type=float, default=RES_K)
+    ap.add_argument("--flow-smooth-iters", type=int, default=FLOW_SMOOTH_ITERS)
+    ap.add_argument("--lam", type=float, default=LAM)
+    ap.add_argument("--out-dir", default=OUT_DIR)
+    ap.add_argument("--motion-resolver", default=MOTION_RESOLVER,
+                    choices=["none", "lk", "affine", "vsa"])
+    ap.add_argument("--compare-resolvers", action="store_true",
+                    help="A/B all COMPARE_METHODS on the same window")
+    ap.add_argument("--lk-min-support", type=int, default=LK_MIN_SUPPORT)
+    ap.add_argument("--condition-min-eig", type=float, default=CONDITION_MIN_EIG)
+    ap.add_argument("--d-vel", type=int, default=D_VEL)
+    ap.add_argument("--vel-grid-n", type=int, default=VEL_GRID_N)
+    ap.add_argument("--vsa-validate", type=lambda s: str(s).lower() not in
+                    ("0", "false", "no"), default=VSA_VALIDATE)
+    ap.add_argument("--band-sigma", type=float, default=BAND_SIGMA)
+    ap.add_argument("--cleanup-topk", type=int, default=CLEANUP_TOPK)
+    ap.add_argument("--cleanup-min-conf", type=float, default=CLEANUP_MIN_CONF)
+    ap.add_argument("--w-node-motion", type=float, default=W_NODE_MOTION)
+    ap.add_argument("--w-node-t", type=float, default=W_NODE_T)
+    ap.add_argument("--w-node-x", type=float, default=W_NODE_X)
+    ap.add_argument("--w-node-y", type=float, default=W_NODE_Y)
+    ap.add_argument("--w-node-p", type=float, default=W_NODE_P)
+    ap.add_argument(
+        "--stream-segments", action="store_true",
+        help="Tile the full recording into --segment-ms windows; run all resolvers",
+    )
+    ap.add_argument(
+        "--segment-ms", type=float, default=SEGMENT_MS,
+        help="Segment length when --stream-segments (default 60 ms)",
+    )
+    ap.add_argument(
+        "--all-resolvers", action="store_true",
+        help="Run none, lk, affine, vsa (default on with --stream-segments)",
+    )
+    ap.add_argument(
+        "--diag-all-segments", action="store_true",
+        help="Full diagnostic PNGs on every segment (default: only first segment)",
+    )
+    args = ap.parse_args()
+
+    if args.stream_segments:
+        args.all_resolvers = args.all_resolvers or True
+
+    sigma_v = args.sigma_v if args.sigma_v is not None else SIGMA_V
+    torch.manual_seed(SEED)
+    t0 = _time.time()
+
+    if args.stream_segments:
+        methods = list(ALL_RESOLVERS) if args.all_resolvers else [args.motion_resolver]
+        compare_resolvers = False
+    elif args.compare_resolvers:
+        methods = list(COMPARE_METHODS)
+        compare_resolvers = True
+    elif args.all_resolvers:
+        methods = list(ALL_RESOLVERS)
+        compare_resolvers = False
+    else:
+        methods = [args.motion_resolver]
+        compare_resolvers = False
+
+    print(
+        f"[config] resolver(s)={methods}  stream={args.stream_segments}  "
+        f"segment_ms={args.segment_ms}  window={args.window_ms}ms  "
+        f"layers={args.num_layers}  out={args.out_dir}"
+    )
+
+    if args.flat:
+        print(f"loading {args.input} (window={args.window_ms} ms) ...")
+        t, x, y, p = load_events(args.input, args.window_ms)
+        print("building spatial + temporal ellipsoid multigraph ...")
+        (edge_spatial, edge_temporal,
+         attr_spatial, attr_temporal,
+         rec, src) = build_multigraph(t, x, y, p)
+        comp = connected_components(len(t), rec, src)
+        node_cb, cb_spatial, cb_temporal, w_spatial, w_temporal = make_codebooks(
+            SENSOR, max((t.max() - t.min()), 1e-9), seed=SEED)
+        print("[flat] FPE encode without residual motion ...")
+        x_hv = fpe_encode(x, y, t, p, node_cb, w_motion=0.0)
+        H_events = encode_nodes_multigraph(
+            x_hv, edge_spatial, attr_spatial, edge_temporal, attr_temporal,
+            cb_spatial, cb_temporal, w_spatial, w_temporal, args.num_layers)
+        obj_id = assign(H_events, t, comp, tau=args.tau)
+        save(t, x, y, p, obj_id, tau=args.tau)
+        return
+
+    all_compare_rows = []
+
+    if args.stream_segments:
+        _, span_ms = file_time_span_ms(args.input)
+        ranges = segment_ranges(span_ms, args.segment_ms)
+        print(f"streaming {len(ranges)} segments over {span_ms:.1f} ms "
+              f"(segment_ms={args.segment_ms})")
         os.makedirs(args.out_dir, exist_ok=True)
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(compare_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(compare_rows)
-        print(f"wrote {csv_path}")
-        print("\n=== resolver comparison ===")
-        hdr = f"{'method':8s} {'resol%':>7s} {'orient':>8s} {'imo%':>6s} " \
-              f"{'#obj':>4s} {'t_res':>6s} {'t_tot':>6s}"
-        print(hdr)
-        for r in compare_rows:
-            print(f"{r['method']:8s} {100*r['resolved_frac']:6.1f}% "
-                  f"{r['orientation_corr']:8.4f} {100*r['imo_frac']:5.1f}% "
-                  f"{r['n_objects']:4d} {r['resolver_runtime_s']:6.2f} "
-                  f"{r['total_runtime_s']:6.1f}")
-        plot_resolver_comparison(fig_paths_by_method, args.out_dir)
+        for seg_i, (t_a, t_b) in enumerate(ranges):
+            seg_label = _segment_dir_name(t_a, t_b)
+            full_diag = args.diag_all_segments or (seg_i == 0)
+            print(f"\n======== segment {seg_i+1}/{len(ranges)} "
+                  f"[{t_a:.0f}, {t_b:.0f}) ms  full_diag={full_diag} ========")
+            t, x, y, p = load_events(
+                args.input, window_ms=None,
+                t_start_ms=t_a, t_end_ms=t_b,
+            )
+            print(f"  {len(t)} events  span={(t.max()-t.min())*1e3:.2f} ms")
+            rows, _ = _run_window(
+                args, t, x, y, p, methods, args.out_dir,
+                full_diag=full_diag,
+                compare_resolvers=False,
+                seg_label=seg_label,
+                save_labels=(seg_i == len(ranges) - 1 and len(methods) == 1),
+            )
+            all_compare_rows.extend(rows)
+        csv_path = os.path.join(args.out_dir, "stream_segments.csv")
+        if all_compare_rows:
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(all_compare_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(all_compare_rows)
+            print(f"wrote {csv_path}")
+    else:
+        print(f"loading {args.input} (window={args.window_ms} ms) ...")
+        t, x, y, p = load_events(args.input, args.window_ms)
+        print(f"  {len(t)} events  span={(t.max()-t.min())*1e3:.2f} ms")
+        compare_rows, fig_paths_by_method = _run_window(
+            args, t, x, y, p, methods, args.out_dir,
+            full_diag=True,
+            compare_resolvers=compare_resolvers,
+            save_labels=not compare_resolvers,
+        )
+        if compare_resolvers:
+            csv_path = os.path.join(args.out_dir, "compare_resolvers.csv")
+            os.makedirs(args.out_dir, exist_ok=True)
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(compare_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(compare_rows)
+            print(f"wrote {csv_path}")
+            print("\n=== resolver comparison ===")
+            hdr = f"{'method':8s} {'resol%':>7s} {'orient':>8s} {'imo%':>6s} " \
+                  f"{'#obj':>4s} {'t_res':>6s} {'t_tot':>6s}"
+            print(hdr)
+            for r in compare_rows:
+                print(f"{r['method']:8s} {100*r['resolved_frac']:6.1f}% "
+                      f"{r['orientation_corr']:8.4f} {100*r['imo_frac']:5.1f}% "
+                      f"{r['n_objects']:4d} {r['resolver_runtime_s']:6.2f} "
+                      f"{r['total_runtime_s']:6.1f}")
+            plot_resolver_comparison(fig_paths_by_method, args.out_dir)
 
     print(f"done in {_time.time()-t0:.1f}s  -> {args.out_dir}/")
 

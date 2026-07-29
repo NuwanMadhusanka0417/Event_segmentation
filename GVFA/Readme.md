@@ -53,6 +53,29 @@ python segment.py --input events_filtered.txt --window-ms 1000 --motion-resolver
 python segment.py --input events_filtered.txt --window-ms 1000 --compare-resolvers
 ```
 
+**Stream 60 ms segments (full file), all four resolvers**
+
+First segment only: full diagnostics (01–07, 11–14 for vsa). Later segments: `06_segmentation.png` only.
+
+```bash
+python segment.py --input events_filtered.txt --stream-segments --segment-ms 60 --out-dir diag_stream
+# layout: diag_stream/none/t0000_0060/ ...  diag_stream/lk/t0060_0120/06_segmentation.png  ...
+# summary: diag_stream/stream_segments.csv
+```
+
+Single resolver across segments:
+
+```bash
+python segment.py --input events_filtered.txt --stream-segments --segment-ms 60 \
+  --motion-resolver lk --out-dir diag_stream
+```
+
+Full diagnostics on every segment (slow):
+
+```bash
+python segment.py --input events_filtered.txt --stream-segments --diag-all-segments --out-dir diag_stream
+```
+
 ```
 --lk-min-support 6
 --condition-min-eig 1e-3
