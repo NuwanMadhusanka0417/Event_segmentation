@@ -153,25 +153,50 @@ def plot_ego_fit(x, y, params, residual, sensor, out_dir, res_k, thresh,
     ax.set_title("fitted ego field v_pred")
     ax.set_aspect("equal", adjustable="box")
 
-    # (b) residual histogram
+    # (b) residual histogram with all three threshold candidates
     ax = axes[1]
     rn = np.hypot(residual[:, 0], residual[:, 1])
     rn_pos = rn[rn > 1e-12]
     ax.hist(rn_pos, bins=60, color="gray", edgecolor="none", alpha=0.85)
-    ax.axvline(thresh, color="crimson", lw=2, label=f"thresh={thresh:.3g}")
+    ts = info.get("thresh_sigma")
+    to = info.get("thresh_otsu")
+    tv = info.get("thresh_valley")
+    active = info.get("thresh_mode", "sigma")
+    if ts is not None:
+        ax.axvline(ts, color="steelblue", lw=1.5, ls="--",
+                   label=f"sigma={ts:.3g}" + (" *" if active == "sigma" else ""))
+    if to is not None:
+        ax.axvline(to, color="darkorange", lw=1.5, ls="-.",
+                   label=f"otsu={to:.3g}" + (" *" if active == "otsu" else ""))
+    if tv is not None:
+        ax.axvline(tv, color="seagreen", lw=1.5, ls=":",
+                   label=f"valley={tv:.3g}" + (" *" if active == "valley" else ""))
+    ax.axvline(thresh, color="crimson", lw=2,
+               label=f"active={thresh:.3g}")
     ax.set_xlabel("|r| (px/s)")
     ax.set_ylabel("count")
     ax.set_title("residual magnitude histogram")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=7)
 
-    fig.suptitle("Stage 2: ego-motion fit (4-param IRLS)", fontweight="bold")
-    _annotate(axes[0], [
+    fitter = info.get("fitter", "irls")
+    title = "Stage 2: ego-motion fit (RANSAC+IRLS)" if "ransac" in fitter else \
+        "Stage 2: ego-motion fit (4-param IRLS)"
+    fig.suptitle(title, fontweight="bold")
+    box = [
         f"tx={tx:.4g}  ty={ty:.4g}",
         f"w={w:.4g}  s={s:.4g}",
         f"inlier RMS={inlier_rms:.4g}",
-        f"RES_K={res_k}",
+        f"EGO_RANSAC={info.get('fitter', 'irls')}",
+    ]
+    if info.get("n_ransac_inliers") is not None:
+        box.append(f"RANSAC inliers={info.get('n_ransac_inliers')}/"
+                   f"{info.get('n_valid', '?')}")
+        box.append(f"hypo RMS={info.get('best_hypo_rms', float('nan')):.4g}")
+    box.extend([
+        f"RES_K={res_k}  mode={info.get('thresh_mode', '?')}",
         f"thresh={thresh:.4g} px/s",
     ])
+    _annotate(axes[0], box)
     fig.tight_layout()
     fig.savefig(path, dpi=140)
     plt.close(fig)
@@ -369,9 +394,10 @@ def plot_flow_resolved(x, y, vx, vy, resolved_mask, out_dir, info, n_sample=2000
         f"|v| before: {info.get('median_speed_before', 0):.4g}",
         f"|v| after:  {info.get('median_speed_after', 0):.4g}",
         f"orient_corr: {info.get('orientation_corr', float('nan')):.4f}",
-        f"unresolved: {info.get('n_unresolved', '?')}",
+        f"reject empty: {info.get('reject_empty', 0)}",
+        f"reject lowconf: {info.get('reject_lowconf', 0)}",
+        f"reject boundary: {info.get('reject_boundary', 0)}",
         f"runtime: {info.get('runtime_s', 0):.3f}s",
-        f"gate: {info.get('n_conditioning_gate', '-')}",
     ])
     fig.tight_layout()
     fig.savefig(path, dpi=140)
@@ -409,8 +435,55 @@ def plot_orientation_check(n_hat, vx, vy, valid, out_dir, info, *, name_suffix=N
     return path
 
 
+def plot_ego_inliers(x, y, vx, vy, params, info, sensor, out_dir, *, name_suffix=None):
+    """10: RANSAC/ego inliers vs outliers with fitted ego quiver."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from ego_motion import ego_field
+
+    out_dir = _ensure_dir(out_dir)
+    path = _fig_path(out_dir, "10_ego_inliers", name_suffix)
+    W, H = sensor
+    cx = info.get("cx", 0.5 * (W - 1))
+    cy = info.get("cy", 0.5 * (H - 1))
+    inlier = info.get("ransac_inlier_mask")
+    if inlier is None:
+        inlier = np.hypot(vx, vy) > 1e-12
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    out = ~inlier
+    if out.any():
+        ax.scatter(x[out], y[out], c="0.82", s=1, linewidths=0, label="outlier")
+    if inlier.any():
+        ax.scatter(x[inlier], y[inlier], c="steelblue", s=1, linewidths=0,
+                   label="RANSAC inlier")
+    gx = np.linspace(0, W - 1, 16)
+    gy = np.linspace(0, H - 1, 12)
+    GX, GY = np.meshgrid(gx, gy)
+    pvx, pvy = ego_field(GX.ravel(), GY.ravel(), params, cx, cy)
+    ax.quiver(GX.ravel(), GY.ravel(), pvx, -pvy,
+              angles="xy", scale_units="xy", scale=None,
+              width=0.003, color="crimson", alpha=0.7)
+    ax.invert_yaxis()
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title("Ego RANSAC inliers vs fitted field", fontweight="bold")
+    _annotate(ax, [
+        f"fitter: {info.get('fitter', '?')}",
+        f"inliers: {int(inlier.sum())}/{len(x)}",
+        f"hypotheses: {info.get('n_hypotheses', '-')}",
+        f"polished RMS: {info.get('inlier_rms', float('nan')):.4g}",
+    ])
+    ax.legend(fontsize=8, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
 def plot_constraint_votes(x, y, is_imo, info, out_dir, *, name_suffix=None):
-    """13: vote maps before/after bundling for 3 hand-picked events."""
+    """13: vote maps before/after bundling for 3 orientation-diverse events."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -424,29 +497,38 @@ def plot_constraint_votes(x, y, is_imo, info, out_dir, *, name_suffix=None):
     path = _fig_path(out_dir, "13_constraint_votes", name_suffix)
     G = grid.shape[0]
     gn = int(np.sqrt(G))
-    # pick events: strong vertical edge, horizontal, corner-like among IMO
-    cand = np.where(is_imo)[0]
-    if cand.size < 3:
-        cand = np.arange(len(x))
-    # heuristic: use events with diverse positions
-    picks = [cand[0], cand[len(cand)//3], cand[2*len(cand)//3]]
+    picks = info.get("sample_events")
+    if picks is None or len(picks) == 0:
+        picks = np.array([0, min(1, len(x) - 1), min(2, len(x) - 1)])
+    picks = np.asarray(picks)[:3]
+    conf = info.get("confidence")
+    vote_mass = info.get("vote_mass")
+    resolved = info.get("resolved_mask")
 
-    fig, axes = plt.subplots(3, 2, figsize=(10, 12))
+    fig, axes = plt.subplots(len(picks), 2, figsize=(10, 4 * len(picks)))
+    if len(picks) == 1:
+        axes = np.array([axes])
     for row, i in enumerate(picks):
         before = C[i].toarray().reshape(gn, gn)
         after = V[i].toarray().reshape(gn, gn)
-        axes[row, 0].imshow(before, origin="lower", cmap="magma")
-        axes[row, 0].set_title(f"event {i} BEFORE bundle (ridge)")
-        axes[row, 1].imshow(after, origin="lower", cmap="magma")
-        axes[row, 1].set_title(f"event {i} AFTER bundle (peak)")
-        # mark resolved velocity if available
-        conf = info.get("confidence")
-        if conf is not None:
-            axes[row, 1].set_xlabel(f"conf={conf[i]:.3f}")
-    fig.suptitle("VSA constraint votes: ridges → peaks", fontweight="bold")
+        active_pct = 100.0 * (before > 0).sum() / max(G, 1)
+        axes[row, 0].imshow(before, origin="lower", cmap="magma",
+                            extent=[-1, 1, -1, 1])
+        axes[row, 0].set_title(f"evt {i} BEFORE (slog grid)  active={active_pct:.1f}%")
+        axes[row, 1].imshow(after, origin="lower", cmap="magma",
+                            extent=[-1, 1, -1, 1])
+        cval = conf[i] if conf is not None else float("nan")
+        vm = vote_mass[i] if vote_mass is not None else float("nan")
+        rej = ""
+        if resolved is not None and not resolved[i]:
+            rej = " REJECTED"
+        axes[row, 1].set_title(
+            f"evt {i} AFTER  conf={cval:.3f} mass={vm:.2e}{rej}")
+    fig.suptitle("VSA constraint votes (linear constraint, slog grid view)",
+                 fontweight="bold")
     _annotate(axes[0, 1], [
-        f"VEL_GRID_N: {info.get('VEL_GRID_N')}",
-        f"BAND_SIGMA: {info.get('BAND_SIGMA')}",
+        f"BAND_SIGMA_PX: {info.get('BAND_SIGMA_PX', '?')}",
+        f"M_eff: {info.get('M_eff', float('nan')):.1f}",
         f"D_VEL: {info.get('D_VEL')}",
         f"G: {info.get('G')}",
     ])
@@ -481,8 +563,52 @@ def plot_vsa_vs_hough(v_vsa, v_hough, mask, out_dir, info, *, name_suffix=None):
         f"corr_vy: {info.get('hough_corr_vy', float('nan')):.4f}",
         f"RMS: {info.get('hough_rms', float('nan')):.4g}",
         f"D_VEL: {info.get('D_VEL')}",
+        f"M_eff: {info.get('M_eff', float('nan')):.1f}",
         f"G: {info.get('G')}",
+        f"D/M_eff: {info.get('D_VEL', 0) / max(info.get('M_eff', 1), 1e-9):.2f}",
     ])
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
+def plot_dvel_capacity(rows, out_dir):
+    """16: D_VEL sweep — correlation vs capacity."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = _ensure_dir(out_dir)
+    path = _fig_path(out_dir, "16_dvel_capacity")
+    dvels = [r["D_VEL"] for r in rows]
+    cvx = [r.get("corr_vx", float("nan")) for r in rows]
+    cvy = [r.get("corr_vy", float("nan")) for r in rows]
+    meff = [r.get("M_eff", float("nan")) for r in rows]
+
+    fig, ax1 = plt.subplots(figsize=(9, 5))
+    ax1.plot(dvels, cvx, "o-", label="corr vx", color="steelblue")
+    ax1.plot(dvels, cvy, "s-", label="corr vy", color="darkorange")
+    ax1.axhline(0.95, color="crimson", ls="--", lw=1, label="target r=0.95")
+    ax1.set_xlabel("D_VEL")
+    ax1.set_ylabel("correlation vs explicit Hough")
+    ax1.set_title("VSA capacity sweep", fontweight="bold")
+    ax1.legend(loc="lower right")
+    ax2 = ax1.twinx()
+    ax2.plot(dvels, meff, "^--", color="gray", alpha=0.7, label="M_eff")
+    ax2.set_ylabel("M_eff (mean active codes)")
+    lines1, lab1 = ax1.get_legend_handles_labels()
+    lines2, lab2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, lab1 + lab2, loc="lower right", fontsize=8)
+    ann = "\n".join(
+        f"D={r['D_VEL']} M={r.get('M_eff', 0):.0f} "
+        f"rx={r.get('corr_vx', float('nan')):.3f} "
+        f"ry={r.get('corr_vy', float('nan')):.3f} "
+        f"t={r.get('runtime_s', 0):.1f}s"
+        for r in rows
+    )
+    _annotate(ax1, ann.split("\n")[:6], loc="upper left")
     fig.tight_layout()
     fig.savefig(path, dpi=140)
     plt.close(fig)

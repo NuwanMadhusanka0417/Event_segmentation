@@ -46,6 +46,7 @@ Outputs events_labeled.parquet and seg.png in the working directory.
 """
 
 import argparse
+import sys
 import numpy as np
 import torch
 from sklearn.neighbors import NearestNeighbors
@@ -53,7 +54,7 @@ from sklearn.neighbors import NearestNeighbors
 from fpe_codebook import FPECodebook, bundle_weighted, bind_hv
 from gvfa_encoder import encode_graph
 from aperture import resolve_flow, extract_constraints
-from ego_motion import fit_ego_motion, residual_split
+from ego_motion import fit_ego_motion, fit_ego_motion_ransac, residual_split
 from graph_smoothing import (
     compute_prototypes,
     drop_tiny_clusters,
@@ -77,6 +78,8 @@ from viz_diagnostics import (
     plot_orientation_check,
     plot_constraint_votes,
     plot_vsa_vs_hough,
+    plot_ego_inliers,
+    plot_dvel_capacity,
     plot_resolver_comparison,
     plot_residual_split,
     plot_segmentation,
@@ -126,23 +129,32 @@ AFFINE_MIN_SUPPORT = 12
 CONDITION_MIN_EIG  = 1e-3
 LK_HUBER_ITERS     = 3
 # Track B
-D_VEL              = 512
+D_VEL              = 2048
 VEL_GRID_N         = 48
 VEL_MAX            = 1500.0
 VEL_SIGNED_LOG     = True
 BW_VEL             = 0.15
-BAND_SIGMA         = 0.08
-WEIGHT_FLOOR       = 1e-3
+BAND_SIGMA_PX      = 40.0   # px/s constraint band (linear velocity space)
+VOTE_MASS_MIN      = 1e-6
+BOUNDARY_RING      = 1
+BOUNDARY_MASS_FRAC = 0.5
+WEIGHT_FLOOR       = 1e-2
 SELF_WEIGHT        = 1.0
 CLEANUP_TOPK       = 5
 CLEANUP_MIN_CONF   = 0.05
 READOUT_CHUNK      = 4096
 VSA_VALIDATE       = True
-VSA_RESOLVE_IMO_ONLY = False  # optional cost cut (not used unless True + pre-mask)
+VSA_RESOLVE_IMO_ONLY = False
 
 # === STAGE 2: ego-motion + residual split ===
-RES_K      = 3.0           # residual threshold in robust sigmas
-IRLS_ITERS = 10
+RES_K              = 2.0
+RES_THRESH_MODE    = "otsu"   # "sigma" | "otsu" | "valley"
+VALLEY_SMOOTH      = 3
+EGO_RANSAC         = True
+RANSAC_HYPOTHESES  = 200
+RANSAC_SAMPLE      = 8
+RANSAC_INLIER_K    = 2.5
+IRLS_ITERS         = 10
 
 # === STAGE 3: motion-coherent pooling on IMO residuals ===
 SIGMA_V          = None   # None => auto (median edge ||v_i-v_j||)
@@ -811,8 +823,11 @@ def _resolver_cfg(args, *, vsa_validate=None):
         "VEL_MAX": VEL_MAX,
         "VEL_SIGNED_LOG": VEL_SIGNED_LOG,
         "BW_VEL": BW_VEL,
-        "BAND_SIGMA": args.band_sigma,
-        "WEIGHT_FLOOR": WEIGHT_FLOOR,
+        "BAND_SIGMA_PX": args.band_sigma_px,
+        "WEIGHT_FLOOR": args.weight_floor,
+        "VOTE_MASS_MIN": args.vote_mass_min,
+        "BOUNDARY_RING": args.boundary_ring,
+        "BOUNDARY_MASS_FRAC": args.boundary_mass_frac,
         "SELF_WEIGHT": SELF_WEIGHT,
         "CLEANUP_TOPK": args.cleanup_topk,
         "CLEANUP_MIN_CONF": args.cleanup_min_conf,
@@ -901,7 +916,7 @@ def _run_window(
             vx_res, vy_res, edge_spatial,
             n_iters=args.flow_smooth_iters, keep=FLOW_KEEP)
 
-        p2 = p11 = p12 = p3 = p4 = p5 = p13 = p14 = None
+        p2 = p10 = p11 = p12 = p3 = p4 = p5 = p13 = p14 = None
         if full_diag:
             p2 = plot_flow_smoothed(
                 x, y, vx_s, vy_s, sub,
@@ -913,10 +928,25 @@ def _run_window(
                 name_suffix=ns)
 
         valid_flow = np.hypot(vx_s, vy_s) > 1e-12
-        params, residual, ego_info = fit_ego_motion(
-            x, y, vx_s, vy_s, SENSOR, n_iters=IRLS_ITERS, valid_mask=valid_flow)
-        is_imo, residual, thresh = residual_split(
-            residual, edge_spatial, res_k=args.res_k, valid_mask=valid_flow)
+        if args.ego_ransac:
+            print("[ego] fitter=RANSAC+IRLS")
+            params, residual, ego_info = fit_ego_motion_ransac(
+                x, y, vx_s, vy_s, SENSOR,
+                n_hypotheses=args.ransac_hypotheses,
+                sample_size=args.ransac_sample,
+                inlier_k=args.ransac_inlier_k,
+                n_iters_polish=IRLS_ITERS,
+                valid_mask=valid_flow, seed=SEED,
+            )
+        else:
+            print("[ego] fitter=IRLS")
+            params, residual, ego_info = fit_ego_motion(
+                x, y, vx_s, vy_s, SENSOR, n_iters=IRLS_ITERS, valid_mask=valid_flow)
+        is_imo, residual, thresh, thresh_info = residual_split(
+            residual, edge_spatial, res_k=args.res_k, valid_mask=valid_flow,
+            thresh_mode=args.res_thresh_mode, valley_smooth=args.valley_smooth,
+        )
+        ego_info = {**ego_info, **thresh_info}
         rx, ry = residual[:, 0], residual[:, 1]
 
         if full_diag:
@@ -931,9 +961,12 @@ def _run_window(
                 res_k=args.res_k, thresh=thresh,
                 inlier_rms=ego_info["inlier_rms"], info=ego_info,
                 name_suffix=ns)
+            p10 = plot_ego_inliers(
+                x, y, vx_s, vy_s, params, ego_info, SENSOR, sub, name_suffix=ns)
             p4 = plot_residual_split(
                 x, y, is_imo, residual, thresh, sub, name_suffix=ns)
             if method == "vsa" and rinfo.get("C_sparse") is not None:
+                rinfo["resolved_mask"] = resolved_mask
                 p13 = plot_constraint_votes(
                     x, y, is_imo, rinfo, sub, name_suffix=ns)
                 if rinfo.get("v_hough") is not None:
@@ -1031,7 +1064,7 @@ def _run_window(
             name_suffix=ns)
 
         if full_diag:
-            paths = [p1, p2, p3, p4, p5, p6, p11, p12]
+            paths = [p1, p2, p3, p4, p5, p6, p10, p11, p12]
             if p13:
                 paths.append(p13)
             if p14:
@@ -1066,6 +1099,54 @@ def _run_window(
     return compare_rows, fig_paths_by_method
 
 
+def _run_dvel_sweep(args):
+    """Sweep D_VEL on one window; write dvel_sweep.csv + 16_dvel_capacity.png."""
+    import csv
+    import os
+    import time as _time
+
+    dvels = [int(s.strip()) for s in args.sweep_dvel.split(",") if s.strip()]
+    os.makedirs(args.out_dir, exist_ok=True)
+    print(f"[sweep-dvel] values={dvels}  window={args.window_ms}ms")
+
+    t, x, y, p = load_events(args.input, args.window_ms)
+    (edge_spatial, edge_temporal,
+     _attr_s, _attr_t, _rec, _src) = build_multigraph(t, x, y, p)
+    vx_raw, vy_raw = node_flow(t, x, y, edge_temporal)
+    u, n_hat, valid = extract_constraints(vx_raw, vy_raw, u_min=U_MIN)
+
+    rows = []
+    for d in dvels:
+        args.d_vel = d
+        cfg = _resolver_cfg(args, vsa_validate=True)
+        t0 = _time.time()
+        vx, vy, resolved, extra = resolve_flow(
+            x, y, vx_raw, vy_raw, [edge_spatial, edge_temporal],
+            method="vsa", cfg=cfg,
+        )
+        runtime = _time.time() - t0
+        rows.append({
+            "D_VEL": d,
+            "corr_vx": extra.get("hough_corr_vx", float("nan")),
+            "corr_vy": extra.get("hough_corr_vy", float("nan")),
+            "RMS": extra.get("hough_rms", float("nan")),
+            "M_eff": extra.get("M_eff", float("nan")),
+            "resolved_frac": float(resolved.mean()),
+            "runtime_s": runtime,
+        })
+        print(f"[sweep-dvel] D_VEL={d}  corr_vx={rows[-1]['corr_vx']:.4f}  "
+              f"corr_vy={rows[-1]['corr_vy']:.4f}  M_eff={rows[-1]['M_eff']:.1f}  "
+              f"t={runtime:.1f}s")
+
+    csv_path = os.path.join(args.out_dir, "dvel_sweep.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"wrote {csv_path}")
+    plot_dvel_capacity(rows, args.out_dir)
+
+
 def main():
     import time as _time
     import csv
@@ -1096,9 +1177,25 @@ def main():
     ap.add_argument("--vel-grid-n", type=int, default=VEL_GRID_N)
     ap.add_argument("--vsa-validate", type=lambda s: str(s).lower() not in
                     ("0", "false", "no"), default=VSA_VALIDATE)
-    ap.add_argument("--band-sigma", type=float, default=BAND_SIGMA)
+    ap.add_argument("--band-sigma-px", type=float, default=BAND_SIGMA_PX)
+    ap.add_argument("--weight-floor", type=float, default=WEIGHT_FLOOR)
+    ap.add_argument("--vote-mass-min", type=float, default=VOTE_MASS_MIN)
+    ap.add_argument("--boundary-ring", type=int, default=BOUNDARY_RING)
+    ap.add_argument("--boundary-mass-frac", type=float, default=BOUNDARY_MASS_FRAC)
     ap.add_argument("--cleanup-topk", type=int, default=CLEANUP_TOPK)
     ap.add_argument("--cleanup-min-conf", type=float, default=CLEANUP_MIN_CONF)
+    ap.add_argument("--ego-ransac", type=lambda s: str(s).lower() not in
+                    ("0", "false", "no"), default=EGO_RANSAC)
+    ap.add_argument("--no-ego-ransac", action="store_true",
+                    help="Disable RANSAC ego fit (use plain IRLS)")
+    ap.add_argument("--ransac-hypotheses", type=int, default=RANSAC_HYPOTHESES)
+    ap.add_argument("--ransac-sample", type=int, default=RANSAC_SAMPLE)
+    ap.add_argument("--ransac-inlier-k", type=float, default=RANSAC_INLIER_K)
+    ap.add_argument("--res-thresh-mode", default=RES_THRESH_MODE,
+                    choices=["sigma", "otsu", "valley"])
+    ap.add_argument("--valley-smooth", type=int, default=VALLEY_SMOOTH)
+    ap.add_argument("--sweep-dvel", default=None,
+                    help="Comma-separated D_VEL list, e.g. 512,1024,2048,4096")
     ap.add_argument("--w-node-motion", type=float, default=W_NODE_MOTION)
     ap.add_argument("--w-node-t", type=float, default=W_NODE_T)
     ap.add_argument("--w-node-x", type=float, default=W_NODE_X)
@@ -1121,16 +1218,22 @@ def main():
         help="Full diagnostic PNGs on every segment (default: only first segment)",
     )
     args = ap.parse_args()
+    if args.no_ego_ransac:
+        args.ego_ransac = False
 
-    if args.stream_segments:
-        args.all_resolvers = args.all_resolvers or True
+    motion_resolver_explicit = any(
+        a == "--motion-resolver" or a.startswith("--motion-resolver=")
+        for a in sys.argv
+    )
 
     sigma_v = args.sigma_v if args.sigma_v is not None else SIGMA_V
     torch.manual_seed(SEED)
     t0 = _time.time()
 
     if args.stream_segments:
-        methods = list(ALL_RESOLVERS) if args.all_resolvers else [args.motion_resolver]
+        # All four by default; --motion-resolver X runs only X
+        use_all = args.all_resolvers or not motion_resolver_explicit
+        methods = list(ALL_RESOLVERS) if use_all else [args.motion_resolver]
         compare_resolvers = False
     elif args.compare_resolvers:
         methods = list(COMPARE_METHODS)
@@ -1145,8 +1248,14 @@ def main():
     print(
         f"[config] resolver(s)={methods}  stream={args.stream_segments}  "
         f"segment_ms={args.segment_ms}  window={args.window_ms}ms  "
-        f"layers={args.num_layers}  out={args.out_dir}"
+        f"ego_ransac={args.ego_ransac}  res_mode={args.res_thresh_mode}  "
+        f"D_vel={args.d_vel}  band_px={args.band_sigma_px}  out={args.out_dir}"
     )
+
+    if args.sweep_dvel:
+        _run_dvel_sweep(args)
+        print(f"done in {_time.time()-t0:.1f}s  -> {args.out_dir}/")
+        return
 
     if args.flat:
         print(f"loading {args.input} (window={args.window_ms} ms) ...")
