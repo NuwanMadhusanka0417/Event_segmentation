@@ -1,6 +1,6 @@
 ssh nk8155@gadi.nci.org.au
 
-qsub -I  -l walltime=3:00:00,mem=190GB,ncpus=12,jobfs=50GB -P mi23 -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+qsub -I  -l walltime=12:00:00,mem=190GB,ncpus=12,jobfs=50GB -P mi23 -l storage=gdata/jq77+scratch/jq77+scratch/mi23
 
 module load python3/3.9.2
 source /scratch/jq77/nk8155/seg/bin/activate
@@ -59,14 +59,17 @@ First segment only: full diagnostics (01–07, 11–14 for vsa). Later segments:
 
 ```bash
 python segment.py --input events_filtered.txt --stream-segments --segment-ms 60 --out-dir diag_stream
-# layout: diag_stream/none/t0000_0060/ ...  diag_stream/lk/t0060_0120/06_segmentation.png  ...
+# flat per resolver, time in filename:
+#   diag_stream/affine/06_segmentation_0_60.png
+#   diag_stream/affine/06_segmentation_60_120.png
+#   diag_stream/affine/02_flow_smoothed_0_60.png  (first segment full set only)
 # summary: diag_stream/stream_segments.csv
 ```
 
 Single resolver across segments:
 
 ```bash
-python segment.py --input events_filtered.txt --stream-segments --segment-ms 60 \
+python segment.py --input events_filtered.txt --stream-segments --segment-ms 60 
   --motion-resolver lk --out-dir diag_stream
 ```
 
@@ -84,4 +87,16 @@ python segment.py --input events_filtered.txt --stream-segments --diag-all-segme
 --cleanup-topk 5 --cleanup-min-conf 0.05
 --vsa-validate false   # skip Hough agreement check (faster)
 --w-node-motion 1.0 --w-node-t 0.1
+```
+
+
+With --stream-segments, --all-resolvers is turned on automatically, so you get none, lk, affine, and vsa on every 60 ms chunk.
+
+Do not pass --diag-all-segments unless you want the full diagnostic set on every segment (slow). Default behavior:
+
+First segment only (t0000_0060): full diagnostics per resolver
+All later segments: only 06_segmentation.png per resolver
+Also written: diag_stream/stream_segments.csv (metrics per segment × method).
+```
+python segment.py --input events_filtered.txt --stream-segments --segment-ms 60 --out-dir diag_stream
 ```

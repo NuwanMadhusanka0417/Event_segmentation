@@ -15,6 +15,13 @@ def _ensure_dir(out_dir):
     return out_dir
 
 
+def _fig_path(out_dir, stem, name_suffix=None):
+    """Build output PNG path; stem is e.g. '06_segmentation'."""
+    if name_suffix:
+        return os.path.join(out_dir, f"{stem}_{name_suffix}.png")
+    return os.path.join(out_dir, f"{stem}.png")
+
+
 def _annotate(ax, lines, loc="upper right"):
     """Semi-transparent monospace parameter/result box."""
     from matplotlib.offsetbox import AnchoredText
@@ -44,13 +51,13 @@ def _scatter_events(ax, x, y, c="0.7", s=1, **kwargs):
     ax.set_aspect("equal", adjustable="box")
 
 
-def plot_flow_raw(x, y, vx, vy, out_dir, n_sample=2000, seed=0):
+def plot_flow_raw(x, y, vx, vy, out_dir, n_sample=2000, seed=0, *, name_suffix=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     out_dir = _ensure_dir(out_dir)
-    path = os.path.join(out_dir, "01_flow_raw.png")
+    path = _fig_path(out_dir, "01_flow_raw", name_suffix)
     spd = np.hypot(vx, vy)
     valid = spd > 1e-12
     frac = 100.0 * valid.mean()
@@ -79,13 +86,14 @@ def plot_flow_raw(x, y, vx, vy, out_dir, n_sample=2000, seed=0):
 
 
 def plot_flow_smoothed(x, y, vx_s, vy_s, out_dir, n_iters, keep,
-                       n_valid_before, n_valid_after, n_sample=2000, seed=0):
+                       n_valid_before, n_valid_after, n_sample=2000, seed=0,
+                       *, name_suffix=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     out_dir = _ensure_dir(out_dir)
-    path = os.path.join(out_dir, "02_flow_smoothed.png")
+    path = _fig_path(out_dir, "02_flow_smoothed", name_suffix)
     spd = np.hypot(vx_s, vy_s)
     valid = spd > 1e-12
     frac = 100.0 * valid.mean()
@@ -116,14 +124,14 @@ def plot_flow_smoothed(x, y, vx_s, vy_s, out_dir, n_iters, keep,
 
 
 def plot_ego_fit(x, y, params, residual, sensor, out_dir, res_k, thresh,
-                 inlier_rms, info):
+                 inlier_rms, info, *, name_suffix=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from ego_motion import ego_field
 
     out_dir = _ensure_dir(out_dir)
-    path = os.path.join(out_dir, "03_ego_fit.png")
+    path = _fig_path(out_dir, "03_ego_fit", name_suffix)
     W, H = sensor
     cx, cy = info.get("cx", 0.5 * (W - 1)), info.get("cy", 0.5 * (H - 1))
     tx, ty, w, s = params
@@ -171,14 +179,14 @@ def plot_ego_fit(x, y, params, residual, sensor, out_dir, res_k, thresh,
     return path
 
 
-def plot_residual_split(x, y, is_imo, residual, thresh, out_dir):
+def plot_residual_split(x, y, is_imo, residual, thresh, out_dir, *, name_suffix=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
 
     out_dir = _ensure_dir(out_dir)
-    path = os.path.join(out_dir, "04_residual_split.png")
+    path = _fig_path(out_dir, "04_residual_split", name_suffix)
     n = len(x)
     n_imo = int(is_imo.sum())
     n_bg = n - n_imo
@@ -213,13 +221,13 @@ def plot_residual_split(x, y, is_imo, residual, thresh, out_dir):
     return path
 
 
-def plot_supernodes(x, y, cluster_id, is_imo, out_dir, info):
+def plot_supernodes(x, y, cluster_id, is_imo, out_dir, info, *, name_suffix=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     out_dir = _ensure_dir(out_dir)
-    path = os.path.join(out_dir, "05_supernodes.png")
+    path = _fig_path(out_dir, "05_supernodes", name_suffix)
     fig, ax = plt.subplots(figsize=(9, 7))
     bg = ~is_imo
     if bg.any():
@@ -256,13 +264,13 @@ def plot_supernodes(x, y, cluster_id, is_imo, out_dir, info):
 
 
 def plot_segmentation(x, y, labels, out_dir, tau, num_layers, lam, smooth_iters,
-                      runtime_s, extra_box=None):
+                      runtime_s, extra_box=None, *, name_suffix=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     out_dir = _ensure_dir(out_dir)
-    path = os.path.join(out_dir, "06_segmentation.png")
+    path = _fig_path(out_dir, "06_segmentation", name_suffix)
     ids, counts = np.unique(labels, return_counts=True)
     n_obj = int((ids > 0).sum())
     count_lines = [f"  id {i}: {c}" for i, c in zip(ids, counts)]
@@ -300,7 +308,7 @@ def plot_segmentation(x, y, labels, out_dir, tau, num_layers, lam, smooth_iters,
     return path
 
 
-def plot_summary(paths, out_dir):
+def plot_summary(paths, out_dir, *, name_suffix=None):
     """Flexible grid summary of diagnostic images."""
     import matplotlib
     matplotlib.use("Agg")
@@ -308,7 +316,7 @@ def plot_summary(paths, out_dir):
     import matplotlib.image as mpimg
 
     out_dir = _ensure_dir(out_dir)
-    path = os.path.join(out_dir, "07_summary.png")
+    path = _fig_path(out_dir, "07_summary", name_suffix)
     paths = [p for p in paths if p]
     n = max(len(paths), 1)
     cols = 3
@@ -327,13 +335,14 @@ def plot_summary(paths, out_dir):
     return path
 
 
-def plot_flow_resolved(x, y, vx, vy, resolved_mask, out_dir, info, n_sample=2000):
+def plot_flow_resolved(x, y, vx, vy, resolved_mask, out_dir, info, n_sample=2000,
+                       *, name_suffix=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     out_dir = _ensure_dir(out_dir)
-    path = os.path.join(out_dir, "11_flow_resolved.png")
+    path = _fig_path(out_dir, "11_flow_resolved", name_suffix)
     fig, ax = plt.subplots(figsize=(9, 7))
     _scatter_events(ax, x, y, c="0.9", s=1)
     idx = _subsample_idx(len(x), n_sample, 0)
@@ -371,13 +380,13 @@ def plot_flow_resolved(x, y, vx, vy, resolved_mask, out_dir, info, n_sample=2000
     return path
 
 
-def plot_orientation_check(n_hat, vx, vy, valid, out_dir, info):
+def plot_orientation_check(n_hat, vx, vy, valid, out_dir, info, *, name_suffix=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     out_dir = _ensure_dir(out_dir)
-    path = os.path.join(out_dir, "12_orientation_check.png")
+    path = _fig_path(out_dir, "12_orientation_check", name_suffix)
     ang_n = np.arctan2(n_hat[valid, 1], n_hat[valid, 0])
     ang_v = np.arctan2(vy[valid], vx[valid])
     fig, ax = plt.subplots(figsize=(7, 7))
@@ -400,7 +409,7 @@ def plot_orientation_check(n_hat, vx, vy, valid, out_dir, info):
     return path
 
 
-def plot_constraint_votes(x, y, is_imo, info, out_dir):
+def plot_constraint_votes(x, y, is_imo, info, out_dir, *, name_suffix=None):
     """13: vote maps before/after bundling for 3 hand-picked events."""
     import matplotlib
     matplotlib.use("Agg")
@@ -412,7 +421,7 @@ def plot_constraint_votes(x, y, is_imo, info, out_dir):
     if C is None or V is None or grid is None:
         return None
     out_dir = _ensure_dir(out_dir)
-    path = os.path.join(out_dir, "13_constraint_votes.png")
+    path = _fig_path(out_dir, "13_constraint_votes", name_suffix)
     G = grid.shape[0]
     gn = int(np.sqrt(G))
     # pick events: strong vertical edge, horizontal, corner-like among IMO
@@ -448,13 +457,13 @@ def plot_constraint_votes(x, y, is_imo, info, out_dir):
     return path
 
 
-def plot_vsa_vs_hough(v_vsa, v_hough, mask, out_dir, info):
+def plot_vsa_vs_hough(v_vsa, v_hough, mask, out_dir, info, *, name_suffix=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     out_dir = _ensure_dir(out_dir)
-    path = os.path.join(out_dir, "14_vsa_vs_hough.png")
+    path = _fig_path(out_dir, "14_vsa_vs_hough", name_suffix)
     fig, axes = plt.subplots(1, 2, figsize=(11, 5))
     m = np.asarray(mask, dtype=bool)
     for ax, dim, name in zip(axes, (0, 1), ("vx", "vy")):

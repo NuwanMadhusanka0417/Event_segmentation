@@ -826,6 +826,11 @@ def _segment_dir_name(t_start_ms, t_end_ms):
     return f"t{int(round(t_start_ms)):04d}_{int(round(t_end_ms)):04d}"
 
 
+def _segment_file_suffix(t_start_ms, t_end_ms):
+    """Filename suffix e.g. 0_60 for 06_segmentation_0_60.png."""
+    return f"{int(round(t_start_ms))}_{int(round(t_end_ms))}"
+
+
 def _run_window(
     args,
     t, x, y, p,
@@ -835,6 +840,7 @@ def _run_window(
     full_diag,
     compare_resolvers,
     seg_label=None,
+    file_suffix=None,
     save_labels=False,
 ):
     """Ego+VSA pipeline on one event window. Returns compare_rows, fig_paths_by_method."""
@@ -862,13 +868,10 @@ def _run_window(
     vx_raw, vy_raw = node_flow(t, x, y, edge_temporal)
     diagnose_node_flow(vx_raw, vy_raw)
 
-    p1 = None
-    if full_diag:
-        p1 = plot_flow_raw(x, y, vx_raw, vy_raw, out_dir)
-
     compare_rows = []
     fig_paths_by_method = {}
     vsa_validate = args.vsa_validate if full_diag else False
+    ns = file_suffix  # short alias for plot name_suffix
 
     for method in methods:
         mt0 = _time.time()
@@ -881,11 +884,14 @@ def _run_window(
             sub = os.path.join(out_dir, f"resolver_{method}")
         elif args.stream_segments or len(methods) > 1:
             sub = os.path.join(out_dir, method)
-            if seg_label:
-                sub = os.path.join(sub, seg_label)
         else:
             sub = out_dir
         os.makedirs(sub, exist_ok=True)
+
+        p1 = None
+        if full_diag:
+            p1 = plot_flow_raw(
+                x, y, vx_raw, vy_raw, sub, name_suffix=ns)
 
         vx_res, vy_res, resolved_mask, rinfo = resolve_flow(
             x, y, vx_raw, vy_raw, [edge_spatial, edge_temporal],
@@ -900,9 +906,11 @@ def _run_window(
             p2 = plot_flow_smoothed(
                 x, y, vx_s, vy_s, sub,
                 n_iters=args.flow_smooth_iters, keep=FLOW_KEEP,
-                n_valid_before=n_vb, n_valid_after=n_va)
+                n_valid_before=n_vb, n_valid_after=n_va,
+                name_suffix=ns)
             p11 = plot_flow_resolved(
-                x, y, vx_res, vy_res, resolved_mask, sub, rinfo)
+                x, y, vx_res, vy_res, resolved_mask, sub, rinfo,
+                name_suffix=ns)
 
         valid_flow = np.hypot(vx_s, vy_s) > 1e-12
         params, residual, ego_info = fit_ego_motion(
@@ -917,18 +925,21 @@ def _run_window(
             if not ori_mask.any():
                 ori_mask = valid_c
             p12 = plot_orientation_check(
-                n_hat, vx_res, vy_res, ori_mask, sub, rinfo)
+                n_hat, vx_res, vy_res, ori_mask, sub, rinfo, name_suffix=ns)
             p3 = plot_ego_fit(
                 x, y, params, residual, SENSOR, sub,
                 res_k=args.res_k, thresh=thresh,
-                inlier_rms=ego_info["inlier_rms"], info=ego_info)
-            p4 = plot_residual_split(x, y, is_imo, residual, thresh, sub)
+                inlier_rms=ego_info["inlier_rms"], info=ego_info,
+                name_suffix=ns)
+            p4 = plot_residual_split(
+                x, y, is_imo, residual, thresh, sub, name_suffix=ns)
             if method == "vsa" and rinfo.get("C_sparse") is not None:
-                p13 = plot_constraint_votes(x, y, is_imo, rinfo, sub)
+                p13 = plot_constraint_votes(
+                    x, y, is_imo, rinfo, sub, name_suffix=ns)
                 if rinfo.get("v_hough") is not None:
                     p14 = plot_vsa_vs_hough(
                         np.stack([vx_res, vy_res], 1), rinfo["v_hough"],
-                        resolved_mask, sub, rinfo)
+                        resolved_mask, sub, rinfo, name_suffix=ns)
                 for k in ("C_sparse", "V_sparse", "Z", "codebook", "grid_coords"):
                     rinfo.pop(k, None)
 
@@ -991,7 +1002,7 @@ def _run_window(
         if full_diag:
             p5 = plot_supernodes(
                 x, y, cluster_full[is_imo] if n_imo else np.array([]),
-                is_imo, sub, cinfo)
+                is_imo, sub, cinfo, name_suffix=ns)
 
         protos = compute_prototypes(H_events, labels)
         labels = smooth_labels(
@@ -1005,7 +1016,7 @@ def _run_window(
         ids, counts = np.unique(labels, return_counts=True)
         n_obj = int((ids > 0).sum())
         largest = float(counts[ids > 0].max() / len(labels)) if n_obj else 0.0
-        seg_extra = {"segment": seg_label} if seg_label else {}
+        seg_extra = {"segment": seg_label or file_suffix or ""}
         p6 = plot_segmentation(
             x, y, labels, sub,
             tau=args.tau, num_layers=args.num_layers,
@@ -1015,8 +1026,9 @@ def _run_window(
                 "resolved %": f"{100*rinfo['resolved_frac']:.1f}",
                 "orient_corr": f"{rinfo['orientation_corr']:.4f}",
                 "W_NODE_MOTION": args.w_node_motion,
-                **seg_extra,
-            })
+                **{k: v for k, v in seg_extra.items() if v},
+            },
+            name_suffix=ns)
 
         if full_diag:
             paths = [p1, p2, p3, p4, p5, p6, p11, p12]
@@ -1024,7 +1036,7 @@ def _run_window(
                 paths.append(p13)
             if p14:
                 paths.append(p14)
-            plot_summary(paths, sub)
+            plot_summary(paths, sub, name_suffix=ns)
 
         if save_labels and not compare_resolvers:
             save(t, x, y, p, labels, tau=args.tau)
@@ -1165,6 +1177,7 @@ def main():
         os.makedirs(args.out_dir, exist_ok=True)
         for seg_i, (t_a, t_b) in enumerate(ranges):
             seg_label = _segment_dir_name(t_a, t_b)
+            file_suffix = _segment_file_suffix(t_a, t_b)
             full_diag = args.diag_all_segments or (seg_i == 0)
             print(f"\n======== segment {seg_i+1}/{len(ranges)} "
                   f"[{t_a:.0f}, {t_b:.0f}) ms  full_diag={full_diag} ========")
@@ -1178,6 +1191,7 @@ def main():
                 full_diag=full_diag,
                 compare_resolvers=False,
                 seg_label=seg_label,
+                file_suffix=file_suffix,
                 save_labels=(seg_i == len(ranges) - 1 and len(methods) == 1),
             )
             all_compare_rows.extend(rows)
