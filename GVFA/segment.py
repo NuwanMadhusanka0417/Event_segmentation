@@ -55,6 +55,7 @@ from fpe_codebook import FPECodebook, bundle_weighted, bind_hv
 from gvfa_encoder import encode_graph
 from aperture import resolve_flow, extract_constraints
 from ego_motion import fit_ego_motion, fit_ego_motion_ransac, residual_split
+from em_motion import fit_em, em_hard_labels, em_confidence
 from graph_smoothing import (
     compute_prototypes,
     drop_tiny_clusters,
@@ -85,6 +86,9 @@ from viz_diagnostics import (
     plot_segmentation,
     plot_summary,
     plot_supernodes,
+    plot_em_convergence,
+    plot_soft_memberships,
+    plot_em_vs_sequential,
 )
 
 # ----------------------------------------------------------------------------
@@ -165,8 +169,20 @@ SUPER_R_T_MS     = 30.0
 MIN_SUPER_SIZE   = 3      # mark supernodes with fewer members as noise
 LAM              = 1.5    # graph label-smoothing strength
 SMOOTH_ITERS     = 5
-MIN_CLUSTER_SIZE = 200    # final objects smaller than this -> background
+MIN_CLUSTER_SIZE = 400    # final objects smaller than this -> background
 OUT_DIR          = "diag"
+
+# === STAGE 3b: EM soft assignment (Stoffregen et al. 2019) ===
+ASSIGNMENT        = "em"          # "sequential" | "em"
+EM_INIT           = "sequential"  # "sequential" | "kmeans" | "vsa"
+EM_N_CLUSTERS     = 6
+EM_ITERS          = 15
+EM_TOL            = 1e-3
+EM_SIGMA_INIT     = None          # None => 1.4826*MAD of init residuals
+EM_SIGMA_MIN      = 20.0
+EM_MIN_WEIGHT     = 50.0
+EM_MODEL_KIND     = "affine"      # "similarity" | "affine"
+EM_USE_CONF_IN_SMOOTHING = True
 
 # === FPE CODEBOOK CONFIG (tunable) ===
 # Per-feature bandwidth (Gaussian kernel length-scale = 1/bandwidth)
@@ -846,6 +862,127 @@ def _segment_file_suffix(t_start_ms, t_end_ms):
     return f"{int(round(t_start_ms))}_{int(round(t_end_ms))}"
 
 
+def _pool_and_assign_imo(
+    x, y, t, p, rx, ry, is_imo, H_events,
+    edge_spatial, edge_temporal, args, sigma_v,
+):
+    """Sequential path: motion-coherent pooling -> VSA assign -> unpool."""
+    labels = np.zeros(len(t), dtype=np.int64)
+    cluster_full = np.full(len(t), -1, dtype=np.int64)
+    cinfo = {
+        "sigma_v": float("nan"), "w_min": args.w_min,
+        "n_levels": args.n_coarsen_levels, "C": 0,
+        "sizes": np.array([0]), "n_rejected_total": 0,
+    }
+    vsa_event_labels = None
+    n_imo = int(is_imo.sum())
+    if n_imo == 0:
+        return labels, cluster_full, cinfo, vsa_event_labels
+
+    edge_s_imo, sub_idx, _ = induce_subgraph(edge_spatial, is_imo)
+    edge_t_imo, _, _ = induce_subgraph(edge_temporal, is_imo)
+    cluster_id, cinfo = motion_coarsen(
+        n_imo, edge_s_imo, edge_t_imo, rx[sub_idx], ry[sub_idx],
+        n_levels=args.n_coarsen_levels, sigma_v=sigma_v,
+        w_min=args.w_min, seed=SEED,
+    )
+    cinfo["w_min"] = args.w_min
+    cinfo["n_levels"] = args.n_coarsen_levels
+    cluster_full[sub_idx] = cluster_id
+    H_imo = H_events[sub_idx]
+    H_s_bundle = bundle_hypervectors(H_imo[:, :D], cluster_id)
+    H_t_bundle = bundle_hypervectors(H_imo[:, D:], cluster_id)
+    H_super = torch.cat([H_s_bundle, H_t_bundle], dim=1)
+    diagnose_bundling_cosine(H_super, seed=SEED, label="bundling")
+    C = H_super.shape[0]
+    if edge_s_imo.numel() > 0:
+        rec_s = cluster_id[edge_s_imo[0].numpy()]
+        src_s = cluster_id[edge_s_imo[1].numpy()]
+        comp_super = connected_components(C, rec_s, src_s)
+    else:
+        comp_super = np.zeros(C, dtype=np.int64)
+    agg = supernode_aggregates(
+        x[sub_idx], y[sub_idx], t[sub_idx], p[sub_idx],
+        rx[sub_idx], ry[sub_idx], cluster_id)
+    labels_super = assign(
+        H_super, agg["t"], comp_super, tau=args.tau, min_events=0)
+    small = agg["counts"] < MIN_SUPER_SIZE
+    if small.any():
+        labels_super = labels_super.copy()
+        labels_super[small] = -1
+    labels_imo = unpool(labels_super, cluster_id)
+    vsa_event_labels = labels_imo.copy()
+    out = np.zeros(n_imo, dtype=np.int64)
+    keep = labels_imo >= 0
+    if keep.any():
+        _, compact = np.unique(labels_imo[keep], return_inverse=True)
+        out[keep] = compact + 1
+    labels[sub_idx] = out
+    return labels, cluster_full, cinfo, vsa_event_labels
+
+
+def _label_imo_em(
+    x, y, t, p, rx, ry, vx, vy, is_imo, H_events,
+    edge_spatial, edge_temporal, args, sigma_v,
+):
+    """EM path: warm-start -> alternating soft assignment -> hard labels."""
+    labels = np.zeros(len(x), dtype=np.int64)
+    cluster_full = np.full(len(x), -1, dtype=np.int64)
+    cinfo = {
+        "sigma_v": float("nan"), "w_min": args.w_min,
+        "n_levels": args.n_coarsen_levels, "C": 0,
+        "sizes": np.array([0]), "n_rejected_total": 0,
+    }
+    em_info = {}
+    P_soft = None
+    n_imo = int(is_imo.sum())
+    if n_imo == 0:
+        return labels, cluster_full, cinfo, em_info, P_soft, None
+
+    sub_idx = np.where(is_imo)[0]
+    vsa_for_init = None
+    if args.em_init == "vsa":
+        _, cluster_full, cinfo, vsa_for_init = _pool_and_assign_imo(
+            x, y, t, p, rx, ry, is_imo, H_events,
+            edge_spatial, edge_temporal, args, sigma_v,
+        )
+
+    P_soft, _models, em_info = fit_em(
+        x, y, vx, vy, is_imo, SENSOR,
+        n_clusters=args.em_n_clusters,
+        n_iters=args.em_iters,
+        sigma_init=args.em_sigma_init,
+        model_kind=args.em_model_kind,
+        tol=args.em_tol,
+        seed=SEED,
+        min_weight=args.em_min_weight,
+        sigma_min=args.em_sigma_min,
+        init_method=args.em_init,
+        vsa_labels=vsa_for_init,
+    )
+
+    labels_imo = em_hard_labels(P_soft)
+    out = np.zeros(n_imo, dtype=np.int64)
+    keep = labels_imo > 0
+    if keep.any():
+        _, compact = np.unique(labels_imo[keep], return_inverse=True)
+        out[keep] = compact + 1
+    labels[sub_idx] = out
+
+    conf = em_confidence(P_soft) if P_soft.size else None
+    return labels, cluster_full, cinfo, em_info, P_soft, conf
+
+
+def _largest_object_frac(labels, is_imo):
+    """Largest IMO object count / total IMO events."""
+    imo_labels = labels[is_imo]
+    fg = imo_labels[imo_labels > 0]
+    if fg.size == 0:
+        return 0.0
+    _, counts = np.unique(fg, return_counts=True)
+    return float(counts.max() / max(int(is_imo.sum()), 1))
+
+
 def _run_window(
     args,
     t, x, y, p,
@@ -917,6 +1054,7 @@ def _run_window(
             n_iters=args.flow_smooth_iters, keep=FLOW_KEEP)
 
         p2 = p10 = p11 = p12 = p3 = p4 = p5 = p13 = p14 = None
+        p17 = p18 = p19 = None
         if full_diag:
             p2 = plot_flow_smoothed(
                 x, y, vx_s, vy_s, sub,
@@ -991,65 +1129,141 @@ def _run_window(
         cinfo = {"sigma_v": float("nan"), "w_min": args.w_min,
                  "n_levels": args.n_coarsen_levels, "C": 0,
                  "sizes": np.array([0]), "n_rejected_total": 0}
+        em_info = {}
+        P_soft = None
+        em_conf = None
+        labels_seq_raw = None
+        labels_em_raw = None
+        seq_ablation_runtime = None
+        em_ablation_runtime = None
         n_imo = int(is_imo.sum())
-        if n_imo > 0:
-            edge_s_imo, sub_idx, _ = induce_subgraph(edge_spatial, is_imo)
-            edge_t_imo, _, _ = induce_subgraph(edge_temporal, is_imo)
-            cluster_id, cinfo = motion_coarsen(
-                n_imo, edge_s_imo, edge_t_imo, rx[sub_idx], ry[sub_idx],
-                n_levels=args.n_coarsen_levels, sigma_v=sigma_v,
-                w_min=args.w_min, seed=SEED,
+
+        if args.assignment == "sequential":
+            labels, cluster_full, cinfo, _ = _pool_and_assign_imo(
+                x, y, t, p, rx, ry, is_imo, H_events,
+                edge_spatial, edge_temporal, args, sigma_v,
             )
-            cinfo["w_min"] = args.w_min
-            cinfo["n_levels"] = args.n_coarsen_levels
-            cluster_full[sub_idx] = cluster_id
-            H_imo = H_events[sub_idx]
-            H_s_bundle = bundle_hypervectors(H_imo[:, :D], cluster_id)
-            H_t_bundle = bundle_hypervectors(H_imo[:, D:], cluster_id)
-            H_super = torch.cat([H_s_bundle, H_t_bundle], dim=1)
-            diagnose_bundling_cosine(H_super, seed=SEED, label="bundling")
-            C = H_super.shape[0]
-            if edge_s_imo.numel() > 0:
-                rec_s = cluster_id[edge_s_imo[0].numpy()]
-                src_s = cluster_id[edge_s_imo[1].numpy()]
-                comp_super = connected_components(C, rec_s, src_s)
-            else:
-                comp_super = np.zeros(C, dtype=np.int64)
-            agg = supernode_aggregates(
-                x[sub_idx], y[sub_idx], t[sub_idx], p[sub_idx],
-                rx[sub_idx], ry[sub_idx], cluster_id)
-            labels_super = assign(
-                H_super, agg["t"], comp_super, tau=args.tau, min_events=0)
-            small = agg["counts"] < MIN_SUPER_SIZE
-            if small.any():
-                labels_super = labels_super.copy()
-                labels_super[small] = -1
-            labels_imo = unpool(labels_super, cluster_id)
-            out = np.zeros(n_imo, dtype=np.int64)
-            keep = labels_imo >= 0
-            if keep.any():
-                _, compact = np.unique(labels_imo[keep], return_inverse=True)
-                out[keep] = compact + 1
-            labels[sub_idx] = out
+            if full_diag:
+                labels_seq_raw = labels.copy()
+                t0e = _time.time()
+                labels_em_raw, _, _, em_info, P_soft, em_conf = _label_imo_em(
+                    x, y, t, p, rx, ry, vx_s, vy_s, is_imo, H_events,
+                    edge_spatial, edge_temporal, args, sigma_v,
+                )
+                em_ablation_runtime = _time.time() - t0e
+        else:
+            labels, cluster_full, cinfo, em_info, P_soft, em_conf = _label_imo_em(
+                x, y, t, p, rx, ry, vx_s, vy_s, is_imo, H_events,
+                edge_spatial, edge_temporal, args, sigma_v,
+            )
+            labels_em_raw = labels.copy()
+            if full_diag:
+                t0s = _time.time()
+                labels_seq_raw, _, _, _ = _pool_and_assign_imo(
+                    x, y, t, p, rx, ry, is_imo, H_events,
+                    edge_spatial, edge_temporal, args, sigma_v,
+                )
+                seq_ablation_runtime = _time.time() - t0s
+
+        if em_info:
+            print(
+                f"[em] init={em_info.get('init_method')}  "
+                f"K_req={em_info.get('n_clusters_requested')}  "
+                f"K_live={em_info.get('n_live')}  "
+                f"iters={em_info.get('iterations')}  "
+                f"converged={em_info.get('converged')}  "
+                f"({em_info.get('converge_reason')})  "
+                f"underflow_rows={em_info.get('n_underflow_total')}  "
+                f"mean_max_p={em_info.get('final_mean_max_membership', 0):.3f}"
+            )
+            ids_e, cnt_e = np.unique(labels[is_imo & (labels > 0)], return_counts=True)
+            for lid, cnt in zip(ids_e.tolist(), cnt_e.tolist()):
+                print(f"[em] cluster {lid}: {cnt} events")
+            if full_diag and labels_seq_raw is not None:
+                frac_seq = _largest_object_frac(labels_seq_raw, is_imo)
+                frac_em = _largest_object_frac(labels_em_raw, is_imo)
+                print(f"[em] largest-object frac: sequential={frac_seq:.3f}  "
+                      f"em={frac_em:.3f}")
 
         if full_diag:
             p5 = plot_supernodes(
                 x, y, cluster_full[is_imo] if n_imo else np.array([]),
                 is_imo, sub, cinfo, name_suffix=ns)
 
+        em_conf_full = None
+        if em_conf is not None and args.em_use_conf_in_smoothing:
+            em_conf_full = np.ones(len(t), dtype=np.float64)
+            sub_idx = np.where(is_imo)[0]
+            em_conf_full[sub_idx] = em_conf
+
         protos = compute_prototypes(H_events, labels)
         labels = smooth_labels(
             labels, H_events, protos,
             edge_index_list=[edge_spatial, edge_temporal],
             lam=args.lam, n_iters=SMOOTH_ITERS,
+            conf=em_conf_full,
         )
-        labels = drop_tiny_clusters(labels, MIN_CLUSTER_SIZE, background=0)
+        labels = drop_tiny_clusters(labels, args.min_cluster_size, background=0)
+
+        labels_seq_final = labels_em_final = None
+        if full_diag and labels_seq_raw is not None and labels_em_raw is not None:
+            protos_seq = compute_prototypes(H_events, labels_seq_raw)
+            labels_seq_final = smooth_labels(
+                labels_seq_raw.copy(), H_events, protos_seq,
+                edge_index_list=[edge_spatial, edge_temporal],
+                lam=args.lam, n_iters=SMOOTH_ITERS,
+            )
+            labels_seq_final = drop_tiny_clusters(
+                labels_seq_final, args.min_cluster_size, background=0)
+
+            protos_em = compute_prototypes(H_events, labels_em_raw)
+            em_conf_ab = None
+            if em_conf is not None and args.em_use_conf_in_smoothing:
+                em_conf_ab = np.ones(len(t), dtype=np.float64)
+                sub_idx = np.where(is_imo)[0]
+                em_conf_ab[sub_idx] = em_conf
+            labels_em_final = smooth_labels(
+                labels_em_raw.copy(), H_events, protos_em,
+                edge_index_list=[edge_spatial, edge_temporal],
+                lam=args.lam, n_iters=SMOOTH_ITERS,
+                conf=em_conf_ab,
+            )
+            labels_em_final = drop_tiny_clusters(
+                labels_em_final, args.min_cluster_size, background=0)
+
+            if em_info:
+                p17 = plot_em_convergence(em_info, sub, args, name_suffix=ns)
+            if P_soft is not None and P_soft.size:
+                sub_idx = np.where(is_imo)[0]
+                p18 = plot_soft_memberships(
+                    x, y, sub_idx, P_soft, em_hard_labels(P_soft),
+                    em_info, sub, name_suffix=ns)
 
         runtime = _time.time() - mt0
+        if full_diag and labels_seq_final is not None and labels_em_final is not None:
+            p19 = plot_em_vs_sequential(
+                x, y, labels_seq_final, labels_em_final,
+                seq_ablation_runtime, em_ablation_runtime, runtime,
+                sub, name_suffix=ns,
+            )
+
         ids, counts = np.unique(labels, return_counts=True)
         n_obj = int((ids > 0).sum())
-        largest = float(counts[ids > 0].max() / len(labels)) if n_obj else 0.0
+        largest = _largest_object_frac(labels, is_imo)
         seg_extra = {"segment": seg_label or file_suffix or ""}
+        em_box = {}
+        if args.assignment == "em" and em_info:
+            em_box = {
+                "ASSIGNMENT": args.assignment,
+                "EM_INIT": em_info.get("init_method", args.em_init),
+                "EM_MODEL_KIND": args.em_model_kind,
+                "K_live": em_info.get("n_live", 0),
+                "iters_to_converge": em_info.get("iterations", 0),
+                "mean max-membership": (
+                    f"{em_info.get('final_mean_max_membership', 0):.3f}"),
+            }
+        elif args.assignment == "sequential":
+            em_box = {"ASSIGNMENT": "sequential"}
         p6 = plot_segmentation(
             x, y, labels, sub,
             tau=args.tau, num_layers=args.num_layers,
@@ -1059,6 +1273,7 @@ def _run_window(
                 "resolved %": f"{100*rinfo['resolved_frac']:.1f}",
                 "orient_corr": f"{rinfo['orientation_corr']:.4f}",
                 "W_NODE_MOTION": args.w_node_motion,
+                **em_box,
                 **{k: v for k, v in seg_extra.items() if v},
             },
             name_suffix=ns)
@@ -1069,6 +1284,12 @@ def _run_window(
                 paths.append(p13)
             if p14:
                 paths.append(p14)
+            if p17:
+                paths.append(p17)
+            if p18:
+                paths.append(p18)
+            if p19:
+                paths.append(p19)
             plot_summary(paths, sub, name_suffix=ns)
 
         if save_labels and not compare_resolvers:
@@ -1082,10 +1303,12 @@ def _run_window(
             "median_speed": rinfo["median_speed_after"],
             "ego_inlier_rms": ego_info["inlier_rms"],
             "imo_frac": float(is_imo.mean()),
-            "n_models_premerge": 0,
-            "n_models_final": 0,
+            "n_models_premerge": em_info.get("n_clusters_requested", 0),
+            "n_models_final": em_info.get("n_live", 0),
             "n_objects": n_obj,
             "largest_object_frac": largest,
+            "assignment": args.assignment,
+            "em_init": em_info.get("init_method", args.em_init),
             "resolver_runtime_s": rinfo["runtime_s"],
             "total_runtime_s": runtime,
         }
@@ -1217,9 +1440,30 @@ def main():
         "--diag-all-segments", action="store_true",
         help="Full diagnostic PNGs on every segment (default: only first segment)",
     )
+    ap.add_argument("--assignment", default=ASSIGNMENT,
+                    choices=["sequential", "em"],
+                    help="IMO labeling: sequential (VSA pool+assign) or em")
+    ap.add_argument("--em-init", default=EM_INIT,
+                    choices=["sequential", "kmeans", "vsa"],
+                    help="EM warm-start method")
+    ap.add_argument("--em-n-clusters", type=int, default=EM_N_CLUSTERS)
+    ap.add_argument("--em-iters", type=int, default=EM_ITERS)
+    ap.add_argument("--em-tol", type=float, default=EM_TOL)
+    ap.add_argument("--em-sigma-init", type=float, default=EM_SIGMA_INIT)
+    ap.add_argument("--em-sigma-min", type=float, default=EM_SIGMA_MIN)
+    ap.add_argument("--em-min-weight", type=float, default=EM_MIN_WEIGHT)
+    ap.add_argument("--em-model-kind", default=EM_MODEL_KIND,
+                    choices=["similarity", "affine"])
+    ap.add_argument("--em-use-conf-in-smoothing", type=lambda s: str(s).lower()
+                    not in ("0", "false", "no"), default=EM_USE_CONF_IN_SMOOTHING)
+    ap.add_argument("--no-em-use-conf-in-smoothing", action="store_true",
+                    help="Disable EM confidence weighting in label smoothing")
+    ap.add_argument("--min-cluster-size", type=int, default=MIN_CLUSTER_SIZE)
     args = ap.parse_args()
     if args.no_ego_ransac:
         args.ego_ransac = False
+    if args.no_em_use_conf_in_smoothing:
+        args.em_use_conf_in_smoothing = False
 
     motion_resolver_explicit = any(
         a == "--motion-resolver" or a.startswith("--motion-resolver=")
@@ -1249,7 +1493,11 @@ def main():
         f"[config] resolver(s)={methods}  stream={args.stream_segments}  "
         f"segment_ms={args.segment_ms}  window={args.window_ms}ms  "
         f"ego_ransac={args.ego_ransac}  res_mode={args.res_thresh_mode}  "
-        f"D_vel={args.d_vel}  band_px={args.band_sigma_px}  out={args.out_dir}"
+        f"D_vel={args.d_vel}  band_px={args.band_sigma_px}  out={args.out_dir}  "
+        f"assignment={args.assignment}  em_init={args.em_init}  "
+        f"em_K={args.em_n_clusters}  em_iters={args.em_iters}  "
+        f"em_tol={args.em_tol}  em_model={args.em_model_kind}  "
+        f"min_cluster={args.min_cluster_size}"
     )
 
     if args.sweep_dvel:

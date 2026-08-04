@@ -60,7 +60,8 @@ def _merged_undirected_edges(edge_index_list):
     return uniq[:, 0].astype(np.int64), uniq[:, 1].astype(np.int64)
 
 
-def smooth_labels(labels, H, protos, edge_index_list, lam=1.5, n_iters=5):
+def smooth_labels(labels, H, protos, edge_index_list, lam=1.5, n_iters=5, *,
+                  conf=None):
     """ICM label smoothing: data term + lam * disagreeing neighbours.
 
     Parameters
@@ -70,6 +71,8 @@ def smooth_labels(labels, H, protos, edge_index_list, lam=1.5, n_iters=5):
     protos : dict {label_id: unit vector [D]} or None (recomputed each iter)
     edge_index_list : list of edge_index [2, E]
     lam, n_iters : smoothing strength / iterations
+    conf : float [N], optional
+        Per-event confidence scaling the data term (keyword-only).
 
     Returns
     -------
@@ -78,6 +81,10 @@ def smooth_labels(labels, H, protos, edge_index_list, lam=1.5, n_iters=5):
     labels = np.asarray(labels, dtype=np.int64).copy()
     Hn = _normalize_rows(_as_numpy(H))
     n = len(labels)
+    if conf is not None:
+        conf = np.asarray(conf, dtype=np.float64)
+        if conf.shape[0] != n:
+            raise ValueError(f"conf length {conf.shape[0]} != labels length {n}")
     ei, ej = _merged_undirected_edges(edge_index_list)
     # undirected adjacency as two directed copies for voting
     if ei.size:
@@ -105,6 +112,8 @@ def smooth_labels(labels, H, protos, edge_index_list, lam=1.5, n_iters=5):
         # data cost [N, K]: 1 - cos
         cos = Hn @ Pmat.T
         data = 1.0 - cos
+        if conf is not None:
+            data = data * conf[:, None]
 
         # neighbour disagreement votes: for each node, count of neighbours per label
         # cost_pair[i,k] = lam * (#nbrs whose label != ids[k])

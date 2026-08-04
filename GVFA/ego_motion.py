@@ -360,3 +360,197 @@ def residual_split(residual, edge_index_spatial, res_k=2.0, valid_mask=None,
         "thresh_active": thresh,
     }
     return is_imo, residual, thresh, thresh_info
+
+
+# ---------------------------------------------------------------------------
+# Object motion models (similarity 4-param / affine 6-param)
+# ---------------------------------------------------------------------------
+
+def affine_field(x, y, params):
+    """6-param affine flow: vx = p0 + p1*x + p2*y, vy = p3 + p4*x + p5*y."""
+    p0, p1, p2, p3, p4, p5 = params
+    vx = p0 + p1 * x + p2 * y
+    vy = p3 + p4 * x + p5 * y
+    return vx, vy
+
+
+def _design_matrix_affine(x, y):
+    """Stack 2N x 6 design matrix for linear affine flow."""
+    n = len(x)
+    A = np.zeros((2 * n, 6), dtype=np.float64)
+    A[0::2, 0] = 1.0
+    A[0::2, 1] = x
+    A[0::2, 2] = y
+    A[1::2, 3] = 1.0
+    A[1::2, 4] = x
+    A[1::2, 5] = y
+    return A
+
+
+def predict_flow(x, y, models, sensor, model_kind="similarity"):
+    """Predict flow for N events under K models.
+
+    Parameters
+    ----------
+    x, y : [N]
+    models : [K, P]
+    sensor : (W, H)
+
+    Returns
+    -------
+    vx_pred, vy_pred : [N, K]
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    models = np.asarray(models, dtype=np.float64)
+    K = models.shape[0]
+    N = len(x)
+    vx_pred = np.zeros((N, K), dtype=np.float64)
+    vy_pred = np.zeros((N, K), dtype=np.float64)
+
+    if K == 0:
+        return vx_pred, vy_pred
+
+    if model_kind == "similarity":
+        W, H = sensor
+        cx, cy = 0.5 * (W - 1), 0.5 * (H - 1)
+        dx = x[:, None] - cx
+        dy = y[:, None] - cy
+        tx = models[:, 0]
+        ty = models[:, 1]
+        w = models[:, 2]
+        s = models[:, 3]
+        vx_pred = tx[None, :] - w[None, :] * dy + s[None, :] * dx
+        vy_pred = ty[None, :] + w[None, :] * dx + s[None, :] * dy
+    elif model_kind == "affine":
+        p0 = models[:, 0]
+        p1 = models[:, 1]
+        p2 = models[:, 2]
+        p3 = models[:, 3]
+        p4 = models[:, 4]
+        p5 = models[:, 5]
+        vx_pred = p0[None, :] + p1[None, :] * x[:, None] + p2[None, :] * y[:, None]
+        vy_pred = p3[None, :] + p4[None, :] * x[:, None] + p5[None, :] * y[:, None]
+    else:
+        raise ValueError(f"unknown model_kind={model_kind!r}")
+    return vx_pred, vy_pred
+
+
+def _fit_model_ls(x, y, vx, vy, sensor, model_kind, weights=None):
+    """Weighted least-squares fit for one motion model."""
+    n = len(x)
+    min_pts = 4 if model_kind == "similarity" else 6
+    if n < min_pts:
+        return None
+
+    if model_kind == "similarity":
+        W, H = sensor
+        cx, cy = 0.5 * (W - 1), 0.5 * (H - 1)
+        A = _design_matrix(x, y, cx, cy)
+    else:
+        A = _design_matrix_affine(x, y)
+
+    b = np.empty(2 * n, dtype=np.float64)
+    b[0::2] = vx
+    b[1::2] = vy
+
+    if weights is not None:
+        w = np.asarray(weights, dtype=np.float64)
+        w2 = np.repeat(np.sqrt(np.maximum(w, 0.0)), 2)
+        A = A * w2[:, None]
+        b = b * w2
+
+    try:
+        params, *_ = np.linalg.lstsq(A, b, rcond=None)
+        return params
+    except np.linalg.LinAlgError:
+        return None
+
+
+def _fit_model_irls(x, y, vx, vy, sensor, model_kind, n_iters=5, weights=None):
+    """IRLS fit for one motion model (Huber on flow residuals)."""
+    params = _fit_model_ls(x, y, vx, vy, sensor, model_kind, weights=weights)
+    if params is None:
+        return None
+
+    W, H = sensor
+    cx, cy = 0.5 * (W - 1), 0.5 * (H - 1)
+    w_base = np.ones(len(x), dtype=np.float64)
+    if weights is not None:
+        w_base = np.asarray(weights, dtype=np.float64).copy()
+
+    for _ in range(max(1, int(n_iters))):
+        if model_kind == "similarity":
+            pvx, pvy = ego_field(x, y, params, cx, cy)
+        else:
+            pvx, pvy = affine_field(x, y, params)
+        rn = np.hypot(vx - pvx, vy - pvy)
+        mad = _mad(rn)
+        delta = 1.4826 * max(mad, 1e-9)
+        huber = np.where(rn <= delta, 1.0, delta / np.maximum(rn, 1e-12))
+        w = w_base * huber
+        params = _fit_model_ls(x, y, vx, vy, sensor, model_kind, weights=w)
+        if params is None:
+            return None
+    return params
+
+
+def _residual_rms(x, y, vx, vy, params, sensor, model_kind, weights=None):
+    """Membership-weighted RMS flow residual for a model."""
+    W, H = sensor
+    cx, cy = 0.5 * (W - 1), 0.5 * (H - 1)
+    if model_kind == "similarity":
+        pvx, pvy = ego_field(x, y, params, cx, cy)
+    else:
+        pvx, pvy = affine_field(x, y, params)
+    rn2 = (vx - pvx) ** 2 + (vy - pvy) ** 2
+    if weights is not None:
+        w = np.asarray(weights, dtype=np.float64)
+        wt = w.sum()
+        if wt <= 0:
+            return float(np.sqrt(np.mean(rn2))) if rn2.size else 0.0
+        return float(np.sqrt(np.sum(w * rn2) / wt))
+    return float(np.sqrt(np.mean(rn2)))
+
+
+def fit_object_models(x, y, vx, vy, sensor, *, max_models=6, model_kind="affine",
+                      inlier_k=2.5, n_irls=5, min_inliers=20, seed=0):
+    """Greedy sequential object-motion fit (hard assignment, one pass).
+
+    Each iteration fits the largest remaining inlier set, removes them, repeats.
+    Returns models [K, P] and hard labels 1..K (0 = unassigned).
+    """
+    _ = seed  # reserved for future stochastic variants
+    n = len(x)
+    remaining = np.ones(n, dtype=bool)
+    models = []
+    labels = np.zeros(n, dtype=np.int64)
+    min_pts = 4 if model_kind == "similarity" else 6
+
+    for _ in range(int(max_models)):
+        if int(remaining.sum()) < max(min_pts, min_inliers):
+            break
+        idx = np.where(remaining)[0]
+        params = _fit_model_irls(
+            x[idx], y[idx], vx[idx], vy[idx], sensor, model_kind, n_iters=n_irls,
+        )
+        if params is None:
+            break
+
+        pvx, pvy = predict_flow(x, y, params[None, :], sensor, model_kind)
+        rn = np.hypot(vx - pvx[:, 0], vy - pvy[:, 0])
+        rn_rem = rn[remaining]
+        mad = _mad(rn_rem)
+        delta = float(inlier_k) * 1.4826 * max(mad, 1e-9)
+        inliers = remaining & (rn <= delta)
+        if int(inliers.sum()) < min_inliers:
+            break
+
+        models.append(params)
+        labels[inliers] = len(models)
+        remaining &= ~inliers
+
+    if not models:
+        return np.zeros((0, 6 if model_kind == "affine" else 4), dtype=np.float64), labels
+
+    return np.stack(models, axis=0), labels

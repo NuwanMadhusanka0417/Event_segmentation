@@ -659,3 +659,178 @@ def plot_resolver_comparison(fig_paths_by_method, out_dir):
     plt.close(fig)
     print(f"wrote {path}")
     return path
+
+
+def plot_em_convergence(em_info, out_dir, args, *, name_suffix=None):
+    """17: EM convergence diagnostics vs iteration."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = _ensure_dir(out_dir)
+    path = _fig_path(out_dir, "17_em_convergence", name_suffix)
+
+    iters = em_info.get("mean_max_membership", [])
+    n_live = em_info.get("n_live_clusters", [])
+    mwr = em_info.get("mean_weighted_residual", [])
+    x_axis = np.arange(1, len(iters) + 1) if iters else np.array([0])
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+
+    ax = axes[0]
+    if iters:
+        ax.plot(x_axis, iters, "o-", color="steelblue")
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("mean max-membership")
+    ax.set_title("(a) assignment confidence", fontweight="bold")
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    if n_live:
+        ax.plot(x_axis, n_live, "s-", color="darkorange")
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("live clusters")
+    ax.set_title("(b) cluster count", fontweight="bold")
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[2]
+    mwr_arr = np.array(mwr) if mwr else np.zeros((0, 0))
+    if mwr_arr.size:
+        for j in range(mwr_arr.shape[1]):
+            ax.plot(x_axis, mwr_arr[:, j], ".-", alpha=0.8, label=f"c{j}")
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("mean weighted residual (px/s)")
+    ax.set_title("(c) fit quality", fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    if mwr_arr.size and mwr_arr.shape[1] <= 8:
+        ax.legend(fontsize=7, ncol=2)
+
+    deaths = sum(em_info.get("deaths_per_iter", []))
+    fig.suptitle("EM convergence (alternating soft assignment)", fontweight="bold")
+    _annotate(axes[2], [
+        f"EM_INIT: {em_info.get('init_method', args.em_init)}",
+        f"EM_N_CLUSTERS: {args.em_n_clusters}",
+        f"EM_ITERS: {args.em_iters}",
+        f"EM_TOL: {args.em_tol}",
+        f"iters_to_converge: {em_info.get('iterations', 0)}",
+        f"K_live: {em_info.get('n_live', 0)}",
+        f"deaths: {deaths}",
+    ])
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
+def plot_soft_memberships(x, y, sub_idx, P, labels_imo, em_info, out_dir,
+                          *, name_suffix=None):
+    """18: soft memberships — alpha = max membership; histogram."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = _ensure_dir(out_dir)
+    path = _fig_path(out_dir, "18_soft_memberships", name_suffix)
+    max_p = P.max(axis=1) if P.size else np.array([])
+    xi = x[sub_idx]
+    yi = y[sub_idx]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+
+    ax = axes[0]
+    if max_p.size:
+        sc = ax.scatter(xi, yi, c=labels_imo, s=3, cmap="tab10",
+                        alpha=np.clip(max_p, 0.05, 1.0), linewidths=0)
+        fig.colorbar(sc, ax=ax, label="cluster id")
+    ax.invert_yaxis()
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("(a) argmax cluster, alpha = max membership", fontweight="bold")
+
+    ax = axes[1]
+    if max_p.size:
+        ax.hist(max_p, bins=40, color="steelblue", edgecolor="white", alpha=0.85)
+    ax.set_xlabel("max membership")
+    ax.set_ylabel("count")
+    ax.set_title("(b) confidence histogram", fontweight="bold")
+
+    mean_mp = em_info.get(
+        "final_mean_max_membership",
+        float(max_p.mean()) if max_p.size else 0.0,
+    )
+    pct90 = em_info.get("pct_above_0.9", 0.0)
+    pct50 = em_info.get("pct_below_0.5", 0.0)
+    uniform_warn = pct50 > 40.0 and mean_mp < 0.6
+    fig.suptitle("Soft event-cluster associations", fontweight="bold")
+    box = [
+        f"mean max-membership: {mean_mp:.3f}",
+        f"% events above 0.9: {pct90:.1f}",
+        f"% events below 0.5: {pct50:.1f}",
+    ]
+    if uniform_warn:
+        box.append("WARNING: low-confidence events look uniform — EM may not have locked on")
+    _annotate(axes[1], box)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    if uniform_warn:
+        print("[em] WARNING: soft memberships appear uniformly uncertain")
+    print(f"wrote {path}")
+    return path
+
+
+def plot_em_vs_sequential(x, y, labels_seq, labels_em,
+                          seq_runtime, em_runtime, total_runtime,
+                          out_dir, *, name_suffix=None):
+    """19: side-by-side sequential vs EM final segmentation."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = _ensure_dir(out_dir)
+    path = _fig_path(out_dir, "19_em_vs_sequential", name_suffix)
+
+    def _panel_stats(labels):
+        ids, counts = np.unique(labels, return_counts=True)
+        n_obj = int((ids > 0).sum())
+        fg = labels > 0
+        largest = float(counts[ids > 0].max() / max(int(fg.sum()), 1)) if n_obj else 0.0
+        count_lines = [f"  id {i}: {c}" for i, c in zip(ids[ids > 0], counts[ids > 0])]
+        return n_obj, largest, count_lines
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    panels = [
+        ("sequential (VSA pool+assign)", labels_seq, seq_runtime),
+        ("EM (soft assignment)", labels_em, em_runtime),
+    ]
+    for ax, (title, labels, rt) in zip(axes, panels):
+        bg = labels == 0
+        if bg.any():
+            ax.scatter(x[bg], y[bg], c="0.82", s=1, linewidths=0)
+        fg = labels > 0
+        if fg.any():
+            ax.scatter(x[fg], y[fg], c=labels[fg], s=2, cmap="tab10", linewidths=0)
+        ax.invert_yaxis()
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(title, fontweight="bold")
+        n_obj, largest, clines = _panel_stats(labels)
+        rt_s = rt if rt is not None else float("nan")
+        box = [
+            f"#objects: {n_obj}",
+            f"largest-object frac: {largest:.3f}",
+            f"runtime: {rt_s:.2f}s",
+        ] + clines[:6]
+        _annotate(ax, box)
+
+    fig.suptitle("EM vs sequential ablation", fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    n_seq, l_seq, _ = _panel_stats(labels_seq)
+    n_em, l_em, _ = _panel_stats(labels_em)
+    print(f"[ablation] sequential: {n_seq} objects, largest_frac={l_seq:.3f}  "
+          f"em: {n_em} objects, largest_frac={l_em:.3f}  total={total_runtime:.1f}s")
+    print(f"wrote {path}")
+    return path
