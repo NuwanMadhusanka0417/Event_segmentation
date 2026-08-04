@@ -2,11 +2,11 @@
 
 Events-only motion segmentation with a frozen GVFA/VSA encoder. The pipeline:
 
-1. Build spatial + temporal graph  
-2. Estimate normal flow → **aperture resolve** (optional)  
-3. Ego-motion fit + residual split (background / IMO)  
-4. FPE node encoding + GVFA  
-5. Motion-coherent pooling + label smoothing  
+1. Build spatial + temporal graph
+2. Estimate normal flow → **aperture resolve** (optional)
+3. Ego-motion fit + residual split (background / IMO)
+4. FPE node encoding + GVFA
+5. Motion-coherent pooling + label smoothing
 
 ---
 
@@ -15,13 +15,14 @@ Events-only motion segmentation with a frozen GVFA/VSA encoder. The pipeline:
 ```bash
 ssh nk8155@gadi.nci.org.au
 
-qsub -I -l walltime=12:00:00,mem=190GB,ncpus=12,jobfs=50GB \
-  -P mi23 -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+qsub -I -l walltime=12:00:00,mem=190GB,ncpus=12,jobfs=50GB -P mi23 -l storage=gdata/jq77+scratch/jq77+scratch/mi23
 
 module load python3/3.9.2
 source /scratch/jq77/nk8155/seg/bin/activate
 cd /scratch/mi23/nuwan/Event_segmentation/GVFA
 ```
+
+
 
 ### Pip cache (if installs fail)
 
@@ -39,16 +40,22 @@ pip install pandas scipy matplotlib
 
 ---
 
+
+
 ## Motion resolvers
 
-| Resolver | Flag | Description |
-|----------|------|-------------|
-| **none** | `--motion-resolver none` | Raw normal flow (ablation baseline) |
-| **lk** | `--motion-resolver lk` | Track A: Lucas–Kanade local fit (default) |
-| **affine** | `--motion-resolver affine` | Track A: affine flow with LK fallback |
-| **vsa** | `--motion-resolver vsa` | Track B: VSA constraint superposition |
+
+| Resolver   | Flag                       | Description                               |
+| ---------- | -------------------------- | ----------------------------------------- |
+| **none**   | `--motion-resolver none`   | Raw normal flow (ablation baseline)       |
+| **lk**     | `--motion-resolver lk`     | Track A: Lucas–Kanade local fit (default) |
+| **affine** | `--motion-resolver affine` | Track A: affine flow with LK fallback     |
+| **vsa**    | `--motion-resolver vsa`    | Track B: VSA constraint superposition     |
+
 
 ---
+
+
 
 ## Single time window
 
@@ -58,29 +65,32 @@ Processes the **first** `--window-ms` milliseconds from the file start (default 
 python segment.py --input events_filtered.txt --window-ms 1000 --out-dir diag
 ```
 
+
+
 ### One resolver
 
 ```bash
 # Ablation — raw normal flow
-python segment.py --input events_filtered.txt --window-ms 1000 \
-  --motion-resolver none --out-dir diag/none
+python segment.py --input events_filtered.txt --window-ms 1000  --motion-resolver none --out-dir diag/none
 
 # Track A (default)
-python segment.py --input events_filtered.txt --window-ms 1000 \
+python segment.py --input events_filtered.txt --window-ms 1000 
   --motion-resolver lk --out-dir diag/lk
 
-python segment.py --input events_filtered.txt --window-ms 1000 \
+python segment.py --input events_filtered.txt --window-ms 1000 
   --motion-resolver affine --out-dir diag/affine
 
 # Track B — VSA (+ Hough validation figures when --vsa-validate true)
-python segment.py --input events_filtered.txt --window-ms 1000 \
+python segment.py --input events_filtered.txt --window-ms 1000 
   --motion-resolver vsa --out-dir diag/vsa
 ```
+
+
 
 ### All four resolvers (one window)
 
 ```bash
-python segment.py --input events_filtered.txt --window-ms 1000 \
+python segment.py --input events_filtered.txt --window-ms 1000 
   --all-resolvers --out-dir diag
 ```
 
@@ -91,30 +101,36 @@ Creates `diag/none/`, `diag/lk/`, `diag/affine/`, `diag/vsa/` with full diagnost
 Runs `none`, `lk`, `vsa` on the **same** window; writes `compare_resolvers.csv` and `15_resolver_comparison.png`.
 
 ```bash
-python segment.py --input events_filtered.txt --window-ms 1000 \
+python segment.py --input events_filtered.txt --window-ms 1000 
   --compare-resolvers --out-dir diag
 ```
 
 ---
 
+
+
 ## Stream 60 ms segments (full recording)
 
 Tiles the **entire file** into non-overlapping segments (default **60 ms**).  
-Use **`--out-dir`** to choose where PNGs are saved.
+Use `--out-dir` to choose where PNGs are saved.
 
 ```bash
 python segment.py --input events_filtered.txt \
   --stream-segments --segment-ms 60 --out-dir diag_stream
 ```
 
+
+
 ### Default behaviour
 
-| Segment | Diagnostics saved |
-|---------|-------------------|
-| **First** (0–60 ms) | Full set per resolver: `01`–`07`, `11`, `12` (+ `13`, `14` for VSA) |
-| **Later** (60–120, 120–180, …) | **`06_segmentation_{start}_{end}.png` only** |
 
-Also written: **`stream_segments.csv`** (metrics per segment × method).
+| Segment                        | Diagnostics saved                                                   |
+| ------------------------------ | ------------------------------------------------------------------- |
+| **First** (0–60 ms)            | Full set per resolver: `01`–`07`, `11`, `12` (+ `13`, `14` for VSA) |
+| **Later** (60–120, 120–180, …) | `06_segmentation_{start}_{end}.png` **only**                        |
+
+
+Also written: `stream_segments.csv` (metrics per segment × method).
 
 ### Output layout (flat folders, time in filename)
 
@@ -162,6 +178,8 @@ python segment.py --input events_filtered.txt \
   --motion-resolver lk --out-dir diag_stream/lk
 ```
 
+
+
 ### Stream — full diagnostics on every segment (slow)
 
 ```bash
@@ -172,24 +190,30 @@ python segment.py --input events_filtered.txt \
 
 ---
 
+
+
 ## Diagnostic figures
 
-| File | Stage |
-|------|-------|
-| `01_flow_raw` | Raw normal flow |
-| `02_flow_smoothed` | Smoothed resolved flow |
-| `03_ego_fit` | Ego-motion fit |
-| `04_residual_split` | Background vs IMO |
-| `05_supernodes` | Motion-coherent pooling |
-| `06_segmentation` | Final segmentation |
-| `07_summary` | Mosaic of stages |
-| `11_flow_resolved` | Aperture-resolved flow |
-| `12_orientation_check` | Edge-normal vs flow angle |
-| `13_constraint_votes` | VSA only — vote maps |
-| `14_vsa_vs_hough` | VSA only — HV vs explicit Hough |
-| `15_resolver_comparison` | Compare mode only |
+
+| File                     | Stage                           |
+| ------------------------ | ------------------------------- |
+| `01_flow_raw`            | Raw normal flow                 |
+| `02_flow_smoothed`       | Smoothed resolved flow          |
+| `03_ego_fit`             | Ego-motion fit                  |
+| `04_residual_split`      | Background vs IMO               |
+| `05_supernodes`          | Motion-coherent pooling         |
+| `06_segmentation`        | Final segmentation              |
+| `07_summary`             | Mosaic of stages                |
+| `11_flow_resolved`       | Aperture-resolved flow          |
+| `12_orientation_check`   | Edge-normal vs flow angle       |
+| `13_constraint_votes`    | VSA only — vote maps            |
+| `14_vsa_vs_hough`        | VSA only — HV vs explicit Hough |
+| `15_resolver_comparison` | Compare mode only               |
+
 
 ---
+
+
 
 ## Useful CLI flags
 
@@ -218,6 +242,8 @@ python segment.py --input events_filtered.txt \
 --w-node-t 0.1
 ```
 
+
+
 ### Segmentation tuning examples
 
 ```bash
@@ -227,10 +253,15 @@ python segment.py --tau 0.18 --window-ms 30                  # more objects
 
 ---
 
+
+
 ## Outputs besides PNGs
 
-| Mode | Extra files |
-|------|-------------|
-| Single resolver, single window | `events_labeled.parquet`, `seg.png` (cwd) |
-| `--compare-resolvers` | `compare_resolvers.csv`, `15_resolver_comparison.png` |
-| `--stream-segments` | `stream_segments.csv` |
+
+| Mode                           | Extra files                                           |
+| ------------------------------ | ----------------------------------------------------- |
+| Single resolver, single window | `events_labeled.parquet`, `seg.png` (cwd)             |
+| `--compare-resolvers`          | `compare_resolvers.csv`, `15_resolver_comparison.png` |
+| `--stream-segments`            | `stream_segments.csv`                                 |
+
+
