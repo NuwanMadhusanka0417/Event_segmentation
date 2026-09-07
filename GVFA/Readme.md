@@ -77,6 +77,45 @@ python segment.py \
   --out-dir diag/vsa_sequential
 ```
 
+### Recommended “best VSA” configuration
+Best balance for your scene (2 people, moving camera): VSA flow + VSA prototype warm start + EM refinement + GVFA smoothing.
+
+#### Stream all 60 ms windows (production run)
+
+```bash
+python segment.py \
+  --input events_filtered.txt \
+  --stream-segments \
+  --segment-ms 60 \
+  --motion-resolver vsa \
+  --assignment em \
+  --em-init vsa \
+  --em-n-clusters 6 \
+  --em-model-kind affine \
+  --tau 0.12 \
+  --num-layers 3 \
+  --w-node-motion 1.5 \
+  --lam 1.5 \
+  --min-cluster-size 400 \
+  --out-dir diag/vsa_best_12_aug_full
+```
+### Single 60 ms window (tune / inspect diagnostics first)
+
+```bash
+python segment.py \
+  --input events_filtered.txt \
+  --window-ms 60 \
+  --motion-resolver vsa \
+  --assignment em \
+  --em-init vsa \
+  --em-n-clusters 6 \
+  --em-model-kind affine \
+  --tau 0.12 \
+  --w-node-motion 1.5 \
+  --out-dir diag/vsa_best_12_aug_single
+
+```
+
 ### Stream full recording (60 ms tiles)
 
 **VSA only** across every segment — writes `stream_segments.csv` and segmentation PNGs under one folder:
