@@ -1,0 +1,57 @@
+# HD-EMS base configuration
+
+seed: 0
+device: cuda
+
+# Hypervector dimensionality
+d: 1024
+
+# VFA encoder
+encoder:
+  patch_size: 21
+  sigma_k: 1.5
+  rank: 64
+  separable_terms: 2
+
+# Bundled matching field
+matching:
+  M: 7
+  pyramid_levels: 4
+  resolutions:
+    - [120, 160]
+    - [60, 80]
+    - [30, 40]
+    - [15, 20]
+  ranges_px:
+    - 3
+    - 6
+    - 12
+    - 24
+
+# Temporal binding
+temporal:
+  window: 8
+  prototype_threshold: 0.6
+
+# Time surface
+time_surface:
+  polarity: true
+  decay: 0.8
+  num_bins: 1
+
+# Decoder (trained)
+decoder:
+  hidden_channels: 64
+  gru_layers: 1
+
+# Segmentation head (trained)
+segmentation:
+  num_classes: 16
+  embedding_dim: 32
+
+# Training defaults
+train:
+  batch_size: 4
+  lr: 1.0e-4
+  epochs: 100
+  num_workers: 4

@@ -1,0 +1,27 @@
+# HD-EMS project rules
+
+## Context
+Event-camera motion segmentation using Vector-Symbolic Architectures.
+Read docs/SPEC.md before writing any code in hdems/vsa/.
+
+## Hard constraints — do not violate
+- FPE MUST be implemented as exp(1j * x * phases). NEVER ifft(fft(X)**x):
+  complex powers have branch cuts and fail silently.
+- Base vectors MUST be unitary (unit modulus in the phasor domain), otherwise
+  unbinding is not the inverse of binding.
+- Binding in the phasor domain is ELEMENTWISE PRODUCT, not torch.conv1d.
+- The bundled-field window M must stay <= 9. Retrieval degrades sharply beyond
+  this (measured). Extend range with pyramid levels, never with larger M.
+- Do not "simplify" the two-pass separable field into an explicit M^2 loop.
+  Separability is the entire efficiency contribution.
+
+## Style
+- Type hints everywhere. Tensor shapes in every docstring as (B, d, H, W).
+- Complex tensors: torch.complex64. Assert dtype at module boundaries.
+- No magic numbers. All constants come from configs/*.yaml.
+- Every hdems/vsa/ function needs a unit test before it is used elsewhere.
+
+## Testing
+- pytest tests/ must pass before adding features.
+- tests/test_field_exact.py and tests/test_retrieval.py are correctness gates.
+  If they fail, STOP and report — do not adjust the thresholds to make them pass.

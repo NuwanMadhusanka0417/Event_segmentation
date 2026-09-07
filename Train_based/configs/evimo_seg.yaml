@@ -1,0 +1,21 @@
+# EV-IMO motion segmentation config
+
+defaults:
+  - base
+
+dataset:
+  name: evimo
+  root: data/evimo
+  split: train
+  version: evimo2
+
+train:
+  task: segmentation
+  batch_size: 4
+  epochs: 100
+
+eval:
+  metrics: [iou, miou, point_iou]
+
+segmentation:
+  num_classes: 12

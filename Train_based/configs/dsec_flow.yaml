@@ -1,0 +1,19 @@
+# DSEC optical flow training config
+
+defaults:
+  - base
+
+dataset:
+  name: dsec
+  root: data/dsec
+  split: train
+  dt: 1
+
+train:
+  task: flow
+  batch_size: 8
+  epochs: 50
+
+eval:
+  metrics: [epe, aepe]
+  baseline_epe: 3.46  # VSA-Flow d=1024 reference
