@@ -180,10 +180,19 @@ def load_frame_sample(
 
 
 def build_sample_index(root: Path, split: str) -> list[tuple[Path, int]]:
-    """List of (sequence_dir, frame_index) for all GT frames in a split."""
+    """List of (sequence_dir, frame_index) for frames that HAVE a GT mask.
+
+    ``meta["frames"]`` lists every camera frame, but ``dataset_mask.npz`` only
+    stores masks for frames with segmentation ground truth. Frames without a
+    matching ``mask_<id>`` key are skipped so ``load_frame_sample`` never raises
+    a KeyError and ``len(dataset)`` reflects only loadable samples.
+    """
     index: list[tuple[Path, int]] = []
     for seq_dir in find_sequence_dirs(root, split):
         meta = load_meta(seq_dir)
-        for fi, _frame in enumerate(meta["frames"]):
-            index.append((seq_dir, fi))
+        with np.load(seq_dir / "dataset_mask.npz") as masks:
+            present = set(masks.files)
+        for fi, frame in enumerate(meta["frames"]):
+            if f"mask_{int(frame['id']):010d}" in present:
+                index.append((seq_dir, fi))
     return index
