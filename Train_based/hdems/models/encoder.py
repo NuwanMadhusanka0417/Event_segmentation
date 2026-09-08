@@ -55,8 +55,10 @@ class VSAEncoder(nn.Module):
         """Apply separable rank-1 filter to x: (B, 1, H, W)."""
         out = torch.zeros_like(x)
         for col, row in terms:
-            tmp = F.conv2d(x, row.view(1, 1, 1, -1), padding=(0, self.pad))
-            out = out + F.conv2d(tmp, col.view(1, 1, -1, 1), padding=(self.pad, 0))
+            row_f = row.to(dtype=x.dtype, device=x.device).view(1, 1, 1, -1)
+            col_f = col.to(dtype=x.dtype, device=x.device).view(1, 1, -1, 1)
+            tmp = F.conv2d(x, row_f, padding=(0, self.pad))
+            out = out + F.conv2d(tmp, col_f, padding=(self.pad, 0))
         return out
 
     def forward(self, surface: torch.Tensor) -> torch.Tensor:
@@ -72,8 +74,8 @@ class VSAEncoder(nn.Module):
         B, C, H, W = surface.shape
         assert surface.dtype == torch.float32
 
-        # Project through rank-r spatial filters, then FPE encode
-        channels = []
+        # Project through rank-r spatial filters, then FPE encode and bundle
+        F_out = torch.zeros(B, self.d, H, W, dtype=torch.complex64, device=surface.device)
         for r in range(self.rank):
             feat = torch.zeros(B, 1, H, W, device=surface.device)
             for c in range(C):
@@ -83,11 +85,7 @@ class VSAEncoder(nn.Module):
             code = fpe(self.phases_x, feat.squeeze(1)) * fpe(
                 self.phases_y, feat.squeeze(1)
             )
-            channels.append(code)
+            # code: (B, H, W, d) -> (B, d, H, W)
+            F_out = F_out + code.permute(0, 3, 1, 2)
 
-        F_field = torch.stack(channels, dim=1)  # (B, rank, d) — need (B, d, H, W)
-        # Sum rank channels into d-dim field via bundling across rank
-        F_out = torch.zeros(B, self.d, H, W, dtype=torch.complex64, device=surface.device)
-        for r in range(self.rank):
-            F_out = F_out + channels[r].permute(0, 2, 1).reshape(B, self.d, H, W)
         return F_out

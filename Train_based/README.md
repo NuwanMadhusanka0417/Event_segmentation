@@ -10,48 +10,45 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-## Build order (from SPEC)
+## EVIMO2 dataset layout
 
-| Step | Component | Gate |
-|------|-----------|------|
-| 1 | `vsa/fpe.py` | roundtrip > 0.99 |
-| 2 | `vsa/kernel.py` | 99% energy at r≈86 |
-| 3 | `vsa/field.py` | separable == explicit < 1e-10 |
-| 4 | `test_retrieval.py` | **≤1 px at M=7 — GO/NO-GO** |
-| 5+ | Data, model, train | see `docs/SPEC.md` |
-
-## Project layout
+Place extracted EVIMO2v2 sequences here:
 
 ```
-Train_based/
-├── docs/SPEC.md          Full build specification
-├── configs/              YAML configs
-├── hdems/                Python package
-│   ├── vsa/              FPE, kernel, field, temporal (CRITICAL)
-│   ├── data/             Time surfaces, DSEC, EV-IMO loaders
-│   ├── models/           Encoder, matcher, decoder, segmentation
-│   ├── losses/
-│   ├── train.py
-│   ├── eval.py
-│   └── benchmark.py
-├── tests/                Gate tests (run before model work)
-└── scripts/              Data preparation
+../Data/EVIMO2/
+├── train/
+│   └── scene10_dyn_train_00_000000/
+│       ├── dataset_events_t.npy
+│       ├── dataset_events_xy.npy
+│       ├── dataset_events_p.npy
+│       ├── dataset_mask.npz
+│       ├── dataset_classical.npz   # used when events empty (e.g. flea3_7)
+│       └── dataset_info.npz
+└── eval/
+    └── scene13_dyn_test_00_000000/
+        └── ...
 ```
 
-## Training
+Config: `configs/evimo_seg.yaml` → `dataset.root: ../Data/EVIMO2`
+
+## Train and evaluate
 
 ```bash
-# Flow (DSEC)
-python -m hdems.train --config configs/dsec_flow.yaml
-
-# Segmentation (EV-IMO)
 python -m hdems.train --config configs/evimo_seg.yaml
+python -m hdems.eval --config configs/evimo_seg.yaml
 ```
 
-## Key design constraints
+Optional `.pt` cache (faster reload):
 
-- FPE via `exp(1j * x * phases)` — never `ifft(fft(X)**x)`
-- Bundled field M ≤ 9; extend range via pyramid, not larger M
-- Separable 2-pass field is exact — do not replace with M² loop
+```bash
+python scripts/prepare_evimo.py --root ../Data/EVIMO2
+```
 
-See `.cursorrules` and `docs/SPEC.md` for full details.
+## Notes
+
+- Raw NPZ/NPY sequences are loaded **directly** — no manual `.pt` conversion required.
+- Event cameras: builds time surfaces from events in a 50 ms window.
+- RGB-only sequences (`flea3_7`): falls back to classical frames as a 2-channel pseudo-surface.
+- Masks are remapped to consecutive class IDs (background = 0).
+
+See `docs/SPEC.md` and `.cursorrules` for VSA constraints.

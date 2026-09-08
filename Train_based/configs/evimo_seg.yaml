@@ -1,21 +1,42 @@
 # EV-IMO motion segmentation config
 
-defaults:
-  - base
+d: 1024
+
+encoder:
+  patch_size: 21
+  sigma_k: 1.5
+  rank: 64
+  separable_terms: 2
+
+matching:
+  M: 7
+  pyramid_levels: 4
 
 dataset:
   name: evimo
-  root: data/evimo
+  root: ../Data/EVIMO2
   split: train
-  version: evimo2
+  eval_split: eval
+  height: 480
+  width: 640
+  window_ms: 50.0
+  remap_mask: true
+  use_classical_fallback: true
 
 train:
   task: segmentation
-  batch_size: 4
+  batch_size: 2
   epochs: 100
+  lr: 1.0e-4
+  num_workers: 0
 
 eval:
-  metrics: [iou, miou, point_iou]
+  metrics: [iou, miou]
+  split: eval
 
 segmentation:
-  num_classes: 12
+  num_classes: 32
+  embedding_dim: 32
+
+time_surface:
+  decay: 0.8

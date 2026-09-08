@@ -21,16 +21,24 @@ def load_config(path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
-def build_dataset(cfg: dict):
+def build_dataset(cfg: dict, split: str | None = None):
     ds_cfg = cfg.get("dataset", {})
     name = ds_cfg.get("name", "dsec")
+    split = split or ds_cfg.get("split", "train")
+
     if name == "dsec":
-        return DSECDataset(ds_cfg["root"], ds_cfg.get("split", "train"))
-    elif name == "evimo":
+        return DSECDataset(ds_cfg["root"], split)
+    if name == "evimo":
         return EVIMODataset(
             ds_cfg["root"],
-            ds_cfg.get("split", "train"),
-            ds_cfg.get("version", "evimo2"),
+            split,
+            ds_cfg.get("version"),
+            height=ds_cfg.get("height", 480),
+            width=ds_cfg.get("width", 640),
+            window_ms=ds_cfg.get("window_ms", 50.0),
+            decay=cfg.get("time_surface", {}).get("decay", 0.8),
+            remap_mask=ds_cfg.get("remap_mask", True),
+            use_classical_fallback=ds_cfg.get("use_classical_fallback", True),
         )
     raise ValueError(f"Unknown dataset: {name}")
 
@@ -79,6 +87,9 @@ def main() -> None:
 
     try:
         dataset = build_dataset(cfg)
+        if len(dataset) == 0:
+            raise FileNotFoundError("Dataset is empty")
+        print(f"Training samples: {len(dataset)}")
         loader = DataLoader(
             dataset,
             batch_size=train_cfg.get("batch_size", 4),
@@ -87,7 +98,7 @@ def main() -> None:
         )
     except FileNotFoundError as e:
         print(f"Dataset not ready: {e}")
-        print("Prepare data first, then re-run training.")
+        print("Place EVIMO2 sequences under root/train/ and root/eval/.")
         return
 
     optimizer = torch.optim.Adam(
