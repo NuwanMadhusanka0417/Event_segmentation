@@ -5,9 +5,18 @@ Hyperdimensional Event Motion Segmentation — VSA-based event camera flow and s
 ## Quick start
 
 ```bash
+ssh nk8155@gadi.nci.org.au
+
 cd Train_based
 pip install -r requirements.txt
 pytest tests/ -v
+
+module load python3/3.9.2
+source /scratch/jq77/nk8155/seg/bin/activate
+cd /scratch/mi23/nuwan/Event_segmentation/Train_based
+
+
+qsub -I -l walltime=12:00:00,mem=190GB,ncpus=12,jobfs=50GB -P mi23 -l storage=gdata/jq77+scratch/jq77+scratch/mi23
 ```
 
 ## EVIMO2 dataset layout

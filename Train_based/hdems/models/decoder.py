@@ -58,7 +58,8 @@ class FlowDecoder(nn.Module):
             flow_up = F.interpolate(flow_coarse, size=(H, W), mode="bilinear", align_corners=True)
             x = x + self.proj(torch.cat([flow_up, torch.zeros(B, self.proj.in_channels - 2, H, W, device=x.device)], dim=1))[:, :x.shape[1]]
 
-        x_seq = x.permute(0, 2, 3, 1).reshape(B, H * W, -1)
-        out, _ = self.gru(x_seq)
+        x_seq = x.permute(0, 2, 3, 1).reshape(B, H * W, -1).contiguous()
+        with torch.backends.cudnn.flags(enabled=False):
+            out, _ = self.gru(x_seq)
         out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2)
         return self.head(out)
