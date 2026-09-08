@@ -83,7 +83,10 @@ class HDEMS(nn.Module):
         Phi = self.matcher([F])[0]
 
         outputs: dict[str, torch.Tensor] = {}
-        outputs["flow"] = self.decoder(Phi)
+        # Only run the flow decoder when flow is actually needed; for the
+        # segmentation task it is unused and just wastes GPU memory/compute.
+        if task != "segmentation":
+            outputs["flow"] = self.decoder(Phi)
         if task == "segmentation":
             outputs["seg_logits"] = self.seg_head(Phi)
         return outputs
