@@ -30,13 +30,17 @@ def events_to_time_surface(
     if events.numel() == 0:
         return surface
 
-    t0 = events[:, 0].min()
-    for ev in events:
-        t, x, y, p = ev[0], int(ev[1]), int(ev[2]), int(ev[3])
-        if 0 <= x < width and 0 <= y < height:
-            c = int(p) if polarity else 0
-            age = (t - t0).item()
-            surface[c, y, x] = decay ** age + surface[c, y, x]
+    t = events[:, 0].to(torch.float64)
+    x = events[:, 1].long()
+    y = events[:, 2].long()
+    t0 = t.min()
+    val = (decay ** (t - t0)).to(torch.float32)             # per-event contribution
+
+    c = events[:, 3].long().clamp_(0, 1) if polarity else torch.zeros_like(x)
+    inb = (x >= 0) & (x < width) & (y >= 0) & (y < height)   # drop out-of-bounds
+
+    flat_idx = (c[inb] * height + y[inb]) * width + x[inb]
+    surface.view(-1).index_add_(0, flat_idx, val[inb])       # scatter-accumulate
     return surface
 
 

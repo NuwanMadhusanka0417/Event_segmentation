@@ -1,11 +1,11 @@
 # EV-IMO motion segmentation config
 
-d: 1024
+d: 512
 
 encoder:
   patch_size: 21
   sigma_k: 1.5
-  rank: 64
+  rank: 16
   separable_terms: 2
 
 matching:
@@ -17,8 +17,8 @@ dataset:
   root: ../Data/EVIMO2
   split: train
   eval_split: eval
-  height: 480
-  width: 640
+  height: 240
+  width: 320
   window_ms: 50.0
   remap_mask: true
   use_classical_fallback: true
@@ -26,9 +26,9 @@ dataset:
 train:
   task: segmentation
   batch_size: 1
-  epochs: 100
+  epochs: 30
   lr: 1.0e-4
-  num_workers: 0
+  num_workers: 8
 
 eval:
   metrics: [iou, miou]
