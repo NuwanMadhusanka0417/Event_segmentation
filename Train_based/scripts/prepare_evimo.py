@@ -19,10 +19,15 @@ Usage
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
 import yaml
+
+# Make the package importable when run as a plain script (python scripts/...),
+# not just via `python -m`. Adds the project root (parent of scripts/) to path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hdems.data.evimo2_reader import build_sample_index, load_frame_sample, load_meta
 
