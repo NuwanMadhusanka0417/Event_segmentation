@@ -56,17 +56,44 @@ def evaluate_flow(model: HDEMS, loader: DataLoader, device: torch.device) -> flo
     return total_epe / max(n, 1)
 
 
+def _save_seg_panel(surface, mask, pred, out_path: Path, num_classes: int) -> None:
+    """Write an events | ground-truth | prediction panel for one sample."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ev = surface.detach().cpu().numpy().sum(0)     # (H, W) aggregated polarity
+    gt = mask.detach().cpu().numpy()
+    pr = pred.detach().cpu().numpy()
+
+    fig, ax = plt.subplots(1, 3, figsize=(12, 4))
+    ax[0].imshow(ev, cmap="gray"); ax[0].set_title("events")
+    ax[1].imshow(gt, cmap="tab20", vmin=0, vmax=num_classes - 1); ax[1].set_title("ground truth")
+    ax[2].imshow(pr, cmap="tab20", vmin=0, vmax=num_classes - 1); ax[2].set_title("prediction")
+    for a in ax:
+        a.axis("off")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
 @torch.no_grad()
 def evaluate_segmentation(
     model: HDEMS,
     loader: DataLoader,
     device: torch.device,
     num_classes: int,
+    save_dir: Path | None = None,
+    max_images: int = 50,
 ) -> dict[str, float]:
     model.eval()
     ious: list[float] = []
     total_loss = 0.0
     n = 0
+    saved = 0
+
+    if save_dir is not None:
+        save_dir.mkdir(parents=True, exist_ok=True)
 
     for batch in loader:
         surface = batch["surface"].to(device)
@@ -84,7 +111,15 @@ def evaluate_segmentation(
             if union.any():
                 inter = (pred_c & mask_c) & valid
                 ious.append(inter.sum().float() / union.sum().float())
+
+        if save_dir is not None and saved < max_images:
+            _save_seg_panel(surface[0], mask[0], pred[0],
+                            save_dir / f"eval_{n:05d}.png", num_classes)
+            saved += 1
         n += 1
+
+    if save_dir is not None:
+        print(f"Saved {saved} panels to {save_dir.resolve()}")
 
     return {
         "loss": total_loss / max(n, 1),
@@ -97,6 +132,10 @@ def main() -> None:
     parser.add_argument("--config", type=str, default="configs/evimo_seg.yaml")
     parser.add_argument("--checkpoint", type=str, required=False)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--save-images", type=str, default=None,
+                        help="directory to write events|GT|prediction panels (segmentation only)")
+    parser.add_argument("--max-images", type=int, default=50,
+                        help="max number of eval panels to save")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -120,7 +159,11 @@ def main() -> None:
 
         if task == "segmentation":
             num_classes = cfg.get("segmentation", {}).get("num_classes", 16)
-            metrics = evaluate_segmentation(model, loader, device, num_classes)
+            save_dir = Path(args.save_images) if args.save_images else None
+            metrics = evaluate_segmentation(
+                model, loader, device, num_classes,
+                save_dir=save_dir, max_images=args.max_images,
+            )
             print(f"Seg loss: {metrics['loss']:.4f}")
             print(f"mIoU:     {metrics['miou']:.4f}")
         else:

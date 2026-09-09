@@ -106,9 +106,25 @@ def main() -> None:
         lr=train_cfg.get("lr", 1e-4),
     )
 
+    # Where checkpoints go (override with train.out_dir in the config).
+    ckpt_dir = Path(train_cfg.get("out_dir", "checkpoints"))
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_loss = float("inf")
+
     for epoch in range(train_cfg.get("epochs", 100)):
         loss = train_one_epoch(model, loader, optimizer, device, task)
         print(f"Epoch {epoch + 1}: loss={loss:.4f}")
+
+        # Save after every epoch: always refresh last.pt, keep best.pt too.
+        ckpt = {"model": model.state_dict(), "epoch": epoch + 1,
+                "loss": loss, "task": task}
+        torch.save(ckpt, ckpt_dir / "last.pt")
+        if loss < best_loss:
+            best_loss = loss
+            torch.save(ckpt, ckpt_dir / "best.pt")
+
+    print(f"Saved checkpoints to {ckpt_dir.resolve()} "
+          f"(last.pt, best.pt @ loss={best_loss:.4f})")
 
 
 if __name__ == "__main__":
