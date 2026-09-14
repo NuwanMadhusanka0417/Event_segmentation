@@ -38,50 +38,23 @@ Place extracted EVIMO2v2 sequences here:
         └── ...
 ```
 
-Config: `configs/evimo_seg.yaml` → `dataset.root: ../Data/EVIMO2`
-
-## Train and evaluate
-
-### CNN segmentation head (trained)
+## Commands (from Train_gpt/)
 
 ```bash
-python -m hdems.train --config configs/evimo_seg.yaml
-python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/best.pt --head cnn
+pip install -r requirements.txt
+
+# 1) Train static/dynamic prototypes (needs masks under train/)
+python scripts/train_prototypes.py --config configs/evimo.yaml --output checkpoints/prototypes.pt
+
+# 2) Main inference
+python scripts/segment_sequence.py \
+  --config configs/evimo.yaml \
+  --input ../Data/EVIMO2 \
+  --output outputs/evimo_vsa_motionseg
+
+# 3) Evaluation (uses eval split, falls back to train if eval missing)
+python scripts/evaluate.py --config configs/evimo.yaml --split eval
+
+# 4) Synthetic / unit tests
+pytest tests/ -q
 ```
-
-### Ridge readout (closed-form, no backprop)
-
-```bash
-python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --out checkpoints/ridge_head.pt
-
-CUDA_VISIBLE_DEVICES="" python -m hdems.eval --config configs/evimo_seg.yaml \
-  --head ridge --ridge-checkpoint checkpoints/ridge_head.pt --device cpu
-
-# Side-by-side CNN vs Ridge metrics + panels
-python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/best.pt \
-  --compare-heads --ridge-checkpoint checkpoints/ridge_head.pt --save-images output/ridge_compare
-```
-
-Set `segmentation.head: ridge` in `configs/evimo_seg.yaml` to make ridge the default eval head.
-See `docs/RIDGE_RESULTS.md` for the supervisor-facing metrics table.
-
-
-
-### Fair VSA-first settings (unchanged from before)
-
-For the GVFA event pipeline (GVFA/segment.py), not HD-EMS:
-
-```bash
-python segment.py --input events_filtered.txt --stream-segments --segment-ms 60 --motion-resolver vsa --assignment em --em-init vsa --out-dir diag_stream/vsa_best
-```
-
-
-
-## Notes
-
-- Raw NPZ/NPY sequences are loaded **directly** — no manual `.pt` conversion required.
-- Event cameras: builds time surfaces from events in a 50 ms window.
-- RGB-only sequences (`flea3_7`): falls back to classical frames as a 2-channel pseudo-surface.
-- Masks are remapped to consecutive class IDs (background = 0).
-
-See `docs/SPEC.md` and `.cursorrules` for VSA constraints.
