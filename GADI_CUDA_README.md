@@ -25,6 +25,8 @@ source /scratch/jq77/nk8155/seg/bin/activate
 cd /scratch/mi23/nuwan/Event_segmentation/Train_based
 ```
 
+
+
 ## 3. Check CUDA is available
 
 ```bash
@@ -38,7 +40,16 @@ Expected: `True` and a GPU name (e.g. `Tesla V100`).
 
 ```bash
 python -m hdems.train --config configs/evimo_seg.yaml --device cuda
-python -m hdems.eval  --config configs/evimo_seg.yaml --device cuda
+python -m hdems.eval  --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt --save-images eval_out --max-images 200
+```
+
+### _Avode "Disk quota exceed" Error white evaluating._
+
+```bash
+export MPLCONFIGDIR=/scratch/mi23/nuwan/.cache/matplotlib
+export PYTORCH_KERNEL_CACHE_PATH=/scratch/mi23/nuwan/.cache/torch/kernels
+export XDG_CACHE_HOME=/scratch/mi23/nuwan/.cache
+mkdir -p "$MPLCONFIGDIR" "$PYTORCH_KERNEL_CACHE_PATH"
 ```
 
 ## 5. CPU only (no GPU — slow, may OOM)
@@ -50,6 +61,8 @@ qsub -I -l walltime=12:00:00,mem=190GB,ncpus=12,jobfs=50GB -P mi23 -l storage=gd
 ```bash
 python -m hdems.train --config configs/evimo_seg.yaml --device cpu
 ```
+
+
 
 ## 6. Batch job (optional)
 
@@ -75,3 +88,4 @@ Submit:
 ```bash
 qsub train_gpu.pbs
 ```
+
