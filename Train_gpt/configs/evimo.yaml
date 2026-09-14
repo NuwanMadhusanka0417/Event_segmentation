@@ -1,0 +1,42 @@
+# EVIMO2 motion segmentation — primary experiment config
+
+dataset:
+  name: evimo
+  root: ../Data/EVIMO2
+  split: train
+  eval_split: eval
+  event_masked_evaluation: true
+
+events:
+  window_ms: 50
+  num_bins: 1
+  legacy_decay: 0.8
+  normalize_time_surface: true
+
+vsa:
+  dimension: 512
+  basis_rank: 16
+  kernel_size: 21
+  gaussian_sigma: 1.5
+  scales: [1, 2, 4]
+  seed: 42
+
+flow:
+  search_radius: 3
+  temperature: 0.08
+  confidence_threshold: 0.12
+  motion_source: vsa_cost_volume
+
+ego_motion:
+  mode: stationary_camera
+
+classifier:
+  type: prototype
+  prototype_path: checkpoints/prototypes.pt
+
+clustering:
+  method: region_growing
+  min_cluster_size: 15
+
+temporal:
+  enabled: true

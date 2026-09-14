@@ -1,0 +1,19 @@
+# Ablation overrides — merge with default.yaml via copy/paste or extend load_config
+
+vsa:
+  dimension: 512   # try 512 | 1024 | 2048
+
+flow:
+  search_radius: 5   # try 3 | 5 | 7
+
+events:
+  window_ms: 30      # try 30 | 50 | 100
+
+clustering:
+  method: dbscan     # region_growing | dbscan
+
+refinement:
+  enabled: false
+
+classifier:
+  type: prototype    # prototype | ridge

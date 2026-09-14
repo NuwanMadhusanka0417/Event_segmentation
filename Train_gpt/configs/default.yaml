@@ -1,0 +1,92 @@
+dataset:
+  name: evimo
+  root: ../Data/EVIMO2
+  split: train
+  eval_split: eval
+  event_masked_evaluation: true
+
+events:
+  window_ms: 50
+  num_bins: 1
+  tau_ms: null          # null -> use legacy_decay
+  legacy_decay: 0.8     # per-event multiplier in Train_based style
+  use_positive_polarity: true
+  use_negative_polarity: true
+  normalize_time_surface: true
+  multi_time_fractions: [0.0, 0.25, 0.5, 1.0]
+
+vsa:
+  dimension: 1024
+  basis_rank: 64
+  kernel_size: 21
+  gaussian_sigma: 1.5
+  scales: [1, 2, 4]
+  representation: real   # real | bipolar | binary
+  separable_terms: 2
+  seed: 42
+  artifact_dir: checkpoints/vsa_artifacts
+
+flow:
+  motion_source: vsa_cost_volume   # vsa_cost_volume | normal_flow | fused
+  search_radius: 3
+  temperature: 0.05
+  confidence_threshold: 0.15
+  use_multiscale: true
+  active_pixels_only: true
+  delta_t_ms: 50
+  chunked: false
+
+ego_motion:
+  mode: stationary_camera   # stationary_camera | rotation_only | ransac_global_model
+  ransac_enabled: false
+  inlier_threshold: 1.5
+  min_inliers: 50
+  max_iterations: 200
+
+classifier:
+  type: prototype   # prototype | ridge | online_hd
+  confidence_threshold: 0.0
+  update_online: false
+  balance_classes: true
+
+clustering:
+  method: region_growing   # region_growing | dbscan
+  neighborhood: 8
+  flow_weight: 1.0
+  hv_weight: 0.5
+  spatial_weight: 0.05
+  min_cluster_size: 20
+  min_samples: 5
+  flow_threshold: 2.0
+  hv_similarity_threshold: 0.3
+
+refinement:
+  enabled: true
+  lambda_bundle: 0.2
+  sigma_flow: 2.0
+  sigma_hv: 0.3
+  connectivity: 8
+
+temporal:
+  enabled: true
+  max_track_gap: 3
+  min_iou: 0.2
+  flow_weight: 1.0
+  hv_weight: 0.5
+  centroid_weight: 0.1
+
+evaluation:
+  metrics:
+    - iou
+    - f1
+    - precision
+    - recall
+    - boundary_f1
+    - temporal_stability
+
+ridge:
+  alpha: 1.0
+  enabled: false
+
+self_supervised:
+  enabled: false
