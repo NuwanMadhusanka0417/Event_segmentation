@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from hdems.data.dsec import DSECDataset
 from hdems.data.evimo import EVIMODataset
 from hdems.losses.flow import epe_loss
-from hdems.losses.seg import seg_loss
+from hdems.losses.seg import dice_loss, seg_loss
 from hdems.models.hdems import HDEMS
 
 
@@ -49,6 +49,9 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     task: str,
+    *,
+    use_dice: bool = False,
+    num_classes: int = 16,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -61,7 +64,12 @@ def train_one_epoch(
         if task == "flow":
             loss = epe_loss(out["flow"], batch["flow"].to(device))
         else:
-            loss = seg_loss(out["seg_logits"], batch["mask"].to(device).long())
+            logits = out["seg_logits"]
+            target = batch["mask"].to(device).long()
+            loss = seg_loss(logits, target)
+            if use_dice:
+                # Dice counters heavy background/foreground imbalance.
+                loss = loss + dice_loss(logits, target.clamp(0, num_classes - 1), num_classes)
 
         loss.backward()
         optimizer.step()
@@ -111,8 +119,12 @@ def main() -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_loss = float("inf")
 
+    use_dice = bool(train_cfg.get("use_dice", False))
+    num_classes = cfg.get("segmentation", {}).get("num_classes", 16)
+
     for epoch in range(train_cfg.get("epochs", 100)):
-        loss = train_one_epoch(model, loader, optimizer, device, task)
+        loss = train_one_epoch(model, loader, optimizer, device, task,
+                               use_dice=use_dice, num_classes=num_classes)
         print(f"Epoch {epoch + 1}: loss={loss:.4f}")
 
         # Save after every epoch: always refresh last.pt, keep best.pt too.

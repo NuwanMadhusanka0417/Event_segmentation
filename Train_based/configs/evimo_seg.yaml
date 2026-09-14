@@ -29,15 +29,19 @@ train:
   epochs: 30
   lr: 1.0e-4
   num_workers: 8
+  use_dice: true          # add Dice to CE (background/foreground imbalance)
 
 eval:
   metrics: [iou, miou]
   split: eval
 
 segmentation:
-  head: cnn              # cnn | ridge
+  head: motion          # motion | cnn | ridge
   num_classes: 32
   embedding_dim: 32
+  ctx_dim: 32            # motion head: compressed HV context channels
+  flow_beta: 1.0         # motion head: soft-argmax temperature for Phi->velocity
+  ego_iters: 3           # motion head: IRLS passes for global-motion fit
   mean_center: false     # CNN legacy checkpoints (no centering)
   motion_features: false
   ridge_mean_center: true

@@ -11,7 +11,8 @@ from hdems.data.time_surface import build_pyramid
 from hdems.models.decoder import FlowDecoder
 from hdems.models.encoder import VSAEncoder
 from hdems.models.matching import HierarchicalMatcher
-from hdems.models.segmentation import SegmentationHead
+from hdems.models.motion import decode_flow, ego_residual
+from hdems.models.segmentation import MotionSegHead, SegmentationHead
 from hdems.ridge_head import RidgeHead
 from hdems.vsa.temporal import bind_trajectory, make_time_phases
 
@@ -55,6 +56,13 @@ class HDEMS(nn.Module):
                 mean_center=seg.get("ridge_mean_center", True),
                 motion_features=seg.get("ridge_motion_features", True),
             )
+        elif self.head_type == "motion":
+            self.seg_head = MotionSegHead(
+                d=d,
+                embedding_dim=seg.get("embedding_dim", 32),
+                num_classes=num_classes,
+                ctx_dim=seg.get("ctx_dim", 32),
+            )
         else:
             self.seg_head = SegmentationHead(
                 d=d,
@@ -63,6 +71,9 @@ class HDEMS(nn.Module):
                 mean_center=mean_center,
                 motion_features=motion_features,
             )
+        # motion-head decode params
+        self.flow_beta = float(seg.get("flow_beta", 1.0))
+        self.ego_iters = int(seg.get("ego_iters", 3))
         self.pyramid_levels = match.get("pyramid_levels", 4)
         self.temporal_window = temp.get("window", 8)
         self.register_buffer("time_phases", make_time_phases(d))
@@ -87,7 +98,18 @@ class HDEMS(nn.Module):
         if task != "segmentation":
             outputs["flow"] = self.decoder(phi)
         if task == "segmentation":
-            outputs["seg_logits"] = self.seg_head(phi, surface=surface)
+            if self.head_type == "motion":
+                # Phase 1: decode velocity from Phi; Phase 3: ego-compensate.
+                flow = decode_flow(
+                    f, phi, self.matcher.phx, self.matcher.phy,
+                    M=self.matcher.M, beta=self.flow_beta,
+                )
+                residual, mag = ego_residual(flow, iters=self.ego_iters)
+                motion = torch.cat([residual, mag], dim=1)
+                outputs["flow"] = flow
+                outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface)
+            else:
+                outputs["seg_logits"] = self.seg_head(phi, surface=surface)
         return outputs
 
     def bind_temporal(
