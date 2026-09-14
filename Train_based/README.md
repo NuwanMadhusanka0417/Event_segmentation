@@ -45,8 +45,9 @@ Config: `configs/evimo_seg.yaml` → `dataset.root: ../Data/EVIMO2`
 ### CNN segmentation head (trained)
 
 ```bash
-python -m hdems.train --config configs/evimo_seg.yaml
-python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/best.pt --head cnn
+source scripts/nci_env.sh
+python -m hdems.train --config configs/evimo_seg.yaml --device cuda
+python -m hdems.eval  --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt --save-images eval_out --max-images 50
 ```
 
 ### Ridge readout (closed-form, no backprop)
