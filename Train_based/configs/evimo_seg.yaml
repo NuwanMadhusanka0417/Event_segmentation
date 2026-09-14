@@ -35,8 +35,21 @@ eval:
   split: eval
 
 segmentation:
+  head: cnn              # cnn | ridge
   num_classes: 32
   embedding_dim: 32
+  mean_center: false     # CNN legacy checkpoints (no centering)
+  motion_features: false
+  ridge_mean_center: true
+  ridge_motion_features: true
+  ridge_weights: checkpoints/ridge_head.pt
+
+ridge:
+  backend: streaming     # streaming | sklearn
+  imbalance: balanced    # balanced | subsample_bg | none
+  bg_subsample_ratio: 0.2
+  val_split: eval
+  alphas: [1.0e-3, 1.0e-1, 1.0, 10.0, 100.0]
 
 time_surface:
   decay: 0.8

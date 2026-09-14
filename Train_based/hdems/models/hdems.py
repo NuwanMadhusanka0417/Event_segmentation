@@ -12,6 +12,7 @@ from hdems.models.decoder import FlowDecoder
 from hdems.models.encoder import VSAEncoder
 from hdems.models.matching import HierarchicalMatcher
 from hdems.models.segmentation import SegmentationHead
+from hdems.ridge_head import RidgeHead
 from hdems.vsa.temporal import bind_trajectory, make_time_phases
 
 
@@ -44,17 +45,29 @@ class HDEMS(nn.Module):
             hidden_channels=dec.get("hidden_channels", 64),
             gru_layers=dec.get("gru_layers", 1),
         )
-        self.seg_head = SegmentationHead(
-            d=d,
-            embedding_dim=seg.get("embedding_dim", 32),
-            num_classes=seg.get("num_classes", 16),
-        )
+        self.head_type = str(seg.get("head", "cnn")).lower()
+        num_classes = seg.get("num_classes", 16)
+        mean_center = bool(seg.get("mean_center", False))
+        motion_features = bool(seg.get("motion_features", False))
+        if self.head_type == "ridge":
+            self.seg_head = RidgeHead(
+                num_classes=num_classes,
+                mean_center=seg.get("ridge_mean_center", True),
+                motion_features=seg.get("ridge_motion_features", True),
+            )
+        else:
+            self.seg_head = SegmentationHead(
+                d=d,
+                embedding_dim=seg.get("embedding_dim", 32),
+                num_classes=num_classes,
+                mean_center=mean_center,
+                motion_features=motion_features,
+            )
         self.pyramid_levels = match.get("pyramid_levels", 4)
         self.temporal_window = temp.get("window", 8)
         self.register_buffer("time_phases", make_time_phases(d))
 
     def encode_pyramid(self, surface: torch.Tensor) -> list[torch.Tensor]:
-        """Time surface -> pyramid of complex descriptor fields."""
         pyr_surfaces = build_pyramid(surface, self.pyramid_levels)
         return [self.encoder(s.unsqueeze(0) if s.dim() == 3 else s) for s in pyr_surfaces]
 
@@ -64,31 +77,17 @@ class HDEMS(nn.Module):
         *,
         task: str = "flow",
     ) -> dict[str, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        surface : (B, C, H, W) time surface
-        task : "flow" or "segmentation"
-
-        Returns
-        -------
-        dict with "flow" and/or "seg_logits"
-        """
         if surface.dim() == 3:
             surface = surface.unsqueeze(0)
-        B = surface.shape[0]
 
-        # Encode finest level (extend to full pyramid in training loop)
-        F = self.encoder(surface)
-        Phi = self.matcher([F])[0]
+        f = self.encoder(surface)
+        phi = self.matcher([f])[0]
 
         outputs: dict[str, torch.Tensor] = {}
-        # Only run the flow decoder when flow is actually needed; for the
-        # segmentation task it is unused and just wastes GPU memory/compute.
         if task != "segmentation":
-            outputs["flow"] = self.decoder(Phi)
+            outputs["flow"] = self.decoder(phi)
         if task == "segmentation":
-            outputs["seg_logits"] = self.seg_head(Phi)
+            outputs["seg_logits"] = self.seg_head(phi, surface=surface)
         return outputs
 
     def bind_temporal(
@@ -96,10 +95,14 @@ class HDEMS(nn.Module):
         field_sequence: list[torch.Tensor],
         times: torch.Tensor,
     ) -> torch.Tensor:
-        """Bind temporal trajectory from field sequence."""
         stacked = torch.stack(field_sequence, dim=0)
         return bind_trajectory(stacked, self.time_phases, times)
 
     @property
     def num_trainable_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def seg_head_param_count(self) -> int:
+        if self.head_type == "ridge":
+            return self.seg_head.num_readout_params()
+        return sum(p.numel() for p in self.seg_head.parameters())

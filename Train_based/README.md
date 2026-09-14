@@ -42,16 +42,40 @@ Config: `configs/evimo_seg.yaml` → `dataset.root: ../Data/EVIMO2`
 
 ## Train and evaluate
 
+### CNN segmentation head (trained)
+
 ```bash
 python -m hdems.train --config configs/evimo_seg.yaml
-python -m hdems.eval --config configs/evimo_seg.yaml
+python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/best.pt --head cnn
 ```
 
-Optional `.pt` cache (faster reload):
+### Ridge readout (closed-form, no backprop)
 
 ```bash
-python scripts/prepare_evimo.py --root ../Data/EVIMO2
+python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --out checkpoints/ridge_head.pt
+
+CUDA_VISIBLE_DEVICES="" python -m hdems.eval --config configs/evimo_seg.yaml \
+  --head ridge --ridge-checkpoint checkpoints/ridge_head.pt --device cpu
+
+# Side-by-side CNN vs Ridge metrics + panels
+python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/best.pt \
+  --compare-heads --ridge-checkpoint checkpoints/ridge_head.pt --save-images output/ridge_compare
 ```
+
+Set `segmentation.head: ridge` in `configs/evimo_seg.yaml` to make ridge the default eval head.
+See `docs/RIDGE_RESULTS.md` for the supervisor-facing metrics table.
+
+
+
+### Fair VSA-first settings (unchanged from before)
+
+For the GVFA event pipeline (GVFA/segment.py), not HD-EMS:
+
+```bash
+python segment.py --input events_filtered.txt --stream-segments --segment-ms 60 --motion-resolver vsa --assignment em --em-init vsa --out-dir diag_stream/vsa_best
+```
+
+
 
 ## Notes
 
