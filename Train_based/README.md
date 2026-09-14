@@ -42,12 +42,31 @@ Config: `configs/evimo_seg.yaml` → `dataset.root: ../Data/EVIMO2`
 
 ## Train and evaluate
 
+Run all commands from the `Train_based/` directory (config: `configs/evimo_seg.yaml`).
+
+On Gadi GPU setup, see [`../GADI_CUDA_README.md`](../GADI_CUDA_README.md).
+
 ### CNN segmentation head (trained)
 
+**Training** — saves `checkpoints/last.pt` every epoch and `checkpoints/best.pt` when loss improves (no segmentation images):
+
 ```bash
-python -m hdems.train --config configs/evimo_seg.yaml
-python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/best.pt --head cnn
+python -m hdems.train --config configs/evimo_seg.yaml --device cuda
+python -m hdems.train --config configs/evimo_seg.yaml --device cpu   # slow; may OOM
 ```
+
+**Evaluation** — prints mIoU, loss, and latency. Segmentation PNGs are **not** saved unless you pass `--save-images`:
+
+```bash
+# Metrics only
+python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/best.pt --head cnn --device cuda
+
+# Metrics + comparison panels (events | GT | prediction) under eval_out/
+python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt \
+  --head cnn --device cuda --save-images eval_out --max-images 200
+```
+
+With `--save-images`, each file is a 3-panel PNG (`eval_00000.png`, …). Default `--max-images` is 50.
 
 ### Ridge readout (closed-form, no backprop)
 
