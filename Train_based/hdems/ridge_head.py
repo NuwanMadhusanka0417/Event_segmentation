@@ -86,6 +86,25 @@ class RidgeHead(nn.Module):
         logits = logits.reshape(b, h, w, self.num_classes).permute(0, 3, 1, 2)
         return logits.to(device=phi.device, dtype=torch.float32)
 
+    def logits_from_features(self, feats: torch.Tensor) -> torch.Tensor:
+        """Apply the linear readout to a PRECOMPUTED per-pixel feature tensor.
+
+        Used for the paper front-end (feats = [Phi.real|Phi.imag|residual velocity]),
+        where features come from the multi-time cost volume rather than from
+        ``prepare_seg_features``. Mean-centering matches the fit-time centering.
+        """
+        if not self.is_loaded:
+            raise RuntimeError("RidgeHead.load(path) must be called before inference")
+        x = feats
+        if self.mean_center and self.feature_mean.numel():
+            x = x - self.feature_mean.to(device=x.device, dtype=x.dtype).view(1, -1, 1, 1)
+        b, _, h, w = x.shape
+        x_flat = x.permute(0, 2, 3, 1).reshape(-1, x.shape[1])
+        with torch.no_grad():
+            logits = x_flat.cpu() @ self.weight + self.bias
+        logits = logits.reshape(b, h, w, self.num_classes).permute(0, 3, 1, 2)
+        return logits.to(device=feats.device, dtype=torch.float32)
+
     def num_readout_params(self) -> int:
         if not self.is_loaded:
             return 0

@@ -16,7 +16,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from hdems.eval import build_dataset, load_config
-from hdems.feature_extract import accumulate_feature_mean, extract_flat_batch
+from hdems.feature_extract import (
+    accumulate_feature_mean,
+    accumulate_paper_feature_mean,
+    extract_flat_batch,
+    extract_paper_flat_batch,
+)
 from hdems.metrics import mean_iou
 from hdems.models.hdems import HDEMS
 from hdems.ridge_fit import (
@@ -44,17 +49,27 @@ def collect_batches(
     feature_mean: torch.Tensor,
     mean_center: bool,
     motion_features: bool,
+    paper: bool = False,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     batches: list[tuple[torch.Tensor, torch.Tensor]] = []
     for batch in loader:
-        x, y = extract_flat_batch(
-            model,
-            batch["surface"].to(device),
-            batch["mask"].to(device),
-            feature_mean=feature_mean,
-            mean_center=mean_center,
-            motion_features=motion_features,
-        )
+        if paper:
+            x, y = extract_paper_flat_batch(
+                model,
+                batch["surface"].to(device),
+                batch["mask"].to(device),
+                feature_mean=feature_mean,
+                mean_center=mean_center,
+            )
+        else:
+            x, y = extract_flat_batch(
+                model,
+                batch["surface"].to(device),
+                batch["mask"].to(device),
+                feature_mean=feature_mean,
+                mean_center=mean_center,
+                motion_features=motion_features,
+            )
         if x.numel():
             batches.append((x.cpu(), y.cpu()))
     return batches
@@ -67,6 +82,8 @@ def eval_ridge_miou(
     loader: DataLoader,
     device: torch.device,
     num_classes: int,
+    *,
+    paper: bool = False,
 ) -> float:
     head.eval()
     model.eval()
@@ -74,8 +91,12 @@ def eval_ridge_miou(
     for batch in loader:
         surface = batch["surface"].to(device)
         mask = batch["mask"].to(device).long()
-        phi = extract_phi(model, surface)
-        logits = head(phi, surface=surface)
+        if paper:
+            feats, _ = model.paper_features(surface)
+            logits = head.logits_from_features(feats)
+        else:
+            phi = extract_phi(model, surface)
+            logits = head(phi, surface=surface)
         pred = logits.argmax(dim=1)
         scores.append(mean_iou(pred[0], mask[0], num_classes))
     return sum(scores) / max(len(scores), 1)
@@ -108,6 +129,12 @@ def main() -> None:
     num_classes = seg_cfg.get("num_classes", 32)
     mean_center = bool(seg_cfg.get("ridge_mean_center", True))
     motion_features = bool(seg_cfg.get("ridge_motion_features", True))
+    # Paper mode: multi-time surfaces -> fit Ridge on the two-time cost-volume
+    # features (Phi + ego-residual velocity) instead of single-frame Phi.
+    paper = bool(cfg.get("dataset", {}).get("time_frames"))
+    if paper:
+        print("[ridge] PAPER mode: features = Phi | ego-residual velocity "
+              "(two-time multi-scale cost volume)")
     imbalance = ridge_cfg.get("imbalance", "balanced")
     alphas = ridge_cfg.get("alphas", [1e-3, 1e-1, 1.0, 10.0, 100.0])
     backend = args.backend or ridge_cfg.get("backend", "streaming")
@@ -148,11 +175,14 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
 
     print(f"[ridge] computing feature mean on {len(train_ds)} train samples ...")
-    feature_mean = accumulate_feature_mean(
-        model, train_loader, device, motion_features=motion_features,
-    )
+    if paper:
+        feature_mean = accumulate_paper_feature_mean(model, train_loader, device)
+    else:
+        feature_mean = accumulate_feature_mean(
+            model, train_loader, device, motion_features=motion_features,
+        )
     print(f"[ridge] feature_dim={feature_mean.numel()}  mean_center={mean_center}  "
-          f"motion={motion_features}")
+          f"motion={motion_features}  paper={paper}")
 
     print("[ridge] collecting train pixels ...")
     train_batches = collect_batches(
@@ -160,6 +190,7 @@ def main() -> None:
         feature_mean=feature_mean,
         mean_center=mean_center,
         motion_features=motion_features,
+        paper=paper,
     )
     n_pix = sum(b[0].shape[0] for b in train_batches)
     print(f"[ridge] train pixels: {n_pix}")
@@ -192,10 +223,12 @@ def main() -> None:
                 motion_features=motion_features,
             )
 
-        head = RidgeHead(num_classes, mean_center=mean_center, motion_features=motion_features)
+        head = RidgeHead(num_classes, mean_center=mean_center,
+                         motion_features=(False if paper else motion_features))
         head.set_from_result(result)
 
-        miou = eval_ridge_miou(model, head, val_loader, device, num_classes) if len(val_ds) else 0.0
+        miou = (eval_ridge_miou(model, head, val_loader, device, num_classes, paper=paper)
+                if len(val_ds) else 0.0)
         print(f"[ridge] alpha={alpha:g}  val_mIoU={miou:.4f}  backend={backend}")
         if miou > best_miou:
             best_miou = miou

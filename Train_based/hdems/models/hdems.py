@@ -91,6 +91,24 @@ class HDEMS(nn.Module):
         """Encode each time-frame of a multi-time stack (B, T, 2, H, W) -> [F_t]."""
         return [self.encoder(surfaces[:, t]) for t in range(surfaces.shape[1])]
 
+    def paper_features(self, surfaces: torch.Tensor):
+        """Paper front-end features for a linear (Ridge) readout.
+
+        (B, T, 2, H, W) -> (feats, flow):
+          feats = [Phi.real | Phi.imag | residual_vx, residual_vy, |r|]  (B, 2d+3, H, W)
+          flow  = decoded optical flow (B, 2, H, W)
+        Same construction the motion head consumes, but concatenated so a linear
+        classifier can read it directly.
+        """
+        fields = self.encode_times(surfaces)
+        cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
+        flow = flow_from_cost(cost, self.matcher.M,
+                              alpha=self.flow_alpha, vel_scale=self.vel_scale)
+        residual, mag = ego_residual(flow, iters=self.ego_iters)
+        phi = self.matcher([fields[0]])[0]
+        feats = torch.cat([phi.real, phi.imag, residual, mag], dim=1).float()
+        return feats, flow
+
     def forward(
         self,
         surface: torch.Tensor,
@@ -114,6 +132,13 @@ class HDEMS(nn.Module):
             phi = self.matcher([fields[0]])[0]                       # HV context (reference)
             outputs["flow"] = flow
             outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface[:, -1])
+            return outputs
+
+        # ---- paper front-end with a linear Ridge readout --------------------
+        if task == "segmentation" and self.head_type == "ridge" and multitime:
+            feats, flow = self.paper_features(surface)
+            outputs["flow"] = flow
+            outputs["seg_logits"] = self.seg_head.logits_from_features(feats)
             return outputs
 
         # ---- single-time paths (fall back to the last frame if a stack) -----

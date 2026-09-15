@@ -12,10 +12,18 @@ events → multi-time surfaces → VFA HD descriptors (F0,F1,F2,F4)
        → two-time multi-scale cost volume  (paper Eq. 10–11)
        → probability-volume flow estimator (paper Eq. 12–14)
        → ego-motion residual (robust affine, IRLS)
-       → motion segmentation head → per-pixel object classes
+       → classifier → per-pixel object classes
 ```
 
-Only the small segmentation head is trained; the entire VSA front-end (kernel,
+The classifier is chosen by `segmentation.head`:
+
+- **`ridge`** (default) — a closed-form **linear** readout on
+  `[Φ | ego-residual velocity]`. **No backprop at all** — the whole pipeline is
+  parameter-free; fit it with `scripts/fit_ridge_head.py`.
+- **`motion`** — a small trained CNN on the same motion-primary features.
+- **`cnn`** — the raw-HV baseline (single-frame Φ only).
+
+Only the (optional) CNN head trains; the entire VSA front-end (kernel,
 descriptors, cost volume, flow estimator, ego-fit) is **parameter-free**.
 
 ## Layout
@@ -84,22 +92,35 @@ source scripts/nci_env.sh
 
 Set `dataset.root: ../Data/EVIMO2` in `configs/evimo_seg.yaml`.
 
-## Run
+## Run — default: paper front-end + Ridge readout (no backprop)
 
 ```bash
 source scripts/nci_env.sh
 
-# 1) Precompute cached shards ONCE (fast per-epoch loading).
-#    Shards are resolution- and time_frames-baked — see note below.
+# 1) Precompute multi-time cached shards ONCE (see cache note below).
 python scripts/prepare_evimo.py --config configs/evimo_seg.yaml
 
-# 2) Train (only the seg head learns; saves checkpoints/last.pt + best.pt)
-python -m hdems.train --config configs/evimo_seg.yaml --device cuda
+# 2) Fit the closed-form Ridge readout (paper features auto-selected when
+#    dataset.time_frames is set). NOT `hdems.train` — Ridge has no backprop.
+python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --out checkpoints/ridge_head.pt
 
 # 3) Evaluate: mIoU + events|GT|prediction panels
-python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt \
+python -m hdems.eval --config configs/evimo_seg.yaml --head ridge \
+  --ridge-checkpoint checkpoints/ridge_head.pt --device cuda \
+  --save-images eval_out --max-images 50
+```
+
+### Alternative: trained CNN motion head
+
+```bash
+# set segmentation.head: motion in the config, then:
+python -m hdems.train --config configs/evimo_seg.yaml --device cuda
+python -m hdems.eval  --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt \
   --device cuda --save-images eval_out --max-images 50
 ```
+
+> `hdems.train` is only for the `motion`/`cnn` heads. With `head: ridge` it will
+> error (Ridge is fit closed-form, not trained) — use `fit_ridge_head.py`.
 
 ### Quick smoke run (limit sample count)
 
@@ -137,16 +158,20 @@ python scripts/prepare_evimo.py --config configs/evimo_seg.yaml
 | `matching.alpha` | Eq.12 probability-volume threshold (0.3) |
 | `dataset.time_frames` | `[0,0.25,0.5,1.0]` multi-time surfaces; `[]` = single-time |
 | `dataset.height/width` | working resolution (240×320) |
-| `segmentation.head` | `motion` (default) · `cnn` · `ridge` |
+| `segmentation.head` | `ridge` (default) · `motion` · `cnn` |
 | `train.use_dice` | add Dice to CE for class imbalance (true) |
 | `train.max_samples` / `eval.max_samples` | cap to first N frames (or CLI `--max-samples`) |
 
-Set `segmentation.head: motion` for the paper motion pipeline (default), `cnn`
-for the raw-HV baseline, or `ridge` for the closed-form readout.
+Head choice (with `time_frames` set → all use the paper front-end):
+`ridge` = closed-form linear readout on `[Φ | ego-residual velocity]` (default);
+`motion` = trained CNN on the same features; `cnn` = single-frame raw-HV baseline.
 
-## Ridge readout (closed-form, no backprop)
+## Ridge readout details
 
-Ridge and CNN heads use single-time features — set `time_frames: []` first.
+With `dataset.time_frames` set, `fit_ridge_head.py` **automatically** fits on the
+paper features (two-time cost volume → flow → ego-residual), dim `2·d + 3`. It
+prints `PAPER mode` when it does. Set `time_frames: []` to fall back to the
+single-frame Φ baseline instead.
 
 ```bash
 python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --out checkpoints/ridge_head.pt

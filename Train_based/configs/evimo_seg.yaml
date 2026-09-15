@@ -42,7 +42,7 @@ eval:
   # max_samples: 20       # optional: eval on first N frames (or CLI --max-samples)
 
 segmentation:
-  head: motion          # motion | cnn | ridge
+  head: ridge           # ridge | motion | cnn  (with time_frames set -> paper front-end)
   num_classes: 32
   embedding_dim: 32
   ctx_dim: 32            # motion head: compressed HV context channels
