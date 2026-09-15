@@ -41,6 +41,7 @@ def build_dataset(cfg: dict, split: str | None = None):
         decay=cfg.get("time_surface", {}).get("decay", 0.8),
         remap_mask=ds_cfg.get("remap_mask", True),
         use_classical_fallback=ds_cfg.get("use_classical_fallback", True),
+        time_frames=ds_cfg.get("time_frames"),
     )
 
 
@@ -80,7 +81,8 @@ def _save_seg_panel(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    ev = surface.detach().cpu().numpy().sum(0)
+    surf = surface.detach().cpu().numpy()
+    ev = surf.reshape(-1, surf.shape[-2], surf.shape[-1]).sum(0)  # handles (2,H,W) and (T,2,H,W)
     gt = mask.detach().cpu().numpy()
     pr = pred.detach().cpu().numpy()
 

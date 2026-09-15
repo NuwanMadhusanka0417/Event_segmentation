@@ -114,6 +114,55 @@ def events_window_to_surface(
     )
 
 
+def events_multitime_surface(
+    seq_dir: Path,
+    ts: float,
+    window_s: float,
+    height: int,
+    width: int,
+    fracs: list[float],
+    *,
+    decay: float = 0.8,
+) -> torch.Tensor:
+    """Stack of accumulative time surfaces at several times inside the window.
+
+    For the window ``[ts - window_s, ts]`` and each fraction ``fr`` in ``fracs``,
+    build an accumulative TS ending at ``t_end = ts - window_s + fr*window_s``
+    over a lookback of one window. Recent events (near ``t_end``) dominate. The
+    first frame (fr=0) is the reference F0; later fractions are the targets the
+    paper cost volume matches against. Returns ``(len(fracs), 2, H, W)``.
+    """
+    n = len(fracs)
+    t_path = seq_dir / "dataset_events_t.npy"
+    if not t_path.exists():
+        return torch.zeros(n, 2, height, width, dtype=torch.float32)
+    t = np.load(t_path, mmap_mode="r").reshape(-1)
+    if t.size == 0:
+        return torch.zeros(n, 2, height, width, dtype=torch.float32)
+    xy = np.load(seq_dir / "dataset_events_xy.npy", mmap_mode="r")
+    p = np.load(seq_dir / "dataset_events_p.npy", mmap_mode="r").reshape(-1)
+
+    surfaces = []
+    for fr in fracs:
+        t_end = ts - window_s + fr * window_s
+        i0 = int(np.searchsorted(t, t_end - window_s, side="left"))
+        i1 = int(np.searchsorted(t, t_end, side="right"))
+        if i1 <= i0:
+            surfaces.append(torch.zeros(2, height, width, dtype=torch.float32))
+            continue
+        age = (t_end - t[i0:i1]).astype(np.float64)          # recent -> small age
+        events = np.stack(
+            [age, xy[i0:i1, 0].astype(np.float64),
+             xy[i0:i1, 1].astype(np.float64), p[i0:i1].astype(np.float64)],
+            axis=1,
+        )
+        surfaces.append(
+            events_to_time_surface(torch.from_numpy(events), height, width,
+                                   polarity=True, decay=decay)
+        )
+    return torch.stack(surfaces, dim=0)
+
+
 def load_frame_sample(
     seq_dir: Path,
     frame: dict[str, Any],
@@ -124,8 +173,14 @@ def load_frame_sample(
     decay: float = 0.8,
     remap_mask: bool = True,
     use_classical_fallback: bool = True,
+    time_fracs: list[float] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Load one aligned (surface, mask) training sample from a sequence."""
+    """Load one aligned (surface, mask) training sample from a sequence.
+
+    If ``time_fracs`` is given, ``surface`` is a multi-time stack
+    ``(len(time_fracs), 2, H, W)`` for the paper two-time cost volume; otherwise
+    a single ``(2, H, W)`` time surface.
+    """
     masks = np.load(seq_dir / "dataset_mask.npz")
     meta = load_meta(seq_dir)
 
@@ -142,20 +197,22 @@ def load_frame_sample(
     has_events = t_path.exists() and np.load(t_path, mmap_mode="r").size > 0
 
     if has_events:
-        surface = events_window_to_surface(
-            seq_dir,
-            ts - window_s,
-            ts,
-            height,
-            width,
-            decay=decay,
-        )
+        if time_fracs:
+            surface = events_multitime_surface(
+                seq_dir, ts, window_s, height, width, time_fracs, decay=decay,
+            )
+        else:
+            surface = events_window_to_surface(
+                seq_dir, ts - window_s, ts, height, width, decay=decay,
+            )
     elif use_classical_fallback:
         classical = np.load(seq_dir / "dataset_classical.npz")
         c_key = f"classical_{frame_id:010d}"
         if c_key not in classical.files:
             raise KeyError(f"{c_key} not found in {seq_dir / 'dataset_classical.npz'}")
         surface = classical_to_surface(classical[c_key])
+        if time_fracs:                                       # replicate to keep the stack shape
+            surface = surface.unsqueeze(0).repeat(len(time_fracs), 1, 1, 1)
     else:
         raise RuntimeError(f"No events and classical fallback disabled for {seq_dir}")
 
@@ -164,12 +221,16 @@ def load_frame_sample(
     if out_height and out_width and (
         surface.shape[-2] != out_height or surface.shape[-1] != out_width
     ):
-        surface = F.interpolate(
-            surface.unsqueeze(0),
-            size=(out_height, out_width),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
+        if surface.dim() == 3:                               # (2, H, W)
+            surface = F.interpolate(
+                surface.unsqueeze(0), size=(out_height, out_width),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0)
+        else:                                                # (T, 2, H, W)
+            surface = F.interpolate(
+                surface, size=(out_height, out_width),
+                mode="bilinear", align_corners=False,
+            )
         mask = F.interpolate(
             mask.unsqueeze(0).unsqueeze(0).float(),
             size=(out_height, out_width),

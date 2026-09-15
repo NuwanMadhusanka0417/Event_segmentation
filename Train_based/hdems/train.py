@@ -39,6 +39,7 @@ def build_dataset(cfg: dict, split: str | None = None):
             decay=cfg.get("time_surface", {}).get("decay", 0.8),
             remap_mask=ds_cfg.get("remap_mask", True),
             use_classical_fallback=ds_cfg.get("use_classical_fallback", True),
+            time_frames=ds_cfg.get("time_frames"),
         )
     raise ValueError(f"Unknown dataset: {name}")
 

@@ -51,6 +51,7 @@ def main() -> None:
     decay = cfg.get("time_surface", {}).get("decay", 0.8)
     remap = ds.get("remap_mask", True)
     fallback = ds.get("use_classical_fallback", True)
+    time_fracs = ds.get("time_frames")
 
     for split in args.splits:
         index = build_sample_index(root, split)
@@ -69,6 +70,7 @@ def main() -> None:
                 out_height=height, out_width=width,
                 window_s=window_s, decay=decay,
                 remap_mask=remap, use_classical_fallback=fallback,
+                time_fracs=time_fracs,
             )
             out_path = out_dir / f"{seq_dir.name}_{fi:06d}.pt"
             torch.save({"surface": sample["surface"], "mask": sample["mask"]}, out_path)

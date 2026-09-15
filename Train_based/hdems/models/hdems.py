@@ -12,6 +12,7 @@ from hdems.models.decoder import FlowDecoder
 from hdems.models.encoder import VSAEncoder
 from hdems.models.matching import HierarchicalMatcher
 from hdems.models.motion import decode_flow, ego_residual
+from hdems.models.paper_flow import flow_from_cost, multiscale_cost_volume
 from hdems.models.segmentation import MotionSegHead, SegmentationHead
 from hdems.ridge_head import RidgeHead
 from hdems.vsa.temporal import bind_trajectory, make_time_phases
@@ -74,6 +75,10 @@ class HDEMS(nn.Module):
         # motion-head decode params
         self.flow_beta = float(seg.get("flow_beta", 1.0))
         self.ego_iters = int(seg.get("ego_iters", 3))
+        # paper two-time / multi-scale cost-volume params
+        self.match_scales = tuple(match.get("scales", [0, 1, 2]))
+        self.flow_alpha = float(match.get("alpha", 0.3))
+        self.vel_scale = float(match.get("vel_scale", 1.0))
         self.pyramid_levels = match.get("pyramid_levels", 4)
         self.temporal_window = temp.get("window", 8)
         self.register_buffer("time_phases", make_time_phases(d))
@@ -82,34 +87,52 @@ class HDEMS(nn.Module):
         pyr_surfaces = build_pyramid(surface, self.pyramid_levels)
         return [self.encoder(s.unsqueeze(0) if s.dim() == 3 else s) for s in pyr_surfaces]
 
+    def encode_times(self, surfaces: torch.Tensor) -> list[torch.Tensor]:
+        """Encode each time-frame of a multi-time stack (B, T, 2, H, W) -> [F_t]."""
+        return [self.encoder(surfaces[:, t]) for t in range(surfaces.shape[1])]
+
     def forward(
         self,
         surface: torch.Tensor,
         *,
         task: str = "flow",
     ) -> dict[str, torch.Tensor]:
-        if surface.dim() == 3:
+        if surface.dim() == 3:                       # (2, H, W) -> (1, 2, H, W)
             surface = surface.unsqueeze(0)
+        multitime = surface.dim() == 5              # (B, T, 2, H, W)
 
+        outputs: dict[str, torch.Tensor] = {}
+
+        # ---- paper two-time / multi-scale motion path -----------------------
+        if task == "segmentation" and self.head_type == "motion" and multitime:
+            fields = self.encode_times(surface)                      # [F0, F1, F2, F4]
+            cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
+            flow = flow_from_cost(cost, self.matcher.M,
+                                  alpha=self.flow_alpha, vel_scale=self.vel_scale)
+            residual, mag = ego_residual(flow, iters=self.ego_iters)
+            motion = torch.cat([residual, mag], dim=1)
+            phi = self.matcher([fields[0]])[0]                       # HV context (reference)
+            outputs["flow"] = flow
+            outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface[:, -1])
+            return outputs
+
+        # ---- single-time paths (fall back to the last frame if a stack) -----
+        if multitime:
+            surface = surface[:, -1]
         f = self.encoder(surface)
         phi = self.matcher([f])[0]
 
-        outputs: dict[str, torch.Tensor] = {}
         if task != "segmentation":
             outputs["flow"] = self.decoder(phi)
-        if task == "segmentation":
-            if self.head_type == "motion":
-                # Phase 1: decode velocity from Phi; Phase 3: ego-compensate.
-                flow = decode_flow(
-                    f, phi, self.matcher.phx, self.matcher.phy,
-                    M=self.matcher.M, beta=self.flow_beta,
-                )
-                residual, mag = ego_residual(flow, iters=self.ego_iters)
-                motion = torch.cat([residual, mag], dim=1)
-                outputs["flow"] = flow
-                outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface)
-            else:
-                outputs["seg_logits"] = self.seg_head(phi, surface=surface)
+        elif self.head_type == "motion":
+            flow = decode_flow(f, phi, self.matcher.phx, self.matcher.phy,
+                               M=self.matcher.M, beta=self.flow_beta)
+            residual, mag = ego_residual(flow, iters=self.ego_iters)
+            motion = torch.cat([residual, mag], dim=1)
+            outputs["flow"] = flow
+            outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface)
+        else:
+            outputs["seg_logits"] = self.seg_head(phi, surface=surface)
         return outputs
 
     def bind_temporal(

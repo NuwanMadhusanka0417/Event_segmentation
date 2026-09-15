@@ -40,6 +40,7 @@ class EVIMODataset(Dataset):
         decay: float = 0.8,
         remap_mask: bool = True,
         use_classical_fallback: bool = True,
+        time_frames: list[float] | None = None,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -50,6 +51,7 @@ class EVIMODataset(Dataset):
         self.decay = decay
         self.remap_mask = remap_mask
         self.use_classical_fallback = use_classical_fallback
+        self.time_frames = time_frames or None  # [] -> None (single-time)
 
         self.cached: list[Path] = find_cached_samples(self.root, split)
         self.index: list[tuple[Path, int]] = (
@@ -81,4 +83,5 @@ class EVIMODataset(Dataset):
             decay=self.decay,
             remap_mask=self.remap_mask,
             use_classical_fallback=self.use_classical_fallback,
+            time_fracs=self.time_frames,
         )
