@@ -44,3 +44,8 @@ class MotionCodebook:
         mx = fpe(self.phases_mx, self.quantize(vx))
         my = fpe(self.phases_my, self.quantize(vy))
         return bind(bind(event_hv, mx), my)
+
+    def to(self, device: torch.device) -> "MotionCodebook":
+        self.phases_mx = self.phases_mx.to(device)
+        self.phases_my = self.phases_my.to(device)
+        return self

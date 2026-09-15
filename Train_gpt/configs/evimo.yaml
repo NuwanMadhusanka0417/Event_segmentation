@@ -1,11 +1,17 @@
 # EVIMO2 motion segmentation — primary experiment config
 
+runtime:
+  device: cpu
+
 dataset:
   name: evimo
   root: ../Data/EVIMO2
   split: train
   eval_split: eval
   event_masked_evaluation: true
+  sequence_index: 0
+  max_train_frames: 20
+  max_eval_frames: 10
 
 events:
   window_ms: 50

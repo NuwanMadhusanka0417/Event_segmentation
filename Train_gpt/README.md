@@ -11,7 +11,7 @@ Event stream → time surface → frozen multi-scale VSA encoder → hypervector
   → region growing / DBSCAN → local VSA refinement → temporal segment IDs → metrics
 ```
 
-See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for how this relates to existing code under `Train_based/` and `GVFA/`.
+See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for design notes and relation to other folders in the repo.
 
 ## Installation
 
@@ -19,6 +19,8 @@ See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for how this relates to exi
 cd Train_gpt
 pip install -r requirements.txt
 ```
+
+Use a **CUDA-enabled PyTorch** wheel if you want GPU acceleration (`pip install torch` matching your CUDA version from [pytorch.org](https://pytorch.org)).
 
 ## Dataset (EVIMO2)
 
@@ -31,44 +33,106 @@ dataset:
   eval_split: eval
 ```
 
-- Training data: `Data/EVIMO2/train`
-- Evaluation: add sequences under `Data/EVIMO2/eval` (same layout as train)
+- Training data: `Data/EVIMO2/train/<sequence>/`
+- Evaluation: `Data/EVIMO2/eval/<sequence>/` (same file layout as train)
 
-## Commands
+Each sequence folder needs `dataset_events_*.npy`, `dataset_mask.npz`, and `dataset_info.npz`.
 
-**Train static/dynamic prototypes** (uses instance masks as weak motion proxy until motion GT is wired):
+## Quick start (CPU)
 
 ```bash
+# 1) Prototypes from train split (limited frames by default)
 python scripts/train_prototypes.py --config configs/evimo.yaml --output checkpoints/prototypes.pt
+
+# 2) Segment one sequence
+python scripts/segment_sequence.py --config configs/evimo.yaml --input ../Data/EVIMO2 --output outputs/evimo_vsa_motionseg
+
+# 3) Evaluate on eval split
+python scripts/evaluate.py --config configs/evimo.yaml --split eval
 ```
 
-**Run segmentation on a sequence:**
+## Running with CUDA
+
+GPU accelerates **VSA encoding**, **cost-volume flow**, and **prototype readout**. **Clustering, refinement, and temporal matching stay on CPU** (SciKit-learn / SciPy / Python loops).
+
+### Check GPU
 
 ```bash
+python -c "import torch; print('cuda:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a')"
+```
+
+On **Gadi**, request a GPU node and load CUDA first — see [`../GADI_CUDA_README.md`](../GADI_CUDA_README.md) for `qsub`, `module load cuda`, and venv activation (adjust paths to `Train_gpt` instead of `Train_based`).
+
+### Option A — CLI (overrides config)
+
+```bash
+python scripts/train_prototypes.py --config configs/evimo.yaml --device cuda --max-frames 10
+
+python scripts/segment_sequence.py --config configs/evimo.yaml --input ../Data/EVIMO2 --output outputs/evimo_vsa_cuda --device cuda
+
+python scripts/evaluate.py --config configs/evimo.yaml --split eval --device cuda --max-frames 15
+```
+
+Use `cuda:0`, `cuda:1`, etc. if you have multiple GPUs. If CUDA is unavailable, the pipeline **falls back to CPU** automatically.
+
+### Option B — config file
+
+In `configs/evimo.yaml` or `configs/default.yaml`:
+
+```yaml
+runtime:
+  device: cuda
+```
+
+Scripts print `Device: cuda:0` (or `cpu`) at startup.
+
+## Limiting training and testing samples
+
+Limits apply to **frames** (timestamps) from **one sequence folder**, not to individual event pixels.
+
+| Setting | Config key | CLI flag | Default (from merged config) |
+|--------|------------|----------|------------------------------|
+| Prototype training | `dataset.max_train_frames` | `--max-frames` | 20 |
+| Evaluation | `dataset.max_eval_frames` | `--max-frames` | 10 |
+| Segmentation / inference | `dataset.max_infer_frames` | `--max-frames` | all frames (`null`) |
+| Which sequence | `dataset.sequence_index` | `--sequence` | 0 (first sorted folder under split) |
+
+**Examples — small smoke runs:**
+
+```bash
+# Train prototypes on 5 frames from sequence 0
+python scripts/train_prototypes.py --max-frames 5 --sequence 0
+
+# Eval on 8 frames from eval split, sequence 1
+python scripts/evaluate.py --split eval --max-frames 8 --sequence 1
+
+# Segment only 30 frames with CUDA
 python scripts/segment_sequence.py \
-  --config configs/evimo.yaml \
-  --input ../Data/EVIMO2 \
-  --output outputs/evimo_vsa_motionseg
+  --output outputs/smoke \
+  --max-frames 30 \
+  --device cuda
 ```
 
-**Evaluate** (event-masked IoU/F1/boundary/temporal stability when GT exists):
+**Notes:**
 
-```bash
-python scripts/evaluate.py --config configs/evimo.yaml --split eval --max-frames 20
-```
+- `--max-frames` on the command line **overrides** the YAML defaults.
+- Prototype training pools **all active event pixels** from those frames; there is no separate pixel cap.
+- Frames without instance masks are skipped for training metrics but still run through the pipeline where applicable.
 
-**Tests (synthetic + unit):**
+## Tests
 
 ```bash
 pytest tests/ -q
 ```
 
+Tests always use CPU-friendly settings in code; they do not require a GPU.
+
 ## Configuration
 
-- `configs/default.yaml` — full parameter surface
-- `configs/evimo.yaml` — EVIMO2 experiment (D=512, rank=16, aligned with existing seg config)
+- `configs/default.yaml` — full parameter surface (`runtime.device`, frame caps, VSA, flow, clustering)
+- `configs/evimo.yaml` — EVIMO2 experiment (D=512, rank=16)
 
-Important knobs: `vsa.dimension`, `flow.search_radius`, `events.window_ms`, `ego_motion.mode`, `clustering.method`, `classifier.type`.
+Important knobs: `runtime.device`, `dataset.max_*_frames`, `vsa.dimension`, `flow.search_radius`, `events.window_ms`, `clustering.method`.
 
 ## Reproducibility
 
@@ -86,7 +150,7 @@ VSA kernels and role vectors are saved under `checkpoints/vsa_artifacts/` when `
 
 ## Computational notes
 
-The pipeline targets **CPU** (PyTorch CPU tensors). Runtime per stage is printed in `benchmark` output. Real-time performance is **not** claimed until you benchmark on your hardware.
+Default **CPU** execution is supported everywhere. With **`runtime.device: cuda`**, expect the largest speedups on encoding and cost-volume stages; end-to-end time still includes CPU clustering. Per-stage timings are printed in each result’s `benchmark` field. Real-time performance is **not** claimed until you benchmark on your hardware.
 
 ## Optional / future
 

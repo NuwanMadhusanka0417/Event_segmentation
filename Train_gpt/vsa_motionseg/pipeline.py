@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from vsa_motionseg.config import resolve_device
 from vsa_motionseg.data.evimo_adapter import EVIMO2Adapter
 from vsa_motionseg.data.time_surface import TimeSurfaceBuilder, events_window
 from vsa_motionseg.evaluation.benchmark import StageTimer
@@ -25,6 +26,7 @@ from vsa_motionseg.vsa.motion_codebook import MotionCodebook
 class VSAMotionSegPipeline:
     def __init__(self, cfg: dict[str, Any]) -> None:
         self.cfg = cfg
+        self.device = resolve_device(cfg.get("runtime", {}).get("device", "cpu"))
         vsa = cfg["vsa"]
         self.encoder = MultiScaleVSAEncoder(
             d=int(vsa["dimension"]),
@@ -36,12 +38,17 @@ class VSAMotionSegPipeline:
             representation=str(vsa.get("representation", "real")),
             artifact_dir=vsa.get("artifact_dir"),
         )
+        self.encoder.to(self.device)
         self.encoder.eval()
         self.codebook = MotionCodebook(d=int(vsa["dimension"]), seed=int(vsa.get("seed", 42)))
+        self.codebook.to(self.device)
         self.classifier = DynamicClassifier()
         proto_path = cfg.get("classifier", {}).get("prototype_path")
         if proto_path and Path(proto_path).exists():
-            self.classifier = DynamicClassifier.from_file(proto_path)
+            from vsa_motionseg.vsa.prototypes import load_prototypes
+
+            protos = load_prototypes(proto_path).to(self.device)
+            self.classifier = DynamicClassifier(protos)
         t_cfg = cfg.get("temporal", {})
         self.tracker = TemporalTracker(
             max_track_gap=int(t_cfg.get("max_track_gap", 3)),
@@ -80,9 +87,9 @@ class VSAMotionSegPipeline:
 
         pack0 = timer.run("Time-surface construction", lambda: _ts(t0, t_mid))
         pack1 = timer.run("Time-surface t1", lambda: _ts(t_mid, t_end))
-        s0 = pack0["surface"].unsqueeze(0)
-        s1 = pack1["surface"].unsqueeze(0)
-        active = pack1["active_mask"] | pack0["active_mask"]
+        s0 = pack0["surface"].unsqueeze(0).to(self.device)
+        s1 = pack1["surface"].unsqueeze(0).to(self.device)
+        active = (pack1["active_mask"] | pack0["active_mask"]).to(self.device)
 
         F0 = timer.run("VSA encoding t0", lambda: self.encoder(s0))
         F1 = timer.run("VSA encoding t1", lambda: self.encoder(s1))
@@ -118,8 +125,8 @@ class VSAMotionSegPipeline:
         my = fpe(self.codebook.phases_my, self.codebook.quantize(res[1]))
         Q = bind(bind(F_hw, mx), my).permute(2, 0, 1)
 
-        dynamic = torch.zeros(H, W, dtype=torch.bool)
-        conf_map = torch.zeros(H, W)
+        dynamic = torch.zeros(H, W, dtype=torch.bool, device=self.device)
+        conf_map = torch.zeros(H, W, device=self.device)
         if self.classifier.prototypes is not None:
             flat = Q.reshape(d, -1).T
             pred, conf = self.classifier.predict(
@@ -131,16 +138,22 @@ class VSAMotionSegPipeline:
             dynamic = active & (res.norm(dim=0) > 0.05)
             conf_map = flow_out["max_prob"][0]
 
+        res_cpu = res.detach().cpu()
+        F1_cpu = F1[0].detach().cpu()
+        dynamic_cpu = dynamic.detach().cpu()
+        Q_cpu = Q.detach().cpu()
+        conf_cpu = conf_map.detach().cpu()
+
         cl_cfg = self.cfg.get("clustering", {})
         method = cl_cfg.get("method", "region_growing")
 
         def _cluster():
             if method == "dbscan":
-                return dbscan_segments(dynamic, res, F1[0], cl_cfg)
+                return dbscan_segments(dynamic_cpu, res_cpu, F1_cpu, cl_cfg)
             return region_growing(
-                dynamic,
-                res,
-                F1[0],
+                dynamic_cpu,
+                res_cpu,
+                F1_cpu,
                 flow_threshold=float(cl_cfg.get("flow_threshold", 2.0)),
                 hv_threshold=float(cl_cfg.get("hv_similarity_threshold", 0.3)),
                 neighborhood=int(cl_cfg.get("neighborhood", 8)),
@@ -151,12 +164,12 @@ class VSAMotionSegPipeline:
 
         ref_cfg = self.cfg.get("refinement", {})
         if ref_cfg.get("enabled", True):
-            Q = timer.run(
+            Q_cpu = timer.run(
                 "Local VSA refinement",
                 lambda: local_vsa_refinement(
-                    Q,
-                    res,
-                    conf_map,
+                    Q_cpu,
+                    res_cpu,
+                    conf_cpu,
                     lambda_bundle=float(ref_cfg.get("lambda_bundle", 0.2)),
                     sigma_flow=float(ref_cfg.get("sigma_flow", 2.0)),
                     sigma_hv=float(ref_cfg.get("sigma_hv", 0.3)),
@@ -164,21 +177,22 @@ class VSAMotionSegPipeline:
                 ),
             )
 
-        segs = segment_summary(labels, Q, res, conf_map)
+        segs = segment_summary(labels, Q_cpu, res_cpu, conf_cpu)
         track_map = self.tracker.update(segs, 0) if self.cfg.get("temporal", {}).get("enabled", True) else {}
 
         return {
-            "event_hypervector": F1[0],
-            "motion_hypervector": Q,
-            "residual_flow": res,
-            "motion_confidence": conf_map,
+            "event_hypervector": F1_cpu,
+            "motion_hypervector": Q_cpu,
+            "residual_flow": res_cpu,
+            "motion_confidence": conf_cpu,
             "event_count": pack1["event_count"],
-            "active_mask": active,
-            "dynamic_mask": dynamic,
+            "active_mask": active.cpu(),
+            "dynamic_mask": dynamic_cpu,
             "segment_labels": labels,
             "track_map": track_map,
-            "optical_flow": optical,
+            "optical_flow": optical.detach().cpu(),
             "benchmark": timer.report.format(),
+            "device": str(self.device),
         }
 
     def run_sequence(self, adapter: EVIMO2Adapter, max_frames: int | None = None) -> list[dict]:

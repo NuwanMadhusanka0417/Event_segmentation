@@ -12,7 +12,8 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from vsa_motionseg.config import load_config
+from vsa_motionseg.cli_helpers import apply_device_override, resolve_max_frames
+from vsa_motionseg.config import load_config, resolve_device
 from vsa_motionseg.data.evimo_adapter import EVIMO2Adapter
 from vsa_motionseg.pipeline import VSAMotionSegPipeline
 from vsa_motionseg.vsa.prototypes import save_prototypes, train_prototypes
@@ -27,16 +28,24 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", default=str(ROOT / "configs" / "evimo.yaml"))
     p.add_argument("--output", default=str(ROOT / "checkpoints" / "prototypes.pt"))
-    p.add_argument("--max-frames", type=int, default=20)
+    p.add_argument("--max-frames", type=int, default=None, help="Cap frames (see dataset.max_train_frames in config)")
+    p.add_argument("--sequence", type=int, default=None, help="Sequence index under split (default: dataset.sequence_index)")
+    p.add_argument("--device", type=str, default=None, help="cpu | cuda | cuda:0 (overrides runtime.device)")
     args = p.parse_args()
 
     cfg = load_config(args.config)
-    adapter = EVIMO2Adapter(cfg["dataset"]["root"], split=cfg["dataset"]["split"])
+    apply_device_override(cfg, args.device)
+    max_frames = resolve_max_frames(args.max_frames, cfg, "max_train_frames", 20)
+    seq = args.sequence
+    if seq is None:
+        seq = int(cfg.get("dataset", {}).get("sequence_index", 0))
+    adapter = EVIMO2Adapter(cfg["dataset"]["root"], split=cfg["dataset"]["split"], sequence=seq)
     pipe = VSAMotionSegPipeline(cfg)
+    print(f"Device: {resolve_device(cfg.get('runtime', {}).get('device', 'cpu'))}")
 
     Q_all = []
     y_all = []
-    for i in range(min(len(adapter), args.max_frames)):
+    for i in range(min(len(adapter), max_frames)):
         fr = adapter.get_frame(i)
         if fr.instance_masks is None:
             continue

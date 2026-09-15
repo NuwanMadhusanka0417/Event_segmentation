@@ -1,1 +1,0 @@
-"""HD-EMS model components."""

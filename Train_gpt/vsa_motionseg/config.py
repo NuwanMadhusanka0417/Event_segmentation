@@ -7,6 +7,19 @@ from typing import Any
 
 import yaml
 
+import torch
+
+
+def resolve_device(spec: str | None = None) -> torch.device:
+    """Map config/CLI device string to ``torch.device`` (falls back to CPU)."""
+    if not spec or spec == "cpu":
+        return torch.device("cpu")
+    if spec.startswith("cuda"):
+        if torch.cuda.is_available():
+            return torch.device(spec)
+        return torch.device("cpu")
+    return torch.device(spec)
+
 
 def load_config(path: str | Path) -> dict[str, Any]:
     path = Path(path)

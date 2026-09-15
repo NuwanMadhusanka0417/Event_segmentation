@@ -1,9 +1,16 @@
+runtime:
+  device: cpu   # cpu | cuda | cuda:0 — clustering/tracking stay on CPU
+
 dataset:
   name: evimo
   root: ../Data/EVIMO2
   split: train
   eval_split: eval
   event_masked_evaluation: true
+  sequence_index: 0      # which scene folder under split/ (sorted)
+  max_train_frames: 20   # prototype training default (override with --max-frames)
+  max_eval_frames: 10    # evaluation default
+  max_infer_frames: null # segmentation: null = all frames in sequence
 
 events:
   window_ms: 50
