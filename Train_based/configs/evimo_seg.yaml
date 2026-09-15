@@ -34,10 +34,12 @@ train:
   lr: 1.0e-4
   num_workers: 8
   use_dice: true          # add Dice to CE (background/foreground imbalance)
+  # max_samples: 100      # optional: train on first N frames (or CLI --max-samples)
 
 eval:
   metrics: [iou, miou]
   split: eval
+  # max_samples: 20       # optional: eval on first N frames (or CLI --max-samples)
 
 segmentation:
   head: motion          # motion | cnn | ridge

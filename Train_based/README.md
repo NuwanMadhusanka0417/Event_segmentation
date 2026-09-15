@@ -101,6 +101,22 @@ python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/la
   --device cuda --save-images eval_out --max-images 50
 ```
 
+### Quick smoke run (limit sample count)
+
+`--max-samples N` restricts training/eval to the first N frames — handy for a
+fast end-to-end check before a full run. Works for all heads and for cached or
+raw datasets; the CLI flag overrides `train.max_samples` / `eval.max_samples`
+in the config.
+
+```bash
+python -m hdems.train --config configs/evimo_seg.yaml --device cuda --max-samples 100
+python -m hdems.eval  --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt \
+  --device cuda --save-images eval_out --max-samples 20
+```
+
+`--max-samples` limits how many **frames** are used; `--max-images` only caps how
+many eval **PNG panels** are written.
+
 **⚠️ Rebuild the cache when you change `dataset` or `time_frames`.** The `.pt`
 shards bake in resolution and the multi-time stack. After changing
 `height/width/window_ms/time_frames/decay`, delete and rebuild:
@@ -123,6 +139,7 @@ python scripts/prepare_evimo.py --config configs/evimo_seg.yaml
 | `dataset.height/width` | working resolution (240×320) |
 | `segmentation.head` | `motion` (default) · `cnn` · `ridge` |
 | `train.use_dice` | add Dice to CE for class imbalance (true) |
+| `train.max_samples` / `eval.max_samples` | cap to first N frames (or CLI `--max-samples`) |
 
 Set `segmentation.head: motion` for the paper motion pipeline (default), `cnn`
 for the raw-HV baseline, or `ridge` for the closed-form readout.

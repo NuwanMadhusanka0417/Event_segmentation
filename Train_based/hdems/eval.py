@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from hdems.data.dsec import DSECDataset
 from hdems.data.evimo import EVIMODataset
@@ -186,6 +186,8 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save-images", type=str, default=None)
     parser.add_argument("--max-images", type=int, default=50)
+    parser.add_argument("--max-samples", type=int, default=None,
+                        help="Evaluate on only the first N dataset frames (smoke test).")
     parser.add_argument("--compare-heads", action="store_true",
                         help="Run CNN and Ridge on same loader; write compare panels")
     args = parser.parse_args()
@@ -216,7 +218,12 @@ def main() -> None:
         dataset = build_dataset(cfg, split=eval_split)
         if len(dataset) == 0:
             raise FileNotFoundError("Eval dataset is empty")
-        print(f"Eval samples ({eval_split}): {len(dataset)}")
+        n_full = len(dataset)
+        max_n = args.max_samples or cfg.get("eval", {}).get("max_samples")
+        if max_n is not None and 0 < max_n < n_full:
+            dataset = Subset(dataset, list(range(max_n)))
+        print(f"Eval samples ({eval_split}): {len(dataset)}"
+              + (f" (of {n_full})" if len(dataset) != n_full else ""))
         loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
         if task != "segmentation":
