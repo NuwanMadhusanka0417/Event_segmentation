@@ -63,25 +63,49 @@ python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/be
 
 # Metrics + comparison panels (events | GT | prediction) under eval_out/
 python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt \
-  --head cnn --device cuda --save-images eval_out --max-images 200
+  --head cnn --device cuda --save-images eval_out_linear_basic --max-images 200
 ```
 
 With `--save-images`, each file is a 3-panel PNG (`eval_00000.png`, …). Default `--max-images` is 50.
 
 ### Ridge readout (closed-form, no backprop)
 
-```bash
-python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --out checkpoints/ridge_head.pt
+Ridge is **not** trained with `hdems.train`. Fit a linear readout on frozen VSA features with `fit_ridge_head.py` (writes `checkpoints/ridge_head.pt`; picks `alpha` on the eval split from config).
 
+**Fit (“training”)**:
+
+```bash
+# CPU (typical on Gadi)
+python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --out checkpoints/ridge_head.pt --device cpu
+
+# GPU — faster feature extraction (optional)
+python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --out checkpoints/ridge_head.pt --device cuda
+```
+
+**Evaluation** — same metrics as CNN; PNGs only with `--save-images`:
+
+```bash
+# Metrics only
 CUDA_VISIBLE_DEVICES="" python -m hdems.eval --config configs/evimo_seg.yaml \
   --head ridge --ridge-checkpoint checkpoints/ridge_head.pt --device cpu
 
-# Side-by-side CNN vs Ridge metrics + panels
-python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/best.pt \
-  --compare-heads --ridge-checkpoint checkpoints/ridge_head.pt --save-images output/ridge_compare
+# Metrics + panels under eval_out_ridge/
+python -m hdems.eval --config configs/evimo_seg.yaml \
+  --head ridge --ridge-checkpoint checkpoints/ridge_head.pt --device cpu \
+  --save-images eval_out_ridge --max-images 200
 ```
 
-Set `segmentation.head: ridge` in `configs/evimo_seg.yaml` to make ridge the default eval head.
+On a GPU node, use `--device cuda` instead of `CUDA_VISIBLE_DEVICES=""` and `--device cpu`.
+
+**Compare CNN vs Ridge** (`--checkpoint` loads CNN weights; ridge uses `ridge_head.pt`):
+
+```bash
+python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/best.pt \
+  --compare-heads --ridge-checkpoint checkpoints/ridge_head.pt \
+  --save-images output/ridge_compare --device cuda
+```
+
+Set `segmentation.head: ridge` in `configs/evimo_seg.yaml` to make ridge the default eval head (still pass `--ridge-checkpoint` or set `segmentation.ridge_weights`).
 See `docs/RIDGE_RESULTS.md` for the supervisor-facing metrics table.
 
 
