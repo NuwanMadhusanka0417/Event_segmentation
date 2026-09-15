@@ -47,8 +47,18 @@ Config: `configs/evimo_seg.yaml` → `dataset.root: ../Data/EVIMO2`
 ```bash
 source scripts/nci_env.sh
 python -m hdems.train --config configs/evimo_seg.yaml --device cuda
-python -m hdems.eval  --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt --save-images eval_out --max-images 50
+
+# Eval metrics + PNG panels (events | GT | prediction)
+python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt \
+  --device cuda --save-images eval_out --max-images 50
 ```
+
+Eval image options (all segmentation eval commands):
+
+- `--save-images <dir>` — output folder for `eval_00000.png`, … (created if missing). Omit to skip PNGs.
+- `--max-images N` — cap how many panels to write (default `50`).
+
+Use a scratch path on Gadi if quota is tight, e.g. `--save-images /scratch/mi23/nuwan/eval_out`.
 
 ### Ridge readout (closed-form, no backprop)
 
@@ -59,12 +69,14 @@ python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --out checkpoin
 python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --device cuda \
   --max-train-samples 30 --max-val-samples 10 --out checkpoints/ridge_smoke.pt
 
-CUDA_VISIBLE_DEVICES="" python -m hdems.eval --config configs/evimo_seg.yaml \
-  --head ridge --ridge-checkpoint checkpoints/ridge_head.pt --device cpu
+python -m hdems.eval --config configs/evimo_seg.yaml --head ridge \
+  --ridge-checkpoint checkpoints/ridge_head.pt --device cuda \
+  --save-images eval_out/ridge --max-images 50
 
-# Side-by-side CNN vs Ridge metrics + panels
+# Side-by-side CNN vs Ridge metrics + panels → <dir>/cnn/ and <dir>/ridge/
 python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/best.pt \
-  --compare-heads --ridge-checkpoint checkpoints/ridge_head.pt --save-images output/ridge_compare
+  --compare-heads --ridge-checkpoint checkpoints/ridge_head.pt --device cuda \
+  --save-images output/ridge_compare --max-images 50
 ```
 
 Set `segmentation.head: ridge` in `configs/evimo_seg.yaml` to make ridge the default eval head.

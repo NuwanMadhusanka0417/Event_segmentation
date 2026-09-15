@@ -4,6 +4,11 @@ HD-EMS training needs a **GPU node** and `--device cuda`. A CPU-only `qsub` (no 
 
 ## 1. Request an interactive GPU session
 
+```bash
+qsub -I -q normal -l ncpus=12,mem=64GB,walltime=24:00:00 -P mi23 -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+```
+
+
 **V100 (gpuvolta):**
 
 ```bash
