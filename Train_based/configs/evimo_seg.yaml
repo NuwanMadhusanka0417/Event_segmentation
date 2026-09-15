@@ -54,6 +54,8 @@ ridge:
   bg_subsample_ratio: 0.2
   val_split: eval
   alphas: [1.0e-3, 1.0e-1, 1.0, 10.0, 100.0]
+  # max_train_samples: 50   # optional smoke cap (first N frames)
+  # max_val_samples: 10
 
 time_surface:
   decay: 0.8

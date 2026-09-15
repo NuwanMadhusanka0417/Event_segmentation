@@ -55,6 +55,10 @@ python -m hdems.eval  --config configs/evimo_seg.yaml --checkpoint checkpoints/l
 ```bash
 python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --out checkpoints/ridge_head.pt
 
+# Fast smoke run (first N frames only; also set ridge.alphas: [1.0] in yaml)
+python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --device cuda \
+  --max-train-samples 30 --max-val-samples 10 --out checkpoints/ridge_smoke.pt
+
 CUDA_VISIBLE_DEVICES="" python -m hdems.eval --config configs/evimo_seg.yaml \
   --head ridge --ridge-checkpoint checkpoints/ridge_head.pt --device cpu
 

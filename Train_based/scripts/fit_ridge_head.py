@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -27,6 +27,12 @@ from hdems.ridge_fit import (
 )
 from hdems.ridge_head import RidgeHead
 from hdems.feature_extract import extract_phi
+
+
+def _cap_dataset(ds, max_samples: int | None):
+    if max_samples is None or max_samples <= 0 or max_samples >= len(ds):
+        return ds
+    return Subset(ds, list(range(max_samples)))
 
 
 @torch.no_grad()
@@ -82,6 +88,18 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--backend", choices=["streaming", "sklearn"], default=None)
+    ap.add_argument(
+        "--max-train-samples",
+        type=int,
+        default=None,
+        help="Use only the first N train frames (smoke tests). Overrides ridge.max_train_samples.",
+    )
+    ap.add_argument(
+        "--max-val-samples",
+        type=int,
+        default=None,
+        help="Use only the first N val frames for lambda selection. Overrides ridge.max_val_samples.",
+    )
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -106,8 +124,25 @@ def main() -> None:
     train_ds = build_dataset(cfg, split=cfg.get("dataset", {}).get("split", "train"))
     val_split = ridge_cfg.get("val_split", "eval")
     val_ds = build_dataset(cfg, split=val_split)
+
+    max_train = args.max_train_samples
+    if max_train is None:
+        max_train = ridge_cfg.get("max_train_samples")
+    max_val = args.max_val_samples
+    if max_val is None:
+        max_val = ridge_cfg.get("max_val_samples")
+
+    n_train_full = len(train_ds)
+    n_val_full = len(val_ds)
+    train_ds = _cap_dataset(train_ds, max_train)
+    val_ds = _cap_dataset(val_ds, max_val)
     if len(train_ds) == 0:
         raise SystemExit("Train dataset empty — check dataset.root")
+    if max_train or max_val:
+        print(
+            f"[ridge] sample cap: train {len(train_ds)}/{n_train_full}  "
+            f"val {len(val_ds)}/{n_val_full}"
+        )
 
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=False, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)

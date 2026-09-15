@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from hdems.data.dsec import DSECDataset
 from hdems.data.evimo import EVIMODataset
@@ -82,6 +82,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train HD-EMS")
     parser.add_argument("--config", type=str, default="configs/base.yaml")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Train on only the first N dataset frames (smoke test).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -97,7 +103,11 @@ def main() -> None:
         dataset = build_dataset(cfg)
         if len(dataset) == 0:
             raise FileNotFoundError("Dataset is empty")
-        print(f"Training samples: {len(dataset)}")
+        n_full = len(dataset)
+        max_n = args.max_samples or train_cfg.get("max_samples")
+        if max_n is not None and 0 < max_n < n_full:
+            dataset = Subset(dataset, list(range(max_n)))
+        print(f"Training samples: {len(dataset)}" + (f" (of {n_full})" if len(dataset) != n_full else ""))
         loader = DataLoader(
             dataset,
             batch_size=train_cfg.get("batch_size", 4),
