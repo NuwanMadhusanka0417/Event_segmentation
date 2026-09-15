@@ -22,3 +22,17 @@ def resolve_max_frames(
     if config_key in ds and ds[config_key] is not None:
         return int(ds[config_key])
     return default
+
+
+def resolve_max_samples(
+    cli_value: int | None,
+    cfg: dict[str, Any],
+    config_key: str = "max_train_samples",
+) -> int | None:
+    if cli_value is not None:
+        return cli_value if cli_value > 0 else None
+    ds = cfg.get("dataset", {})
+    if config_key in ds and ds[config_key] is not None:
+        v = int(ds[config_key])
+        return v if v > 0 else None
+    return None

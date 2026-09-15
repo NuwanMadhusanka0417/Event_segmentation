@@ -92,7 +92,8 @@ Limits apply to **frames** (timestamps) from **one sequence folder**, not to ind
 
 | Setting | Config key | CLI flag | Default (from merged config) |
 |--------|------------|----------|------------------------------|
-| Prototype training | `dataset.max_train_frames` | `--max-frames` | 20 |
+| Prototype training (frames) | `dataset.max_train_frames` | `--max-frames` | 20 |
+| Prototype training (pixels) | `dataset.max_train_samples` | `--max-samples` | unlimited (`null`) |
 | Evaluation | `dataset.max_eval_frames` | `--max-frames` | 10 |
 | Segmentation / inference | `dataset.max_infer_frames` | `--max-frames` | all frames (`null`) |
 | Which sequence | `dataset.sequence_index` | `--sequence` | 0 (first sorted folder under split) |
@@ -102,6 +103,9 @@ Limits apply to **frames** (timestamps) from **one sequence folder**, not to ind
 ```bash
 # Train prototypes on 5 frames from sequence 0
 python scripts/train_prototypes.py --max-frames 5 --sequence 0
+
+# Cap pixel-level training rows (static/dynamic labels at active event pixels)
+python scripts/train_prototypes.py --max-samples 5000 --max-frames 20 --device cuda
 
 # Eval on 8 frames from eval split, sequence 1
 python scripts/evaluate.py --split eval --max-frames 8 --sequence 1
@@ -115,9 +119,9 @@ python scripts/segment_sequence.py \
 
 **Notes:**
 
-- `--max-frames` on the command line **overrides** the YAML defaults.
-- Prototype training pools **all active event pixels** from those frames; there is no separate pixel cap.
-- Frames without instance masks are skipped for training metrics but still run through the pipeline where applicable.
+- `--max-frames` limits **timestamps**; `--max-samples` limits **pixel rows** used for prototypes (stratified static/dynamic when class balancing is on).
+- With `--max-samples`, processing **stops early** once enough active pixels were collected (still at least one full frame).
+- Frames without instance masks are skipped for training.
 
 ## Tests
 

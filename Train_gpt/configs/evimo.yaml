@@ -11,6 +11,7 @@ dataset:
   event_masked_evaluation: true
   sequence_index: 0
   max_train_frames: 20
+  max_train_samples: null   # e.g. 5000 for fast smoke training
   max_eval_frames: 10
 
 events:

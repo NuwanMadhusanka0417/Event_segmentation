@@ -9,6 +9,7 @@ dataset:
   event_masked_evaluation: true
   sequence_index: 0      # which scene folder under split/ (sorted)
   max_train_frames: 20   # prototype training default (override with --max-frames)
+  max_train_samples: null  # cap pixel rows for prototypes (override with --max-samples)
   max_eval_frames: 10    # evaluation default
   max_infer_frames: null # segmentation: null = all frames in sequence
 
