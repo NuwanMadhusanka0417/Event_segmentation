@@ -13,9 +13,12 @@ from hdems.models.encoder import VSAEncoder
 from hdems.models.matching import HierarchicalMatcher
 from hdems.models.motion import decode_flow, ego_residual
 from hdems.models.paper_flow import flow_from_cost, multiscale_cost_volume
+from hdems.models.prototype_head import PrototypeHead
 from hdems.models.segmentation import MotionSegHead, SegmentationHead
 from hdems.ridge_head import RidgeHead
+from hdems.vsa.fpe import make_base_phases
 from hdems.vsa.temporal import bind_trajectory, make_time_phases
+from hdems.vsa.velocity import combine_event_velocity, encode_velocity
 
 
 class HDEMS(nn.Module):
@@ -64,6 +67,8 @@ class HDEMS(nn.Module):
                 num_classes=num_classes,
                 ctx_dim=seg.get("ctx_dim", 32),
             )
+        elif self.head_type == "prototype":
+            self.seg_head = PrototypeHead(num_classes)
         else:
             self.seg_head = SegmentationHead(
                 d=d,
@@ -79,6 +84,13 @@ class HDEMS(nn.Module):
         self.match_scales = tuple(match.get("scales", [0, 1, 2]))
         self.flow_alpha = float(match.get("alpha", 0.3))
         self.vel_scale = float(match.get("vel_scale", 1.0))
+        # velocity-hypervector combination (ridge / prototype heads)
+        vel = cfg.get("velocity", {})
+        self.vel_bw = float(vel.get("vel_bw", 6.0))
+        self.axis_combine = str(vel.get("axis_combine", "bind"))     # bind | bundle
+        self.event_combine = str(vel.get("event_combine", "bind"))   # bind | bundle | concat
+        self.register_buffer("phi_vx", make_base_phases(d, seed=7))
+        self.register_buffer("phi_vy", make_base_phases(d, seed=8))
         self.pyramid_levels = match.get("pyramid_levels", 4)
         self.temporal_window = temp.get("window", 8)
         self.register_buffer("time_phases", make_time_phases(d))
@@ -104,9 +116,12 @@ class HDEMS(nn.Module):
         cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
         flow = flow_from_cost(cost, self.matcher.M,
                               alpha=self.flow_alpha, vel_scale=self.vel_scale)
-        residual, mag = ego_residual(flow, iters=self.ego_iters)
+        residual, _mag = ego_residual(flow, iters=self.ego_iters)
         phi = self.matcher([fields[0]])[0]
-        feats = torch.cat([phi.real, phi.imag, residual, mag], dim=1).float()
+        # residual velocity -> hypervector (axis_combine), fused with Phi (event_combine)
+        mv = encode_velocity(residual[:, 0], residual[:, 1], self.phi_vx, self.phi_vy,
+                             vel_bw=self.vel_bw, axis_combine=self.axis_combine)
+        feats = combine_event_velocity(phi, mv, self.event_combine)
         return feats, flow
 
     def forward(
@@ -134,8 +149,8 @@ class HDEMS(nn.Module):
             outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface[:, -1])
             return outputs
 
-        # ---- paper front-end with a linear Ridge readout --------------------
-        if task == "segmentation" and self.head_type == "ridge" and multitime:
+        # ---- paper front-end with a linear Ridge / prototype readout --------
+        if task == "segmentation" and self.head_type in ("ridge", "prototype") and multitime:
             feats, flow = self.paper_features(surface)
             outputs["flow"] = flow
             outputs["seg_logits"] = self.seg_head.logits_from_features(feats)

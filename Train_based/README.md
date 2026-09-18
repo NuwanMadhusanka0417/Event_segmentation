@@ -8,23 +8,42 @@ ego-motion + segmentation stage.
 ## Pipeline
 
 ```
-events → multi-time surfaces → VFA HD descriptors (F0,F1,F2,F4)
-       → two-time multi-scale cost volume  (paper Eq. 10–11)
-       → probability-volume flow estimator (paper Eq. 12–14)
-       → ego-motion residual (robust affine, IRLS)
+events → multi-time surfaces (F0,F1,F2,F4)
+       → VFA HD descriptors        F = T ∗ K   (paper Eq. 4/6, FPE over positions)
+       → two-time multi-scale cost volume       (paper Eq. 10–11)
+       → probability-volume flow estimator      (paper Eq. 12–14)
+       → ego-motion residual velocity           (robust affine, IRLS)
+       → residual velocity → FPE hypervector, combined with the event field Φ
        → classifier → per-pixel object classes
 ```
 
-The classifier is chosen by `segmentation.head`:
+The whole VSA front-end (kernel, descriptors, cost volume, flow estimator,
+ego-fit) is **parameter-free**. Only the (optional) CNN heads train.
 
-- **`ridge`** (default) — a closed-form **linear** readout on
-  `[Φ | ego-residual velocity]`. **No backprop at all** — the whole pipeline is
-  parameter-free; fit it with `scripts/fit_ridge_head.py`.
-- **`motion`** — a small trained CNN on the same motion-primary features.
-- **`cnn`** — the raw-HV baseline (single-frame Φ only).
+## Heads (`segmentation.head`, or `--head`)
 
-Only the (optional) CNN head trains; the entire VSA front-end (kernel,
-descriptors, cost volume, flow estimator, ego-fit) is **parameter-free**.
+With `dataset.time_frames` set, all heads use the paper front-end.
+
+- **`prototype`** (default) — VSA nearest-centroid; class prototypes are the
+  normalized bundle of training features. **Parameter-free**, no backprop.
+- **`ridge`** — closed-form linear readout (least squares). No backprop.
+- **`motion`** — small trained CNN on motion-primary features (`hdems.train`).
+- **`cnn`** — raw single-frame Φ baseline (`hdems.train`).
+
+`prototype`/`ridge` are **fit** with `scripts/fit_ridge_head.py`.
+
+## Velocity → event combination (selectable)
+
+The residual velocity is FPE-encoded (`Vx`, `Vy`) and fused with Φ. Two choices,
+set in the config **or** on the command line:
+
+| Option | Values | Meaning |
+|---|---|---|
+| `velocity.axis_combine` / `--axis-combine` | `bind` · `bundle` | combine `Vx, Vy` |
+| `velocity.event_combine` / `--event-combine` | `bind` · `bundle` · `concat` | combine Φ with the velocity code |
+
+Feature dim: `2d` for `bind`/`bundle`, `4d` for `concat`. Natural pairings:
+`prototype`+`bind`, `ridge`+`concat` — but measure them.
 
 ## Layout
 
@@ -32,30 +51,31 @@ descriptors, cost volume, flow estimator, ego-fit) is **parameter-free**.
 Train_based/
 ├── hdems/
 │   ├── data/            events → accumulative time surfaces, EVIMO2 reader/dataset
-│   │   ├── time_surface.py      vectorized accumulative TS + pyramid
+│   │   ├── time_surface.py      vectorized accumulative TS
 │   │   ├── evimo2_reader.py     raw NPZ/NPY reader; multi-time surface builder
 │   │   └── evimo.py             EVIMODataset (raw or cached .pt shards)
-│   ├── vsa/             FPE, HRR bind/bundle, VFA kernel eigen-basis, temporal
+│   ├── vsa/
+│   │   ├── fpe.py               FPE, HRR bind/bundle/similarity
+│   │   ├── velocity.py          residual-velocity hypervector + combine (bind/bundle/concat)
+│   │   └── kernel.py, temporal.py
 │   ├── models/
-│   │   ├── encoder.py           VFA HD feature descriptor (rank-r, frozen)
-│   │   ├── matching.py          bundled matching field (HV context)
+│   │   ├── encoder.py           paper VFA kernel  F = T ∗ K  (FPE over positions)
+│   │   ├── matching.py          bundled matching field (Φ context)
 │   │   ├── paper_flow.py        two-time multi-scale cost volume + Eq.12–14 flow
-│   │   ├── motion.py            single-frame flow decode + ego-motion residual
-│   │   ├── segmentation.py      MotionSegHead (motion-primary) / SegmentationHead
-│   │   ├── decoder.py           learned flow decoder (flow task only)
-│   │   └── hdems.py             HDEMS assembly + forward
+│   │   ├── motion.py            ego-motion residual (+ single-frame decode)
+│   │   ├── prototype_head.py    VSA nearest-centroid head
+│   │   ├── segmentation.py      MotionSegHead / SegmentationHead (CNN heads)
+│   │   └── hdems.py             HDEMS assembly + forward + paper_features
 │   ├── ridge_head.py / ridge_fit.py / seg_features.py / feature_extract.py
-│   │                    closed-form Ridge readout head (no backprop)
 │   ├── losses/          seg (CE + Dice), flow (EPE)
-│   ├── train.py         training entry point (saves checkpoints/last.pt, best.pt)
-│   ├── eval.py          metrics (mIoU) + events|GT|prediction PNG panels
-│   └── metrics.py / benchmark.py
+│   ├── train.py         trains the CNN heads (motion/cnn); saves last.pt/best.pt
+│   └── eval.py          mIoU + events|GT|prediction PNG panels
 ├── scripts/
 │   ├── nci_env.sh       redirect torch/matplotlib caches to scratch (NCI quota)
 │   ├── prepare_evimo.py precompute (surface, mask) → .pt shards
-│   └── fit_ridge_head.py
+│   └── fit_ridge_head.py  fit prototype/ridge readouts
 ├── configs/            evimo_seg.yaml (main), base.yaml, dsec_flow.yaml
-├── tests/              pytest unit tests (FPE, kernel rank, field exactness, …)
+├── tests/              pytest unit tests
 ├── docs/               SPEC.md, RIDGE_RESULTS.md
 └── pyproject.toml, requirements.txt, pytest.ini
 ```
@@ -66,82 +86,72 @@ Train_based/
 module load python3/3.9.2
 source /scratch/jq77/nk8155/seg/bin/activate
 cd /scratch/mi23/nuwan/Event_segmentation/Train_based
-
 pip install -r requirements.txt      # first time only
-pytest tests/ -v                     # optional sanity check
 
 # Interactive GPU node:
 qsub -I -l walltime=12:00:00,mem=190GB,ncpus=12,ngpus=1,jobfs=50GB \
   -q gpuvolta -P mi23 -l storage=gdata/jq77+scratch/jq77+scratch/mi23
 
-# ALWAYS source this first — sends torch/matplotlib caches to scratch
-# (NCI $HOME quota is tiny and otherwise causes "Disk quota exceeded"):
+# ALWAYS source first — sends caches to scratch ($HOME quota is tiny):
 source scripts/nci_env.sh
 ```
 
-## EVIMO2 dataset layout
+## Dataset layout
 
 ```
 ../Data/EVIMO2/
 ├── train/scene10_dyn_train_00_000000/
-│   ├── dataset_events_t.npy   dataset_events_xy.npy   dataset_events_p.npy
-│   ├── dataset_mask.npz       dataset_info.npz
-│   └── dataset_classical.npz  # fallback when events are empty (e.g. flea3_7)
+│   ├── dataset_events_t.npy  dataset_events_xy.npy  dataset_events_p.npy
+│   ├── dataset_mask.npz      dataset_info.npz
+│   └── dataset_classical.npz   # fallback when events are empty
 └── eval/scene13_dyn_test_00_000000/ ...
 ```
-
 Set `dataset.root: ../Data/EVIMO2` in `configs/evimo_seg.yaml`.
 
-## Run — default: paper front-end + Ridge readout (no backprop)
+## Run
 
 ```bash
 source scripts/nci_env.sh
 
-# 1) Precompute multi-time cached shards ONCE (see cache note below).
+# 1) Build the multi-time cache ONCE (see cache note below).
 python scripts/prepare_evimo.py --config configs/evimo_seg.yaml
 
-# 2) Fit the closed-form Ridge readout (paper features auto-selected when
-#    dataset.time_frames is set). NOT `hdems.train` — Ridge has no backprop.
-python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --out checkpoints/ridge_head.pt
+# 2) Fit a readout. Combine + head are CLI options; the checkpoint is auto-named
+#    checkpoints/[head]_[axis]_[event]_[num_train_frames].pt  (omit --out).
+python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml \
+  --head prototype --axis-combine bind --event-combine bind \
+  --device cuda --max-train-samples 500 --max-val-samples 50
+#  -> checkpoints/prototype_bind_bind_500.pt
 
-# 3) Evaluate: mIoU + events|GT|prediction panels
-python -m hdems.eval --config configs/evimo_seg.yaml --head ridge \
-  --ridge-checkpoint checkpoints/ridge_head.pt --device cuda \
-  --save-images eval_out --max-images 50
-```
-
-### Alternative: trained CNN motion head
-
-```bash
-# set segmentation.head: motion in the config, then:
-python -m hdems.train --config configs/evimo_seg.yaml --device cuda
-python -m hdems.eval  --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt \
+# 3) Evaluate: mIoU + PNG panels. The combo is read from the checkpoint.
+python -m hdems.eval --config configs/evimo_seg.yaml --head prototype \
+  --prototype-checkpoint checkpoints/prototype_bind_bind_500.pt \
   --device cuda --save-images eval_out --max-images 50
 ```
 
-> `hdems.train` is only for the `motion`/`cnn` heads. With `head: ridge` it will
-> error (Ridge is fit closed-form, not trained) — use `fit_ridge_head.py`.
-
-### Quick smoke run (limit sample count)
-
-`--max-samples N` restricts training/eval to the first N frames — handy for a
-fast end-to-end check before a full run. Works for all heads and for cached or
-raw datasets; the CLI flag overrides `train.max_samples` / `eval.max_samples`
-in the config.
-
+Ridge example:
 ```bash
-python -m hdems.train --config configs/evimo_seg.yaml --device cuda --max-samples 100
-python -m hdems.eval  --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt \
-  --device cuda --save-images eval_out --max-samples 20
+python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml \
+  --head ridge --axis-combine bind --event-combine concat --max-train-samples 500
+#  -> checkpoints/ridge_bind_concat_500.pt
+python -m hdems.eval --config configs/evimo_seg.yaml --head ridge \
+  --ridge-checkpoint checkpoints/ridge_bind_concat_500.pt --save-images eval_out/ridge
 ```
 
-`--max-samples` limits how many **frames** are used; `--max-images` only caps how
-many eval **PNG panels** are written.
+Trained CNN motion head (uses `hdems.train`, not the fit script):
+```bash
+python -m hdems.train --config configs/evimo_seg.yaml --device cuda --max-samples 500   # set head: motion first
+python -m hdems.eval  --config configs/evimo_seg.yaml --checkpoint checkpoints/last.pt --save-images eval_out
+```
 
-**⚠️ Rebuild the cache when you change `dataset` or `time_frames`.** The `.pt`
-shards bake in resolution and the multi-time stack. After changing
-`height/width/window_ms/time_frames/decay`, delete and rebuild:
+Notes on the flags:
+- `--max-train-samples N` caps the fit to N frames; that N appears in the auto name.
+- `--max-samples` (train/eval) caps frames; `--max-images` only caps saved PNGs.
+- Re-fit after changing a combine option (**no cache rebuild** needed — combining
+  happens in the model, not in the cached surfaces).
 
+**⚠️ Rebuild the cache** only when you change `dataset` resolution, `window_ms`,
+`time_frames`, or `decay` (the `.pt` shards bake those in):
 ```bash
 rm ../Data/EVIMO2/train/*.pt ../Data/EVIMO2/eval/*.pt
 python scripts/prepare_evimo.py --config configs/evimo_seg.yaml
@@ -152,44 +162,20 @@ python scripts/prepare_evimo.py --config configs/evimo_seg.yaml
 | Key | Meaning |
 |-----|---------|
 | `d` | hypervector dimension (512) |
-| `encoder.rank` | VFA kernel eigen-basis rank (16) — quality vs speed |
+| `encoder.patch_size` | VFA kernel size N (21; lower ≈11 for speed, σ=1.5 support is ±4–5 px) |
 | `matching.M` | cost-volume window (7 → ±3 px per scale) |
 | `matching.scales` | `[0,1,2]` two-time pairs F0↔F1/F2/F4 at pool 1/2/4 |
 | `matching.alpha` | Eq.12 probability-volume threshold (0.3) |
-| `dataset.time_frames` | `[0,0.25,0.5,1.0]` multi-time surfaces; `[]` = single-time |
+| `dataset.time_frames` | `[0,0.25,0.5,1.0]` multi-time (paper); `[]` = single-time |
 | `dataset.height/width` | working resolution (240×320) |
-| `segmentation.head` | `ridge` (default) · `motion` · `cnn` |
-| `train.use_dice` | add Dice to CE for class imbalance (true) |
-| `train.max_samples` / `eval.max_samples` | cap to first N frames (or CLI `--max-samples`) |
-
-Head choice (with `time_frames` set → all use the paper front-end):
-`ridge` = closed-form linear readout on `[Φ | ego-residual velocity]` (default);
-`motion` = trained CNN on the same features; `cnn` = single-frame raw-HV baseline.
-
-## Ridge readout details
-
-With `dataset.time_frames` set, `fit_ridge_head.py` **automatically** fits on the
-paper features (two-time cost volume → flow → ego-residual), dim `2·d + 3`. It
-prints `PAPER mode` when it does. Set `time_frames: []` to fall back to the
-single-frame Φ baseline instead.
-
-```bash
-python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml --out checkpoints/ridge_head.pt
-python -m hdems.eval --config configs/evimo_seg.yaml --head ridge \
-  --ridge-checkpoint checkpoints/ridge_head.pt --device cuda --save-images eval_out/ridge
-
-# Side-by-side CNN vs Ridge:
-python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/best.pt \
-  --compare-heads --ridge-checkpoint checkpoints/ridge_head.pt --save-images output/ridge_compare
-```
-
-See `docs/RIDGE_RESULTS.md` for the metrics table and `docs/SPEC.md` for VSA
-constraints.
+| `velocity.axis_combine` | `bind` · `bundle` |
+| `velocity.event_combine` | `bind` · `bundle` · `concat` |
+| `segmentation.head` | `prototype` (default) · `ridge` · `motion` · `cnn` |
 
 ## Notes
 
-- Raw NPZ/NPY sequences load **directly**; `.pt` shards are an optional cache.
 - Masks are remapped to consecutive class IDs (background = 0); EVIMO masks are
   the independently-moving objects, so this is genuinely motion segmentation.
-- The VSA front-end is deterministic — precomputing the residual flow to cache is
-  the next speed optimization (not yet implemented).
+- Record results in `docs/RIDGE_RESULTS.md`; `docs/SPEC.md` has the VSA constraints.
+- CLI combine/head options override the config; the chosen combo is stored inside
+  each checkpoint so eval auto-matches it.

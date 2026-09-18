@@ -1,0 +1,76 @@
+#!/bin/bash
+#PBS -N hdems_seg
+#PBS -P mi23
+#PBS -q gpuvolta
+#PBS -l ncpus=12
+#PBS -l mem=64GB
+#PBS -l ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+#PBS -l wd
+#PBS -j oe
+# ^ -l wd  : start in the directory you ran qsub from
+#   -j oe  : merge stdout+stderr into one log (lands as hdems_seg.o<jobid> in that dir)
+
+set -eo pipefail   # stop immediately if fit fails, so eval never runs on a stale/missing checkpoint
+
+# ---------------------------------------------------------------------------
+# PARAMETERS  (edit these; everything below is derived from them)
+# ---------------------------------------------------------------------------
+AX_COMBINE=bind        # bind | bundle
+EV_COMBINE=bind        # bind | bundle | concat
+HEAD=prototype         # prototype | ridge | motion | cnn
+SAMPLES=100            # max train samples,  valid 1-4000
+VAL_SAMPLES=50        # max val samples while training  (integer count)
+TEST_SAMPLES=50       # max eval images for testing   (integer count)
+
+CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
+CONFIG=configs/evimo_seg.yaml
+VENV=/scratch/jq77/nk8155/seg/bin/activate
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT
+# ---------------------------------------------------------------------------
+module load cuda
+module load python3/3.9.2
+source "${VENV}"
+cd "${CODE_DIR}"
+
+# Derived names -------------------------------------------------------------
+RUN_NAME="${HEAD}_${AX_COMBINE}_${EV_COMBINE}_${SAMPLES}"
+CKPT="checkpoints/${RUN_NAME}.pt"
+RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "${RESULTS_DIR}"
+
+# ---------------------------------------------------------------------------
+# SANITY / PROVENANCE  (cheap, printed to the log so you can trust the run)
+# ---------------------------------------------------------------------------
+echo "=== Job ${PBS_JOBID} starting $(date) ==="
+echo "Run name : ${RUN_NAME}"
+echo "Results  : ${CODE_DIR}/${RESULTS_DIR}"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+echo "---------------------------------------------------------------"
+
+# ---------------------------------------------------------------------------
+# 1. FIT THE HEAD
+# ---------------------------------------------------------------------------
+echo ">>> [$(date +%T)] fitting ${HEAD} head"
+python scripts/fit_ridge_head.py --config "${CONFIG}" \
+  --head "${HEAD}" --axis-combine "${AX_COMBINE}" --event-combine "${EV_COMBINE}" \
+  --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"
+
+# ---------------------------------------------------------------------------
+# 2. EVALUATE
+# ---------------------------------------------------------------------------
+echo ">>> [$(date +%T)] evaluating -> ${RESULTS_DIR}/eval_images"
+python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
+  --prototype-checkpoint "${CKPT}" \
+  --device cuda --save-images "${RESULTS_DIR}/eval_images" \
+  --max-images "${TEST_SAMPLES}"
+
+# ---------------------------------------------------------------------------
+# 3. COLLECT  (keep a copy of the checkpoint + this log next to the results)
+# ---------------------------------------------------------------------------
+cp "${CKPT}" "${RESULTS_DIR}/" 2>/dev/null || true
+echo "=== Job ${PBS_JOBID} finished $(date) ==="
+# When this line completes, PBS tears the job down and stops billing. No qdel needed.

@@ -41,8 +41,13 @@ eval:
   split: eval
   # max_samples: 20       # optional: eval on first N frames (or CLI --max-samples)
 
+velocity:
+  vel_bw: 6.0            # FPE bandwidth for residual velocity (topological similarity)
+  axis_combine: bind     # combine Vx,Vy -> bind | bundle
+  event_combine: bind    # combine Phi with velocity code -> bind | bundle | concat
+
 segmentation:
-  head: ridge           # ridge | motion | cnn  (with time_frames set -> paper front-end)
+  head: prototype       # prototype | ridge | motion | cnn  (time_frames set -> paper front-end)
   num_classes: 32
   embedding_dim: 32
   ctx_dim: 32            # motion head: compressed HV context channels
@@ -53,6 +58,7 @@ segmentation:
   ridge_mean_center: true
   ridge_motion_features: true
   ridge_weights: checkpoints/ridge_head.pt
+  prototype_weights: checkpoints/prototype_head.pt
 
 ridge:
   backend: streaming     # streaming | sklearn

@@ -32,6 +32,7 @@ from hdems.ridge_fit import (
 )
 from hdems.ridge_head import RidgeHead
 from hdems.feature_extract import extract_phi
+from hdems.models.prototype_head import PrototypeHead, fit_prototypes, save_prototypes
 
 
 def _cap_dataset(ds, max_samples: int | None):
@@ -105,7 +106,14 @@ def eval_ridge_miou(
 def main() -> None:
     ap = argparse.ArgumentParser(description="Fit ridge segmentation head")
     ap.add_argument("--config", type=str, default="configs/evimo_seg.yaml")
-    ap.add_argument("--out", type=str, default="checkpoints/ridge_head.pt")
+    ap.add_argument("--out", type=str, default=None,
+                    help="Output .pt. Default: checkpoints/[head]_[axis]_[event]_[N].pt")
+    ap.add_argument("--head", type=str, choices=["ridge", "prototype"], default=None,
+                    help="Readout to fit (overrides segmentation.head).")
+    ap.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
+                    help="Vx,Vy combine (overrides velocity.axis_combine).")
+    ap.add_argument("--event-combine", type=str, choices=["bind", "bundle", "concat"], default=None,
+                    help="Phi+velocity combine (overrides velocity.event_combine).")
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--backend", choices=["streaming", "sklearn"], default=None)
@@ -124,17 +132,30 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.axis_combine or args.event_combine:                 # CLI overrides config
+        vel = dict(cfg.get("velocity", {}))
+        if args.axis_combine:
+            vel["axis_combine"] = args.axis_combine
+        if args.event_combine:
+            vel["event_combine"] = args.event_combine
+        cfg["velocity"] = vel
+    axis = cfg.get("velocity", {}).get("axis_combine", "bind")
+    event = cfg.get("velocity", {}).get("event_combine", "bind")
     ridge_cfg = cfg.get("ridge", {})
     seg_cfg = cfg.get("segmentation", {})
     num_classes = seg_cfg.get("num_classes", 32)
+    head_type = (args.head or seg_cfg.get("head", "ridge")).lower()
     mean_center = bool(seg_cfg.get("ridge_mean_center", True))
     motion_features = bool(seg_cfg.get("ridge_motion_features", True))
-    # Paper mode: multi-time surfaces -> fit Ridge on the two-time cost-volume
-    # features (Phi + ego-residual velocity) instead of single-frame Phi.
+    # Paper mode: multi-time surfaces -> fit on the two-time cost-volume features
+    # (Phi combined with ego-residual velocity) instead of single-frame Phi.
     paper = bool(cfg.get("dataset", {}).get("time_frames"))
+    if head_type == "prototype":
+        if not paper:
+            raise SystemExit("prototype head requires dataset.time_frames (paper mode)")
+        mean_center = False   # cosine-centroid: normalization handles scale
     if paper:
-        print("[ridge] PAPER mode: features = Phi | ego-residual velocity "
-              "(two-time multi-scale cost volume)")
+        print(f"[fit] PAPER mode, head={head_type}: features = Phi (X) velocity code")
     imbalance = ridge_cfg.get("imbalance", "balanced")
     alphas = ridge_cfg.get("alphas", [1e-3, 1e-1, 1.0, 10.0, 100.0])
     backend = args.backend or ridge_cfg.get("backend", "streaming")
@@ -174,15 +195,18 @@ def main() -> None:
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=False, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
 
-    print(f"[ridge] computing feature mean on {len(train_ds)} train samples ...")
-    if paper:
-        feature_mean = accumulate_paper_feature_mean(model, train_loader, device)
+    if mean_center:
+        print(f"[fit] computing feature mean on {len(train_ds)} train samples ...")
+        if paper:
+            feature_mean = accumulate_paper_feature_mean(model, train_loader, device)
+        else:
+            feature_mean = accumulate_feature_mean(
+                model, train_loader, device, motion_features=motion_features,
+            )
+        print(f"[fit] feature_dim={feature_mean.numel()}  mean_center={mean_center}")
     else:
-        feature_mean = accumulate_feature_mean(
-            model, train_loader, device, motion_features=motion_features,
-        )
-    print(f"[ridge] feature_dim={feature_mean.numel()}  mean_center={mean_center}  "
-          f"motion={motion_features}  paper={paper}")
+        feature_mean = None
+        print(f"[fit] no mean-centering (head={head_type})")
 
     print("[ridge] collecting train pixels ...")
     train_batches = collect_batches(
@@ -193,7 +217,29 @@ def main() -> None:
         paper=paper,
     )
     n_pix = sum(b[0].shape[0] for b in train_batches)
-    print(f"[ridge] train pixels: {n_pix}")
+    print(f"[fit] train pixels: {n_pix}")
+
+    # Output path: explicit --out, else [head]_[axis]_[event]_[num_samples].pt
+    if args.out:
+        out_path = Path(args.out)
+    else:
+        out_path = Path("checkpoints") / f"{head_type}_{axis}_{event}_{len(train_ds)}.pt"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ---- prototype head: class-mean centroids, no alpha sweep -----------------
+    if head_type == "prototype":
+        protos = fit_prototypes(train_batches, num_classes)
+        head = PrototypeHead(num_classes)
+        head.set_prototypes(protos)
+        miou = (eval_ridge_miou(model, head, val_loader, device, num_classes, paper=paper)
+                if len(val_ds) else 0.0)
+        save_prototypes(str(out_path), protos, num_classes,
+                        extra={"val_miou": miou, "seed": args.seed,
+                               "num_samples": len(train_ds),
+                               "axis_combine": axis, "event_combine": event})
+        print(f"[proto] saved {out_path}  val_mIoU={miou:.4f}  "
+              f"prototypes={tuple(protos.shape)}")
+        return
 
     best_alpha = alphas[0]
     best_result: RidgeFitResult | None = None
@@ -236,12 +282,12 @@ def main() -> None:
             best_result = result
 
     assert best_result is not None
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     save_ridge_weights(
         str(out_path),
         best_result,
-        extra={"val_miou": best_miou, "seed": args.seed, "backend": backend},
+        extra={"val_miou": best_miou, "seed": args.seed, "backend": backend,
+               "num_samples": len(train_ds),
+               "axis_combine": axis, "event_combine": event},
     )
     print(f"[ridge] saved {out_path}  alpha={best_alpha:g}  val_mIoU={best_miou:.4f}  "
           f"W shape={tuple(best_result.weight.shape)}  imbalance={imbalance}")

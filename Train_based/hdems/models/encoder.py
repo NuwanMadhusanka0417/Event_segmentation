@@ -1,4 +1,14 @@
-"""Rank-r analytic VSA encoder (zero-parameter, frozen)."""
+"""Paper-faithful VFA encoder (You et al. 2025, Eq. 2/4/6).
+
+F(x,y) = Σ_{Δx,Δy} T(x+Δx, y+Δy) · K(Δx,Δy),  where the HD kernel is
+    K(Δx,Δy) = Gaussian(Δx,Δy) · ( Xᐟᐟ^Δx ⊙ Yᐟᐟ^Δy )
+             = Gaussian(Δx,Δy) · exp( i ( Δx·φx + Δy·φy ) ).
+
+FPE is applied to the POSITIONS (Δx,Δy) — building a Gaussian-smoothed
+translation-invariant (VFA) kernel — exactly as in the paper. This replaces the
+earlier (incorrect) FPE-of-filter-response construction. Implemented as a single
+depthwise convolution of the time surface with the d complex kernels.
+"""
 
 from __future__ import annotations
 
@@ -6,86 +16,53 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from hdems.vsa.fpe import fpe, make_base_phases
-from hdems.vsa.kernel import eigen_basis, separable_approx
+from hdems.vsa.fpe import make_base_phases
 
 
 class VSAEncoder(nn.Module):
-    """Analytic VFA encoder: time surface -> complex descriptor field F.
-
-    Parameters
-    ----------
-    d : hypervector dimension
-    patch_size, sigma_k, rank : VFA kernel params
-    separable_terms : rank-1 factors per filter
-
-    Output shape: (B, d, H, W) complex64
-    """
+    """Time surface -> complex descriptor field F, output (B, d, H, W) complex64."""
 
     def __init__(
         self,
         d: int = 1024,
         patch_size: int = 21,
         sigma_k: float = 1.5,
-        rank: int = 64,
-        separable_terms: int = 2,
+        rank: int = 64,          # kept for config compatibility (unused: full kernel)
+        separable_terms: int = 2,  # kept for config compatibility (unused)
         seed: int = 0,
     ) -> None:
         super().__init__()
         self.d = d
         self.patch_size = patch_size
-        self.rank = rank
+        self.pad = patch_size // 2
 
-        filters, energy = eigen_basis(patch_size, sigma_k, rank)
-        self.register_buffer("filters", filters)
-        self.energy_fraction = energy
+        # FPE base phases for the two axes (Gaussian -> Gaussian kernel similarity).
+        phases_x = make_base_phases(d, seed=seed)          # (d,)
+        phases_y = make_base_phases(d, seed=seed + 1)
+        self.register_buffer("phases_x", phases_x)
+        self.register_buffer("phases_y", phases_y)
 
-        self.separable = separable_approx(filters, separable_terms)
-        pad = patch_size // 2
-        self.pad = pad
-
-        phases = make_base_phases(d, seed=seed)
-        self.register_buffer("phases_x", phases)
-        self.register_buffer("phases_y", make_base_phases(d, seed=seed + 1))
+        # Build the HD kernel K (d, N, N): position code * Gaussian.
+        n = self.pad
+        coords = torch.arange(-n, n + 1, dtype=torch.float32)
+        oy, ox = torch.meshgrid(coords, coords, indexing="ij")     # (N, N) each
+        gauss = torch.exp(-(ox ** 2 + oy ** 2) / (2.0 * sigma_k ** 2))  # (N, N)
+        # phase[k, iy, ix] = ox·φx[k] + oy·φy[k]
+        phase = (ox[None] * phases_x[:, None, None]
+                 + oy[None] * phases_y[:, None, None])              # (d, N, N)
+        K = gauss[None] * torch.exp(1j * phase)                     # (d, N, N) complex
+        # conv2d weights: (out_channels=d, in_channels=1, N, N)
+        self.register_buffer("k_real", K.real.unsqueeze(1).contiguous())
+        self.register_buffer("k_imag", K.imag.unsqueeze(1).contiguous())
 
         for p in self.parameters():
             p.requires_grad = False
 
-    def _conv_separable(self, x: torch.Tensor, terms: list) -> torch.Tensor:
-        """Apply separable rank-1 filter to x: (B, 1, H, W)."""
-        out = torch.zeros_like(x)
-        for col, row in terms:
-            row_f = row.to(dtype=x.dtype, device=x.device).view(1, 1, 1, -1)
-            col_f = col.to(dtype=x.dtype, device=x.device).view(1, 1, -1, 1)
-            tmp = F.conv2d(x, row_f, padding=(0, self.pad))
-            out = out + F.conv2d(tmp, col_f, padding=(self.pad, 0))
-        return out
-
     def forward(self, surface: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        surface : (B, C, H, W) float32 time surface
-
-        Returns
-        -------
-        F : (B, d, H, W) complex64
-        """
-        B, C, H, W = surface.shape
+        """surface: (B, C, H, W) float32 -> F: (B, d, H, W) complex64."""
         assert surface.dtype == torch.float32
-
-        # Project through rank-r spatial filters, then FPE encode and bundle
-        F_out = torch.zeros(B, self.d, H, W, dtype=torch.complex64, device=surface.device)
-        for r in range(self.rank):
-            feat = torch.zeros(B, 1, H, W, device=surface.device)
-            for c in range(C):
-                feat = feat + self._conv_separable(
-                    surface[:, c : c + 1], self.separable[r]
-                )
-            code = fpe(self.phases_x, feat.squeeze(1)) * fpe(
-                self.phases_y, feat.squeeze(1)
-            )
-            # code: (B, H, W, d) -> (B, d, H, W)
-            F_out = F_out + code.permute(0, 3, 1, 2)
-
-        return F_out
+        # Combine polarity channels into one time surface T, then F = T * K.
+        t = surface.sum(dim=1, keepdim=True)                        # (B, 1, H, W)
+        f_real = F.conv2d(t, self.k_real, padding=self.pad)         # (B, d, H, W)
+        f_imag = F.conv2d(t, self.k_imag, padding=self.pad)
+        return torch.complex(f_real, f_imag)

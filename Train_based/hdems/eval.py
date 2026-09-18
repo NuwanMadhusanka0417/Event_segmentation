@@ -182,7 +182,13 @@ def main() -> None:
                         help="CNN checkpoint (seg_head weights when head=cnn)")
     parser.add_argument("--ridge-checkpoint", type=str, default=None,
                         help="Ridge weights .pt (required when head=ridge)")
-    parser.add_argument("--head", type=str, choices=["cnn", "ridge"], default=None)
+    parser.add_argument("--prototype-checkpoint", type=str, default=None,
+                        help="Prototype weights .pt (required when head=prototype)")
+    parser.add_argument("--head", type=str, choices=["cnn", "ridge", "prototype", "motion"], default=None)
+    parser.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
+                        help="Override velocity.axis_combine (else taken from the checkpoint).")
+    parser.add_argument("--event-combine", type=str, choices=["bind", "bundle", "concat"], default=None,
+                        help="Override velocity.event_combine (else taken from the checkpoint).")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save-images", type=str, default=None)
     parser.add_argument("--max-images", type=int, default=50)
@@ -193,6 +199,13 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.axis_combine or args.event_combine:                 # CLI overrides config
+        vel = dict(cfg.get("velocity", {}))
+        if args.axis_combine:
+            vel["axis_combine"] = args.axis_combine
+        if args.event_combine:
+            vel["event_combine"] = args.event_combine
+        cfg["velocity"] = vel
     head = args.head or cfg.get("segmentation", {}).get("head", "cnn")
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     seg_cfg = cfg.get("segmentation", {})
@@ -203,11 +216,26 @@ def main() -> None:
     def build_model(head_name: str) -> HDEMS:
         mcfg = _apply_head_config(cfg, head_name)
         model = HDEMS(mcfg).to(device)
+        def _match_combine(path: str) -> None:
+            # Auto-match the combine stored in the checkpoint unless CLI overrode it.
+            meta = torch.load(path, map_location="cpu", weights_only=False)
+            if not args.axis_combine and meta.get("axis_combine"):
+                model.axis_combine = meta["axis_combine"]
+            if not args.event_combine and meta.get("event_combine"):
+                model.event_combine = meta["event_combine"]
+
         if head_name == "ridge":
             rpath = args.ridge_checkpoint or seg_cfg.get("ridge_weights")
             if not rpath:
                 raise SystemExit("--ridge-checkpoint or segmentation.ridge_weights required")
             model.seg_head.load(rpath)
+            _match_combine(rpath)
+        elif head_name == "prototype":
+            ppath = args.prototype_checkpoint or seg_cfg.get("prototype_weights")
+            if not ppath:
+                raise SystemExit("--prototype-checkpoint or segmentation.prototype_weights required")
+            model.seg_head.load(ppath)
+            _match_combine(ppath)
         elif args.checkpoint:
             ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
             state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
