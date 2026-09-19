@@ -184,12 +184,14 @@ def _apply_head_config(cfg: dict, head: str | None) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate HD-EMS")
     parser.add_argument("--config", type=str, default="configs/evimo_seg.yaml")
+    # Any ONE of these three may be given for any head; the loader matches it to
+    # --head (so a single run script can pass the same flag for every model).
     parser.add_argument("--checkpoint", type=str, required=False,
-                        help="CNN checkpoint (seg_head weights when head=cnn)")
+                        help="Head checkpoint .pt (any head)")
     parser.add_argument("--ridge-checkpoint", type=str, default=None,
-                        help="Ridge weights .pt (required when head=ridge)")
+                        help="Head checkpoint .pt (any head; alias)")
     parser.add_argument("--prototype-checkpoint", type=str, default=None,
-                        help="Prototype weights .pt (required when head=prototype)")
+                        help="Head checkpoint .pt (any head; alias)")
     parser.add_argument("--head", type=str, choices=["cnn", "ridge", "prototype", "motion"], default=None)
     parser.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
                         help="Override velocity.axis_combine (else taken from the checkpoint).")
@@ -213,11 +215,15 @@ def main() -> None:
             vel["event_combine"] = args.event_combine
         cfg["velocity"] = vel
     head = args.head or cfg.get("segmentation", {}).get("head", "cnn")
+    # Whichever checkpoint flag was given (compare mode keeps them separate).
+    any_ckpt = None if args.compare_heads else (
+        args.checkpoint or args.prototype_checkpoint or args.ridge_checkpoint)
+    trained_ckpt = args.checkpoint or any_ckpt
     # Trained heads (cnn) bake the combine into their input dim — match it from the
     # checkpoint so the rebuilt model has the right shapes.
-    if head in ("cnn", "motion") and args.checkpoint and not (args.axis_combine or args.event_combine):
+    if head in ("cnn", "motion") and trained_ckpt and not (args.axis_combine or args.event_combine):
         try:
-            _meta = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+            _meta = torch.load(trained_ckpt, map_location="cpu", weights_only=False)
             vel = dict(cfg.get("velocity", {}))
             if _meta.get("axis_combine"):
                 vel["axis_combine"] = _meta["axis_combine"]
@@ -244,21 +250,26 @@ def main() -> None:
                 model.event_combine = meta["event_combine"]
 
         if head_name == "ridge":
-            rpath = args.ridge_checkpoint or seg_cfg.get("ridge_weights")
+            rpath = args.ridge_checkpoint or any_ckpt or seg_cfg.get("ridge_weights")
             if not rpath:
-                raise SystemExit("--ridge-checkpoint or segmentation.ridge_weights required")
+                raise SystemExit("a checkpoint flag or segmentation.ridge_weights is required")
             model.seg_head.load(rpath)
             _match_combine(rpath)
         elif head_name == "prototype":
-            ppath = args.prototype_checkpoint or seg_cfg.get("prototype_weights")
+            ppath = args.prototype_checkpoint or any_ckpt or seg_cfg.get("prototype_weights")
             if not ppath:
-                raise SystemExit("--prototype-checkpoint or segmentation.prototype_weights required")
+                raise SystemExit("a checkpoint flag or segmentation.prototype_weights is required")
             model.seg_head.load(ppath)
             _match_combine(ppath)
-        elif args.checkpoint:
-            ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
-            state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-            model.load_state_dict(state, strict=False)
+        else:                                               # cnn / motion (trained heads)
+            cpath = args.checkpoint or any_ckpt
+            if cpath:
+                ckpt = torch.load(cpath, map_location=device, weights_only=True)
+                state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+                model.load_state_dict(state, strict=False)
+            elif task == "segmentation":
+                raise SystemExit(f"a checkpoint is required for head={head_name!r} "
+                                 "(an untrained head would give meaningless results)")
         return model
 
     try:

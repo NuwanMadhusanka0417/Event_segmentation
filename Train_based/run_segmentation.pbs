@@ -2,9 +2,9 @@
 #PBS -N hdems_seg
 #PBS -P mi23
 #PBS -q gpuvolta
-#PBS -l ncpus=12
-#PBS -l mem=64GB
-#PBS -l ngpus=1
+#PBS -l ncpus=24
+#PBS -l mem=128GB
+#PBS -l ngpus=2
 #PBS -l walltime=12:00:00
 #PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
 #PBS -l wd
@@ -18,10 +18,10 @@ set -eo pipefail   # stop immediately if fit fails, so eval never runs on a stal
 # PARAMETERS  (edit these; everything below is derived from them)
 # ---------------------------------------------------------------------------
 AX_COMBINE=bind        # bind | bundle
-EV_COMBINE=bind        # bind | bundle | concat
-HEAD=prototype         # prototype | ridge | motion | cnn
-SAMPLES=100            # max train samples,  valid 1-4000
-VAL_SAMPLES=50        # max val samples while training  (integer count)
+EV_COMBINE=concat        # bind | bundle | concat
+HEAD=cnn         # prototype | ridge | motion | cnn
+SAMPLES=300            # max train samples,  valid 1-4000
+VAL_SAMPLES=150        # max val samples while training  (integer count)
 TEST_SAMPLES=50       # max eval images for testing   (integer count)
 
 CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based

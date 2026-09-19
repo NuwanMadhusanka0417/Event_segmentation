@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Fit closed-form ridge readout on frozen HD-EMS features (EVIMO2 train split)."""
+"""Fit / train a segmentation head on the frozen HD-EMS front-end (EVIMO2).
+
+Single entry point for every head:
+  ridge, prototype -> closed-form fit (no backprop)
+  cnn, motion      -> backprop training; the best epoch by val mIoU is kept
+All heads save to checkpoints/[head]_[axis]_[event]_[N].pt (unless --out).
+"""
 
 from __future__ import annotations
 
@@ -15,7 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hdems.eval import build_dataset, load_config
+from hdems.eval import build_dataset, evaluate_segmentation, load_config
+from hdems.train import train_one_epoch
 from hdems.feature_extract import (
     accumulate_feature_mean,
     accumulate_paper_feature_mean,
@@ -104,12 +111,14 @@ def eval_ridge_miou(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Fit ridge segmentation head")
+    ap = argparse.ArgumentParser(description="Fit or train a segmentation head")
     ap.add_argument("--config", type=str, default="configs/evimo_seg.yaml")
     ap.add_argument("--out", type=str, default=None,
                     help="Output .pt. Default: checkpoints/[head]_[axis]_[event]_[N].pt")
-    ap.add_argument("--head", type=str, choices=["ridge", "prototype"], default=None,
-                    help="Readout to fit (overrides segmentation.head).")
+    ap.add_argument("--head", type=str, choices=["ridge", "prototype", "cnn", "motion"],
+                    default=None,
+                    help="ridge/prototype: closed-form fit; cnn/motion: backprop training "
+                         "(overrides segmentation.head).")
     ap.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
                     help="Vx,Vy combine (overrides velocity.axis_combine).")
     ap.add_argument("--event-combine", type=str, choices=["bind", "bundle", "concat"], default=None,
@@ -145,10 +154,9 @@ def main() -> None:
     seg_cfg = cfg.get("segmentation", {})
     num_classes = seg_cfg.get("num_classes", 32)
     head_type = (args.head or seg_cfg.get("head", "ridge")).lower()
-    if head_type not in ("ridge", "prototype"):
-        raise SystemExit(
-            f"fit_ridge_head fits ridge|prototype only (got head={head_type!r}). "
-            "For the cnn/motion heads use:  python -m hdems.train")
+    if head_type not in ("ridge", "prototype", "cnn", "motion"):
+        raise SystemExit(f"unknown head {head_type!r} (ridge|prototype|cnn|motion)")
+    trainable = head_type in ("cnn", "motion")
     mean_center = bool(seg_cfg.get("ridge_mean_center", True))
     motion_features = bool(seg_cfg.get("ridge_motion_features", True))
     # Paper mode: multi-time surfaces -> fit on the two-time cost-volume features
@@ -168,10 +176,11 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    model = HDEMS({**cfg, "segmentation": {**seg_cfg, "head": "cnn"}}).to(device)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad = False
+    if not trainable:                        # frozen feature extractor for ridge/prototype
+        model = HDEMS({**cfg, "segmentation": {**seg_cfg, "head": "cnn"}}).to(device)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
 
     train_ds = build_dataset(cfg, split=cfg.get("dataset", {}).get("split", "train"))
     val_split = ridge_cfg.get("val_split", "eval")
@@ -198,6 +207,42 @@ def main() -> None:
 
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=False, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
+
+    # ---- trainable heads (cnn / motion): backprop, keep best epoch by val mIoU --
+    if trainable:
+        out_path = (Path(args.out) if args.out else
+                    Path("checkpoints") / f"{head_type}_{axis}_{event}_{len(train_ds)}.pt")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        train_cfg = cfg.get("train", {})
+        net = HDEMS({**cfg, "segmentation": {**seg_cfg, "head": head_type}}).to(device)
+        print(f"[train] head={head_type}  trainable params: {net.num_trainable_params:,}")
+        tr_loader = DataLoader(train_ds, batch_size=train_cfg.get("batch_size", 1),
+                               shuffle=True, num_workers=train_cfg.get("num_workers", 4))
+        optimizer = torch.optim.Adam([p for p in net.parameters() if p.requires_grad],
+                                     lr=train_cfg.get("lr", 1e-4))
+        use_dice = bool(train_cfg.get("use_dice", False))
+        epochs = int(train_cfg.get("epochs", 30))
+
+        best_score, best_state, best_epoch = float("-inf"), None, 0
+        for epoch in range(1, epochs + 1):
+            loss = train_one_epoch(net, tr_loader, optimizer, device, "segmentation",
+                                   use_dice=use_dice, num_classes=num_classes)
+            if len(val_ds):
+                score = evaluate_segmentation(net, val_loader, device, num_classes)["miou"]
+                print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}  val_mIoU={score:.4f}")
+            else:                                   # no val split: lowest train loss wins
+                score = -loss
+                print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}")
+            if score > best_score:
+                best_score, best_epoch = score, epoch
+                best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+
+        torch.save({"model": best_state, "task": "segmentation", "head": head_type,
+                    "epoch": best_epoch, "val_miou": best_score if len(val_ds) else None,
+                    "num_samples": len(train_ds),
+                    "axis_combine": axis, "event_combine": event}, out_path)
+        print(f"[train] saved {out_path}  best epoch={best_epoch}  score={best_score:.4f}")
+        return
 
     if mean_center:
         print(f"[fit] computing feature mean on {len(train_ds)} train samples ...")
