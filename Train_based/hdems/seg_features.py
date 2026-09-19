@@ -26,6 +26,21 @@ def event_valid_mask(surface: torch.Tensor, *, threshold: float = 1e-6) -> torch
     return surface.abs().sum(dim=1) > threshold
 
 
+def event_pixel_mask(surface: torch.Tensor, *, threshold: float = 1e-6) -> torch.Tensor:
+    """Pixels that actually carry events in the window -> (B, H, W) bool.
+
+    Accepts (2,H,W), (B,2,H,W) or the multi-time stack (B,T,2,H,W): every
+    non-spatial dimension is reduced, so a pixel is active if ANY frame/polarity
+    has activity there. Loss and metrics are restricted to these pixels — the
+    rest have no evidence and would otherwise dominate training with trivial
+    background.
+    """
+    if surface.dim() == 3:
+        surface = surface.unsqueeze(0)
+    b, h, w = surface.shape[0], surface.shape[-2], surface.shape[-1]
+    return surface.abs().reshape(b, -1, h, w).sum(dim=1) > threshold
+
+
 def motion_mag_angle(surface: torch.Tensor) -> torch.Tensor:
     if surface.dim() == 3:
         surface = surface.unsqueeze(0)

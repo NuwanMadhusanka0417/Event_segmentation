@@ -145,6 +145,10 @@ def main() -> None:
     seg_cfg = cfg.get("segmentation", {})
     num_classes = seg_cfg.get("num_classes", 32)
     head_type = (args.head or seg_cfg.get("head", "ridge")).lower()
+    if head_type not in ("ridge", "prototype"):
+        raise SystemExit(
+            f"fit_ridge_head fits ridge|prototype only (got head={head_type!r}). "
+            "For the cnn/motion heads use:  python -m hdems.train")
     mean_center = bool(seg_cfg.get("ridge_mean_center", True))
     motion_features = bool(seg_cfg.get("ridge_motion_features", True))
     # Paper mode: multi-time surfaces -> fit on the two-time cost-volume features

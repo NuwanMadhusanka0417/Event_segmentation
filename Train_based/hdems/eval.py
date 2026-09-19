@@ -16,6 +16,7 @@ from hdems.losses.flow import epe_loss
 from hdems.losses.seg import seg_loss
 from hdems.metrics import mean_iou
 from hdems.models.hdems import HDEMS
+from hdems.seg_features import event_pixel_mask
 
 
 def load_config(path: str | Path) -> dict:
@@ -128,13 +129,18 @@ def evaluate_segmentation(
         mask = batch["mask"].to(device).long()
         out = model(surface, task="segmentation")
         logits = out["seg_logits"]
-        total_loss += seg_loss(logits, mask).item()
+        # Score on EVENT pixels only (pixels without events carry no evidence).
+        valid = event_pixel_mask(surface) & (mask >= 0)
+        if valid.any():
+            total_loss += seg_loss(logits, mask.masked_fill(~valid, 255)).item()
         pred = logits.argmax(dim=1)
-        ious.append(mean_iou(pred[0], mask[0], num_classes))
+        ious.append(mean_iou(pred[0], mask[0], num_classes, valid=valid[0]))
 
         if save_dir is not None and saved < max_images:
+            # show the prediction where it is scored; elsewhere = background
+            pred_vis = pred.masked_fill(~valid, 0)
             _save_seg_panel(
-                surface[0], mask[0], pred[0],
+                surface[0], mask[0], pred_vis[0],
                 save_dir / f"eval_{n:05d}.png", num_classes,
                 title=panel_title, box_lines=box_lines,
             )
@@ -207,6 +213,19 @@ def main() -> None:
             vel["event_combine"] = args.event_combine
         cfg["velocity"] = vel
     head = args.head or cfg.get("segmentation", {}).get("head", "cnn")
+    # Trained heads (cnn) bake the combine into their input dim — match it from the
+    # checkpoint so the rebuilt model has the right shapes.
+    if head in ("cnn", "motion") and args.checkpoint and not (args.axis_combine or args.event_combine):
+        try:
+            _meta = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+            vel = dict(cfg.get("velocity", {}))
+            if _meta.get("axis_combine"):
+                vel["axis_combine"] = _meta["axis_combine"]
+            if _meta.get("event_combine"):
+                vel["event_combine"] = _meta["event_combine"]
+            cfg["velocity"] = vel
+        except Exception:
+            pass
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     seg_cfg = cfg.get("segmentation", {})
     num_classes = seg_cfg.get("num_classes", 16)

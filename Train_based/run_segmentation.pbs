@@ -74,3 +74,9 @@ python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
 cp "${CKPT}" "${RESULTS_DIR}/" 2>/dev/null || true
 echo "=== Job ${PBS_JOBID} finished $(date) ==="
 # When this line completes, PBS tears the job down and stops billing. No qdel needed.
+
+
+#qsub run_segmentation.pbs        # submit; prints a job id like 12345678.gadi-pbs
+#qstat -u nk8155                  # check status: Q=queued, R=running, done=gone from list
+#tail -f hdems_seg.o12345678      # watch the log live while it runs
+#qdel 12345678                    # ONLY if you want to cancel early

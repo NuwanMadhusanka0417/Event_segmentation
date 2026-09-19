@@ -94,3 +94,29 @@ class MotionSegHead(nn.Module):
             motion = torch.zeros(b, self.motion_ch, h, w, device=phi.device)
         x = torch.cat([motion.float(), ctx], dim=1)
         return self.classifier(self.embed(x))
+
+
+class HVConvHead(nn.Module):
+    """HV-as-channels CNN head (the correct way to conv a hypervector field).
+
+    Input is the paper feature tensor ``(B, in_ch, H, W)`` where the hypervector
+    is the CHANNEL vector at each grid cell (NOT a reshaped image). A 1x1 conv is
+    a per-pixel whole-hypervector template match; the following 3x3 conv adds
+    spatial context for coherent segmentation. Trained with ``hdems.train``.
+    """
+
+    def __init__(self, in_ch: int, embedding_dim: int = 32, num_classes: int = 16) -> None:
+        super().__init__()
+        hidden = embedding_dim * 4
+        groups = 8 if hidden % 8 == 0 else 1
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, hidden, 1),                 # 1x1: whole-HV template match
+            nn.GroupNorm(groups, hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, embedding_dim, 3, padding=1),  # 3x3: spatial context
+            nn.ReLU(inplace=True),
+        )
+        self.classifier = nn.Conv2d(embedding_dim, num_classes, 1)
+
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.net(feats.float()))

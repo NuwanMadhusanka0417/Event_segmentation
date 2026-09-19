@@ -14,6 +14,7 @@ from hdems.data.evimo import EVIMODataset
 from hdems.losses.flow import epe_loss
 from hdems.losses.seg import dice_loss, seg_loss
 from hdems.models.hdems import HDEMS
+from hdems.seg_features import event_pixel_mask
 
 
 def load_config(path: str | Path) -> dict:
@@ -67,10 +68,15 @@ def train_one_epoch(
         else:
             logits = out["seg_logits"]
             target = batch["mask"].to(device).long()
-            loss = seg_loss(logits, target)
+            # Train on EVENT pixels only: pixels with no events carry no evidence
+            # and would otherwise flood the loss with trivial background.
+            valid = event_pixel_mask(surface)
+            if not valid.any():
+                continue
+            loss = seg_loss(logits, target.masked_fill(~valid, 255))
             if use_dice:
                 # Dice counters heavy background/foreground imbalance.
-                loss = loss + dice_loss(logits, target.clamp(0, num_classes - 1), num_classes)
+                loss = loss + dice_loss(logits, target, num_classes, mask=valid)
 
         loss.backward()
         optimizer.step()
@@ -89,9 +95,22 @@ def main() -> None:
         default=None,
         help="Train on only the first N dataset frames (smoke test).",
     )
+    parser.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
+                        help="Override velocity.axis_combine (cnn head).")
+    parser.add_argument("--event-combine", type=str, choices=["bind", "bundle", "concat"], default=None,
+                        help="Override velocity.event_combine (cnn head).")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.axis_combine or args.event_combine:                 # CLI overrides config
+        vel = dict(cfg.get("velocity", {}))
+        if args.axis_combine:
+            vel["axis_combine"] = args.axis_combine
+        if args.event_combine:
+            vel["event_combine"] = args.event_combine
+        cfg["velocity"] = vel
+    axis = cfg.get("velocity", {}).get("axis_combine", "bind")
+    event = cfg.get("velocity", {}).get("event_combine", "bind")
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     model = HDEMS(cfg).to(device)
@@ -125,8 +144,10 @@ def main() -> None:
         lr=train_cfg.get("lr", 1e-4),
     )
 
-    # Where checkpoints go (override with train.out_dir in the config).
-    ckpt_dir = Path(train_cfg.get("out_dir", "checkpoints"))
+    # Checkpoints: train.out_dir, else checkpoints/[head]_[axis]_[event] so the
+    # combine is recorded in the path (last.pt / best.pt live inside).
+    head = cfg.get("segmentation", {}).get("head", "cnn")
+    ckpt_dir = Path(train_cfg.get("out_dir", f"checkpoints/{head}_{axis}_{event}"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_loss = float("inf")
 
@@ -140,7 +161,8 @@ def main() -> None:
 
         # Save after every epoch: always refresh last.pt, keep best.pt too.
         ckpt = {"model": model.state_dict(), "epoch": epoch + 1,
-                "loss": loss, "task": task}
+                "loss": loss, "task": task,
+                "axis_combine": axis, "event_combine": event}
         torch.save(ckpt, ckpt_dir / "last.pt")
         if loss < best_loss:
             best_loss = loss

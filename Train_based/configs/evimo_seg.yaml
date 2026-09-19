@@ -1,6 +1,6 @@
 # EV-IMO motion segmentation config
 
-d: 512
+d: 1024                  # higher d -> less random-feature noise in the cost volume
 
 encoder:
   patch_size: 21
@@ -13,6 +13,7 @@ matching:
   pyramid_levels: 4
   scales: [0, 1, 2]       # paper two-time cost volume: F0 vs F1/F2/F4 at pool 1/2/4
   alpha: 0.3              # Eq.12 probability-volume threshold coefficient
+  smooth: 3               # Eq.12 cost-volume pre-smoothing (odd; 1 = off)
   vel_scale: 1.0          # displacement->velocity scale (1.0 = pixel units)
 
 dataset:
@@ -20,8 +21,8 @@ dataset:
   root: ../Data/EVIMO2
   split: train
   eval_split: eval
-  height: 240
-  width: 320
+  height: 480            # full resolution (accuracy); REBUILD CACHE after changing
+  width: 640
   window_ms: 50.0
   time_frames: [0.0, 0.25, 0.5, 1.0]   # paper multi-time surfaces (F0,F1,F2,F4); [] = single-time
   remap_mask: true
@@ -47,7 +48,8 @@ velocity:
   event_combine: bind    # combine Phi with velocity code -> bind | bundle | concat
 
 segmentation:
-  head: prototype       # prototype | ridge | motion | cnn  (time_frames set -> paper front-end)
+  head: cnn             # cnn (HV-channels CNN, trained) | prototype | ridge | motion
+  #                      cnn/motion -> hdems.train ; ridge/prototype -> fit_ridge_head.py
   num_classes: 32
   embedding_dim: 32
   ctx_dim: 32            # motion head: compressed HV context channels

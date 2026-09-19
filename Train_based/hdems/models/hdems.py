@@ -14,7 +14,7 @@ from hdems.models.matching import HierarchicalMatcher
 from hdems.models.motion import decode_flow, ego_residual
 from hdems.models.paper_flow import flow_from_cost, multiscale_cost_volume
 from hdems.models.prototype_head import PrototypeHead
-from hdems.models.segmentation import MotionSegHead, SegmentationHead
+from hdems.models.segmentation import HVConvHead, MotionSegHead, SegmentationHead
 from hdems.ridge_head import RidgeHead
 from hdems.vsa.fpe import make_base_phases
 from hdems.vsa.temporal import bind_trajectory, make_time_phases
@@ -54,6 +54,17 @@ class HDEMS(nn.Module):
         num_classes = seg.get("num_classes", 16)
         mean_center = bool(seg.get("mean_center", False))
         motion_features = bool(seg.get("motion_features", False))
+
+        # velocity-hypervector combination (ridge / prototype / cnn heads)
+        vel = cfg.get("velocity", {})
+        self.vel_bw = float(vel.get("vel_bw", 6.0))
+        self.axis_combine = str(vel.get("axis_combine", "bind"))     # bind | bundle
+        self.event_combine = str(vel.get("event_combine", "bind"))   # bind | bundle | concat
+        self.register_buffer("phi_vx", make_base_phases(d, seed=7))
+        self.register_buffer("phi_vy", make_base_phases(d, seed=8))
+        # paper feature dim fed to a per-pixel head: concat -> 4d, else 2d
+        combine_dim = 4 * d if self.event_combine == "concat" else 2 * d
+
         if self.head_type == "ridge":
             self.seg_head = RidgeHead(
                 num_classes=num_classes,
@@ -69,13 +80,11 @@ class HDEMS(nn.Module):
             )
         elif self.head_type == "prototype":
             self.seg_head = PrototypeHead(num_classes)
-        else:
-            self.seg_head = SegmentationHead(
-                d=d,
+        else:  # "cnn" — HV-as-channels CNN on the paper feature tensor
+            self.seg_head = HVConvHead(
+                in_ch=combine_dim,
                 embedding_dim=seg.get("embedding_dim", 32),
                 num_classes=num_classes,
-                mean_center=mean_center,
-                motion_features=motion_features,
             )
         # motion-head decode params
         self.flow_beta = float(seg.get("flow_beta", 1.0))
@@ -84,13 +93,8 @@ class HDEMS(nn.Module):
         self.match_scales = tuple(match.get("scales", [0, 1, 2]))
         self.flow_alpha = float(match.get("alpha", 0.3))
         self.vel_scale = float(match.get("vel_scale", 1.0))
-        # velocity-hypervector combination (ridge / prototype heads)
-        vel = cfg.get("velocity", {})
-        self.vel_bw = float(vel.get("vel_bw", 6.0))
-        self.axis_combine = str(vel.get("axis_combine", "bind"))     # bind | bundle
-        self.event_combine = str(vel.get("event_combine", "bind"))   # bind | bundle | concat
-        self.register_buffer("phi_vx", make_base_phases(d, seed=7))
-        self.register_buffer("phi_vy", make_base_phases(d, seed=8))
+        # Eq.12 cost-volume pre-smoothing (paper: removes event-stochasticity noise)
+        self.flow_smooth = int(match.get("smooth", 1))
         self.pyramid_levels = match.get("pyramid_levels", 4)
         self.temporal_window = temp.get("window", 8)
         self.register_buffer("time_phases", make_time_phases(d))
@@ -114,8 +118,8 @@ class HDEMS(nn.Module):
         """
         fields = self.encode_times(surfaces)
         cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
-        flow = flow_from_cost(cost, self.matcher.M,
-                              alpha=self.flow_alpha, vel_scale=self.vel_scale)
+        flow = flow_from_cost(cost, self.matcher.M, alpha=self.flow_alpha,
+                              vel_scale=self.vel_scale, smooth=self.flow_smooth)
         residual, _mag = ego_residual(flow, iters=self.ego_iters)
         phi = self.matcher([fields[0]])[0]
         # residual velocity -> hypervector (axis_combine), fused with Phi (event_combine)
@@ -140,8 +144,8 @@ class HDEMS(nn.Module):
         if task == "segmentation" and self.head_type == "motion" and multitime:
             fields = self.encode_times(surface)                      # [F0, F1, F2, F4]
             cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
-            flow = flow_from_cost(cost, self.matcher.M,
-                                  alpha=self.flow_alpha, vel_scale=self.vel_scale)
+            flow = flow_from_cost(cost, self.matcher.M, alpha=self.flow_alpha,
+                                  vel_scale=self.vel_scale, smooth=self.flow_smooth)
             residual, mag = ego_residual(flow, iters=self.ego_iters)
             motion = torch.cat([residual, mag], dim=1)
             phi = self.matcher([fields[0]])[0]                       # HV context (reference)
@@ -149,11 +153,14 @@ class HDEMS(nn.Module):
             outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface[:, -1])
             return outputs
 
-        # ---- paper front-end with a linear Ridge / prototype readout --------
-        if task == "segmentation" and self.head_type in ("ridge", "prototype") and multitime:
+        # ---- paper front-end with a per-pixel readout (ridge/prototype/cnn) --
+        if task == "segmentation" and self.head_type in ("ridge", "prototype", "cnn") and multitime:
             feats, flow = self.paper_features(surface)
             outputs["flow"] = flow
-            outputs["seg_logits"] = self.seg_head.logits_from_features(feats)
+            if self.head_type == "cnn":                      # trained HV-channels CNN
+                outputs["seg_logits"] = self.seg_head(feats)
+            else:                                            # closed-form linear / prototype
+                outputs["seg_logits"] = self.seg_head.logits_from_features(feats)
             return outputs
 
         # ---- single-time paths (fall back to the last frame if a stack) -----
@@ -171,6 +178,9 @@ class HDEMS(nn.Module):
             motion = torch.cat([residual, mag], dim=1)
             outputs["flow"] = flow
             outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface)
+        elif self.head_type == "cnn":                        # single-frame fallback (event_combine != concat)
+            feats = torch.cat([phi.real, phi.imag], dim=1).float()
+            outputs["seg_logits"] = self.seg_head(feats)
         else:
             outputs["seg_logits"] = self.seg_head(phi, surface=surface)
         return outputs
