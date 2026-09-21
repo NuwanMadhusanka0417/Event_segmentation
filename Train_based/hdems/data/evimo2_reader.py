@@ -46,30 +46,6 @@ def sensor_size(meta: dict[str, Any], mask_shape: tuple[int, ...]) -> tuple[int,
     return int(mask_shape[0]), int(mask_shape[1])
 
 
-def mask_to_classes(mask: np.ndarray, remap: bool = True) -> np.ndarray:
-    """Convert EVIMO mask (object_id * 1000) to integer class labels."""
-    mask = mask.astype(np.int64)
-    if not remap:
-        return mask // 1000
-
-    labels = np.zeros_like(mask, dtype=np.int64)
-    unique = sorted(v for v in np.unique(mask) if v > 0)
-    for idx, value in enumerate(unique, start=1):
-        labels[mask == value] = idx
-    return labels
-
-
-def classical_to_surface(rgb: np.ndarray) -> torch.Tensor:
-    """RGB frame -> (2, H, W) pseudo time surface for classical-only sequences."""
-    rgb = rgb.astype(np.float32) / 255.0
-    if rgb.ndim == 2:
-        gray = rgb
-    else:
-        gray = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
-    gray_t = torch.from_numpy(gray)
-    return torch.stack([gray_t, gray_t.clone()], dim=0)
-
-
 def events_window_to_surface(
     seq_dir: Path,
     t_start: float,
@@ -171,11 +147,13 @@ def load_frame_sample(
     out_width: int | None = None,
     window_s: float = 0.05,
     decay: float = 0.8,
-    remap_mask: bool = True,
-    use_classical_fallback: bool = True,
     time_fracs: list[float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Load one aligned (surface, mask) training sample from a sequence.
+
+    EVENT DATA ONLY — there is no RGB/classical fallback. A sequence without
+    events is an error, so a wrong (frame-camera) folder can never be trained on
+    silently.
 
     If ``time_fracs`` is given, ``surface`` is a multi-time stack
     ``(len(time_fracs), 2, H, W)`` for the paper two-time cost volume; otherwise
@@ -194,29 +172,24 @@ def load_frame_sample(
     height, width = sensor_size(meta, mask_np.shape)
 
     t_path = seq_dir / "dataset_events_t.npy"
-    has_events = t_path.exists() and np.load(t_path, mmap_mode="r").size > 0
+    if not (t_path.exists() and np.load(t_path, mmap_mode="r").size > 0):
+        raise RuntimeError(
+            f"No events in {seq_dir}. This pipeline is event-only — point "
+            "dataset.root at an event camera folder (e.g. samsung_mono/imo)."
+        )
 
-    if has_events:
-        if time_fracs:
-            surface = events_multitime_surface(
-                seq_dir, ts, window_s, height, width, time_fracs, decay=decay,
-            )
-        else:
-            surface = events_window_to_surface(
-                seq_dir, ts - window_s, ts, height, width, decay=decay,
-            )
-    elif use_classical_fallback:
-        classical = np.load(seq_dir / "dataset_classical.npz")
-        c_key = f"classical_{frame_id:010d}"
-        if c_key not in classical.files:
-            raise KeyError(f"{c_key} not found in {seq_dir / 'dataset_classical.npz'}")
-        surface = classical_to_surface(classical[c_key])
-        if time_fracs:                                       # replicate to keep the stack shape
-            surface = surface.unsqueeze(0).repeat(len(time_fracs), 1, 1, 1)
+    if time_fracs:
+        surface = events_multitime_surface(
+            seq_dir, ts, window_s, height, width, time_fracs, decay=decay,
+        )
     else:
-        raise RuntimeError(f"No events and classical fallback disabled for {seq_dir}")
+        surface = events_window_to_surface(
+            seq_dir, ts - window_s, ts, height, width, decay=decay,
+        )
 
-    mask = torch.from_numpy(mask_to_classes(mask_np, remap=remap_mask)).long()
+    # Keep the RAW mask (object_id * 1000). Labels are derived at load time from
+    # dataset.label_mode, so switching mode never requires a cache rebuild.
+    mask = torch.from_numpy(mask_np.astype(np.int64))
 
     if out_height and out_width and (
         surface.shape[-2] != out_height or surface.shape[-1] != out_width
@@ -237,10 +210,11 @@ def load_frame_sample(
             mode="nearest",
         ).squeeze(0).squeeze(0).long()
 
-    return {"surface": surface.float(), "mask": mask}
+    # mask_raw marks shards that store raw ids (older shards hold derived labels).
+    return {"surface": surface.float(), "mask": mask, "mask_raw": True}
 
 
-def build_sample_index(root: Path, split: str) -> list[tuple[Path, int]]:
+def build_sample_index(root: Path, split: str, min_match: float = 0.5) -> list[tuple[Path, int]]:
     """List of (sequence_dir, frame_index) for frames that HAVE a GT mask.
 
     ``meta["frames"]`` lists every camera frame, but ``dataset_mask.npz`` only
@@ -253,7 +227,16 @@ def build_sample_index(root: Path, split: str) -> list[tuple[Path, int]]:
         meta = load_meta(seq_dir)
         with np.load(seq_dir / "dataset_mask.npz") as masks:
             present = set(masks.files)
-        for fi, frame in enumerate(meta["frames"]):
-            if f"mask_{int(frame['id']):010d}" in present:
-                index.append((seq_dir, fi))
+        frames = meta["frames"]
+        hits = [fi for fi, fr in enumerate(frames)
+                if f"mask_{int(fr['id']):010d}" in present]
+        # Some EVIMO exports number masks from 0 while the frame ids start from an
+        # offset. Then a handful of ids collide by coincidence and would pair a
+        # surface with the WRONG mask, so drop the whole sequence.
+        ratio = len(hits) / max(len(frames), 1)
+        if ratio < min_match:
+            print(f"[data] skipping {seq_dir.name}: only {len(hits)}/{len(frames)} "
+                  f"frames match a mask ({ratio:.0%}) — inconsistent mask indexing")
+            continue
+        index.extend((seq_dir, fi) for fi in hits)
     return index

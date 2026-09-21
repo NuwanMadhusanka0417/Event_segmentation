@@ -14,6 +14,7 @@ from hdems.data.evimo2_reader import (
     load_frame_sample,
     load_meta,
 )
+from hdems.data.labels import to_labels
 
 
 class EVIMODataset(Dataset):
@@ -38,9 +39,8 @@ class EVIMODataset(Dataset):
         width: int = 640,
         window_ms: float = 50.0,
         decay: float = 0.8,
-        remap_mask: bool = True,
-        use_classical_fallback: bool = True,
         time_frames: list[float] | None = None,
+        label_mode: str = "motion",
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -49,9 +49,8 @@ class EVIMODataset(Dataset):
         self.width = width
         self.window_s = window_ms / 1000.0
         self.decay = decay
-        self.remap_mask = remap_mask
-        self.use_classical_fallback = use_classical_fallback
         self.time_frames = time_frames or None  # [] -> None (single-time)
+        self.label_mode = str(label_mode).lower()
 
         self.cached: list[Path] = find_cached_samples(self.root, split)
         self.index: list[tuple[Path, int]] = (
@@ -70,18 +69,31 @@ class EVIMODataset(Dataset):
             )
 
         if self.cached:
-            return torch.load(self.cached[idx], weights_only=True)
+            return self._apply_labels(torch.load(self.cached[idx], weights_only=True))
 
         seq_dir, frame_idx = self.index[idx]
         frame = load_meta(seq_dir)["frames"][frame_idx]
-        return load_frame_sample(
+        return self._apply_labels(load_frame_sample(
             seq_dir,
             frame,
             out_height=self.height,
             out_width=self.width,
             window_s=self.window_s,
             decay=self.decay,
-            remap_mask=self.remap_mask,
-            use_classical_fallback=self.use_classical_fallback,
             time_fracs=self.time_frames,
-        )
+        ))
+
+    def _apply_labels(self, sample: dict[str, Any]) -> dict[str, Any]:
+        """Raw mask -> labels for the chosen label_mode; keep raw ids as gt_raw.
+
+        Shards written before this change already hold derived labels (no
+        ``mask_raw`` flag) and are passed through unchanged.
+        """
+        if not sample.get("mask_raw", False):
+            return sample
+        raw = sample["mask"].long()
+        return {
+            "surface": sample["surface"],
+            "mask": to_labels(raw, self.label_mode),
+            "gt_raw": raw,                 # original object ids (instance metric)
+        }

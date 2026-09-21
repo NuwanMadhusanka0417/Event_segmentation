@@ -18,15 +18,15 @@ matching:
 
 dataset:
   name: evimo
-  root: ../Data/EVIMO2
+  root: ../Data/EVIMO2_new/samsung_mono/imo   # EVENT camera (Samsung DVS, 640x480)
   split: train
   eval_split: eval
   height: 480            # full resolution (accuracy); REBUILD CACHE after changing
   width: 640
   window_ms: 50.0
   time_frames: [0.0, 0.25, 0.5, 1.0]   # paper multi-time surfaces (F0,F1,F2,F4); [] = single-time
-  remap_mask: true
-  use_classical_fallback: true
+  label_mode: motion     # motion = moving vs background (Option A, 2 classes)
+  #                        objects = per-object id (Option B; ids 5..28 -> needs >=29)
 
 train:
   task: segmentation
@@ -50,7 +50,7 @@ velocity:
 segmentation:
   head: cnn             # cnn (HV-channels CNN, trained) | prototype | ridge | motion
   #                      cnn/motion -> hdems.train ; ridge/prototype -> fit_ridge_head.py
-  num_classes: 32
+  num_classes: 32        # used by label_mode=objects/remap; motion forces 2
   embedding_dim: 32
   ctx_dim: 32            # motion head: compressed HV context channels
   flow_beta: 1.0         # motion head: soft-argmax temperature for Phi->velocity

@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from hdems.data.labels import num_classes_for, resolve_label_mode
 from hdems.eval import build_dataset, evaluate_segmentation, load_config
 from hdems.train import train_one_epoch
 from hdems.feature_extract import (
@@ -123,6 +124,8 @@ def main() -> None:
                     help="Vx,Vy combine (overrides velocity.axis_combine).")
     ap.add_argument("--event-combine", type=str, choices=["bind", "bundle", "concat"], default=None,
                     help="Phi+velocity combine (overrides velocity.event_combine).")
+    ap.add_argument("--label-mode", type=str, choices=["motion", "objects", "remap"], default=None,
+                    help="motion = moving vs background (Option A); objects = per-object id (Option B).")
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--backend", choices=["streaming", "sklearn"], default=None)
@@ -141,6 +144,8 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.label_mode:
+        cfg["dataset"] = {**cfg.get("dataset", {}), "label_mode": args.label_mode}
     if args.axis_combine or args.event_combine:                 # CLI overrides config
         vel = dict(cfg.get("velocity", {}))
         if args.axis_combine:
@@ -151,8 +156,12 @@ def main() -> None:
     axis = cfg.get("velocity", {}).get("axis_combine", "bind")
     event = cfg.get("velocity", {}).get("event_combine", "bind")
     ridge_cfg = cfg.get("ridge", {})
+    # Label mode fixes the class count so head size and labels always agree.
+    label_mode = resolve_label_mode(cfg)
+    num_classes = num_classes_for(label_mode, cfg.get("segmentation", {}).get("num_classes", 32))
+    cfg["segmentation"] = {**cfg.get("segmentation", {}), "num_classes": num_classes}
     seg_cfg = cfg.get("segmentation", {})
-    num_classes = seg_cfg.get("num_classes", 32)
+    print(f"[fit] label_mode={label_mode}  num_classes={num_classes}")
     head_type = (args.head or seg_cfg.get("head", "ridge")).lower()
     if head_type not in ("ridge", "prototype", "cnn", "motion"):
         raise SystemExit(f"unknown head {head_type!r} (ridge|prototype|cnn|motion)")
@@ -211,7 +220,8 @@ def main() -> None:
     # ---- trainable heads (cnn / motion): backprop, keep best epoch by val mIoU --
     if trainable:
         out_path = (Path(args.out) if args.out else
-                    Path("checkpoints") / f"{head_type}_{axis}_{event}_{len(train_ds)}.pt")
+                    Path("checkpoints")
+                    / f"{head_type}_{axis}_{event}_{label_mode}_{len(train_ds)}.pt")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         train_cfg = cfg.get("train", {})
         net = HDEMS({**cfg, "segmentation": {**seg_cfg, "head": head_type}}).to(device)
@@ -239,8 +249,9 @@ def main() -> None:
 
         torch.save({"model": best_state, "task": "segmentation", "head": head_type,
                     "epoch": best_epoch, "val_miou": best_score if len(val_ds) else None,
-                    "num_samples": len(train_ds),
-                    "axis_combine": axis, "event_combine": event}, out_path)
+                    "num_samples": len(train_ds), "num_classes": num_classes,
+                    "axis_combine": axis, "event_combine": event,
+                    "label_mode": label_mode}, out_path)
         print(f"[train] saved {out_path}  best epoch={best_epoch}  score={best_score:.4f}")
         return
 
@@ -272,7 +283,8 @@ def main() -> None:
     if args.out:
         out_path = Path(args.out)
     else:
-        out_path = Path("checkpoints") / f"{head_type}_{axis}_{event}_{len(train_ds)}.pt"
+        out_path = (Path("checkpoints")
+                    / f"{head_type}_{axis}_{event}_{label_mode}_{len(train_ds)}.pt")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # ---- prototype head: class-mean centroids, no alpha sweep -----------------
@@ -285,7 +297,8 @@ def main() -> None:
         save_prototypes(str(out_path), protos, num_classes,
                         extra={"val_miou": miou, "seed": args.seed,
                                "num_samples": len(train_ds),
-                               "axis_combine": axis, "event_combine": event})
+                               "axis_combine": axis, "event_combine": event,
+                               "label_mode": label_mode})
         print(f"[proto] saved {out_path}  val_mIoU={miou:.4f}  "
               f"prototypes={tuple(protos.shape)}")
         return
@@ -336,7 +349,8 @@ def main() -> None:
         best_result,
         extra={"val_miou": best_miou, "seed": args.seed, "backend": backend,
                "num_samples": len(train_ds),
-               "axis_combine": axis, "event_combine": event},
+               "axis_combine": axis, "event_combine": event,
+               "label_mode": label_mode},
     )
     print(f"[ridge] saved {out_path}  alpha={best_alpha:g}  val_mIoU={best_miou:.4f}  "
           f"W shape={tuple(best_result.weight.shape)}  imbalance={imbalance}")

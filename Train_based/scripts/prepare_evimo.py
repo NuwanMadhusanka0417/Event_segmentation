@@ -49,8 +49,6 @@ def main() -> None:
     width = ds.get("width", 640)
     window_s = ds.get("window_ms", 50.0) / 1000.0
     decay = cfg.get("time_surface", {}).get("decay", 0.8)
-    remap = ds.get("remap_mask", True)
-    fallback = ds.get("use_classical_fallback", True)
     time_fracs = ds.get("time_frames")
 
     for split in args.splits:
@@ -69,7 +67,6 @@ def main() -> None:
                 seq_dir, frame,
                 out_height=height, out_width=width,
                 window_s=window_s, decay=decay,
-                remap_mask=remap, use_classical_fallback=fallback,
                 time_fracs=time_fracs,
             )
             out_path = out_dir / f"{seq_dir.name}_{fi:06d}.pt"

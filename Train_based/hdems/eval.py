@@ -6,6 +6,7 @@ import argparse
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
@@ -15,6 +16,9 @@ from hdems.data.evimo import EVIMODataset
 from hdems.losses.flow import epe_loss
 from hdems.losses.seg import seg_loss
 from hdems.metrics import mean_iou
+from hdems.data.labels import num_classes_for, resolve_label_mode
+from hdems.detection import detection_metrics, masks_to_boxes
+from hdems.instances import binary_iou, connected_components, instance_metrics
 from hdems.models.hdems import HDEMS
 from hdems.seg_features import event_pixel_mask
 
@@ -40,9 +44,8 @@ def build_dataset(cfg: dict, split: str | None = None):
         width=ds_cfg.get("width", 640),
         window_ms=ds_cfg.get("window_ms", 50.0),
         decay=cfg.get("time_surface", {}).get("decay", 0.8),
-        remap_mask=ds_cfg.get("remap_mask", True),
-        use_classical_fallback=ds_cfg.get("use_classical_fallback", True),
         time_frames=ds_cfg.get("time_frames"),
+        label_mode=resolve_label_mode(cfg),
     )
 
 
@@ -114,12 +117,18 @@ def evaluate_segmentation(
     *,
     panel_title: str = "prediction",
     box_lines: list[str] | None = None,
+    label_mode: str = "motion",
+    min_instance: int = 50,
+    detect: bool = False,
 ) -> dict[str, float]:
     model.eval()
     ious: list[float] = []
     total_loss = 0.0
     n = 0
     saved = 0
+    fg_ious: list[float] = []          # motion mode: foreground IoU
+    inst_scores: list[dict] = []       # motion mode: instance matching
+    det_scores: list[dict] = []        # object detection: box matching
 
     if save_dir is not None:
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +145,23 @@ def evaluate_segmentation(
         pred = logits.argmax(dim=1)
         ious.append(mean_iou(pred[0], mask[0], num_classes, valid=valid[0]))
 
+        if label_mode == "motion":
+            # Option A: foreground IoU + class-agnostic instance matching.
+            v = valid[0].cpu().numpy()
+            pred_fg = (pred[0] > 0).cpu().numpy()
+            gt_fg = (mask[0] > 0).cpu().numpy()
+            fg_ious.append(binary_iou(pred_fg, gt_fg, valid=v))
+            gt_raw = batch.get("gt_raw")
+            if gt_raw is not None:
+                gt_inst = (gt_raw[0].cpu().numpy().astype(np.int64)) // 1000
+                pred_inst = connected_components(np.logical_and(pred_fg, v),
+                                                 min_size=min_instance)
+                inst_scores.append(instance_metrics(pred_inst, gt_inst, valid=v))
+                if detect:                       # boxes = extent of each instance
+                    det_scores.append(detection_metrics(
+                        masks_to_boxes(pred_inst, min_area=min_instance),
+                        masks_to_boxes(gt_inst, min_area=min_instance)))
+
         if save_dir is not None and saved < max_images:
             # show the prediction where it is scored; elsewhere = background
             pred_vis = pred.masked_fill(~valid, 0)
@@ -150,10 +176,29 @@ def evaluate_segmentation(
     if save_dir is not None:
         print(f"Saved {saved} panels to {save_dir.resolve()}")
 
-    return {
+    out: dict[str, float] = {
         "loss": total_loss / max(n, 1),
         "miou": sum(ious) / max(len(ious), 1),
     }
+    if label_mode == "motion":
+        fin = [v for v in fg_ious if v == v]                      # drop NaN frames
+        out["fg_iou"] = sum(fin) / max(len(fin), 1)
+        if inst_scores:
+            im = [s["instance_miou"] for s in inst_scores if s["instance_miou"] == s["instance_miou"]]
+            out["instance_miou"] = sum(im) / max(len(im), 1)
+            out["precision"] = sum(s["precision"] for s in inst_scores) / len(inst_scores)
+            out["recall"] = sum(s["recall"] for s in inst_scores) / len(inst_scores)
+            out["mean_pred_instances"] = sum(s["n_pred"] for s in inst_scores) / len(inst_scores)
+            out["mean_gt_instances"] = sum(s["n_gt"] for s in inst_scores) / len(inst_scores)
+    if det_scores:
+        k = len(det_scores)
+        out["det_precision"] = sum(s["det_precision"] for s in det_scores) / k
+        out["det_recall"] = sum(s["det_recall"] for s in det_scores) / k
+        out["det_miou"] = sum(s["det_miou"] for s in det_scores) / k
+        out["det_tp"] = sum(s["tp"] for s in det_scores)
+        out["det_n_gt"] = sum(s["n_gt"] for s in det_scores)
+        out["det_n_pred"] = sum(s["n_pred"] for s in det_scores)
+    return out
 
 
 @torch.no_grad()
@@ -197,16 +242,22 @@ def main() -> None:
                         help="Override velocity.axis_combine (else taken from the checkpoint).")
     parser.add_argument("--event-combine", type=str, choices=["bind", "bundle", "concat"], default=None,
                         help="Override velocity.event_combine (else taken from the checkpoint).")
+    parser.add_argument("--label-mode", type=str, choices=["motion", "objects", "remap"], default=None,
+                        help="Override dataset.label_mode (else taken from the checkpoint).")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save-images", type=str, default=None)
     parser.add_argument("--max-images", type=int, default=50)
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Evaluate on only the first N dataset frames (smoke test).")
+    parser.add_argument("--detect", action="store_true",
+                        help="Also report object detection (boxes from predicted instances).")
     parser.add_argument("--compare-heads", action="store_true",
                         help="Run CNN and Ridge on same loader; write compare panels")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.label_mode:
+        cfg["dataset"] = {**cfg.get("dataset", {}), "label_mode": args.label_mode}
     if args.axis_combine or args.event_combine:                 # CLI overrides config
         vel = dict(cfg.get("velocity", {}))
         if args.axis_combine:
@@ -218,23 +269,32 @@ def main() -> None:
     # Whichever checkpoint flag was given (compare mode keeps them separate).
     any_ckpt = None if args.compare_heads else (
         args.checkpoint or args.prototype_checkpoint or args.ridge_checkpoint)
-    trained_ckpt = args.checkpoint or any_ckpt
-    # Trained heads (cnn) bake the combine into their input dim — match it from the
-    # checkpoint so the rebuilt model has the right shapes.
-    if head in ("cnn", "motion") and trained_ckpt and not (args.axis_combine or args.event_combine):
+    # A checkpoint records the combine AND the label mode it was built with; both
+    # decide tensor shapes (feature dim, class count), so read them back for EVERY
+    # head before anything is constructed. CLI flags still win.
+    peek_ckpt = args.checkpoint or args.prototype_checkpoint or args.ridge_checkpoint
+    if peek_ckpt:
         try:
-            _meta = torch.load(trained_ckpt, map_location="cpu", weights_only=False)
-            vel = dict(cfg.get("velocity", {}))
-            if _meta.get("axis_combine"):
-                vel["axis_combine"] = _meta["axis_combine"]
-            if _meta.get("event_combine"):
-                vel["event_combine"] = _meta["event_combine"]
-            cfg["velocity"] = vel
+            _meta = torch.load(peek_ckpt, map_location="cpu", weights_only=False)
+            if isinstance(_meta, dict):
+                vel = dict(cfg.get("velocity", {}))
+                if not args.axis_combine and _meta.get("axis_combine"):
+                    vel["axis_combine"] = _meta["axis_combine"]
+                if not args.event_combine and _meta.get("event_combine"):
+                    vel["event_combine"] = _meta["event_combine"]
+                cfg["velocity"] = vel
+                if not args.label_mode and _meta.get("label_mode"):
+                    cfg["dataset"] = {**cfg.get("dataset", {}),
+                                      "label_mode": _meta["label_mode"]}
         except Exception:
             pass
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    # Label mode fixes the class count -> must match what the head was trained with.
+    label_mode = resolve_label_mode(cfg)
+    num_classes = num_classes_for(label_mode, cfg.get("segmentation", {}).get("num_classes", 32))
+    cfg["segmentation"] = {**cfg.get("segmentation", {}), "num_classes": num_classes}
     seg_cfg = cfg.get("segmentation", {})
-    num_classes = seg_cfg.get("num_classes", 16)
+    print(f"label_mode={label_mode}  num_classes={num_classes}")
     task = cfg.get("train", {}).get("task", "flow")
     eval_split = cfg.get("eval", {}).get("split", cfg.get("dataset", {}).get("eval_split", "eval"))
 
@@ -345,12 +405,26 @@ def main() -> None:
             model, loader, device, num_classes,
             save_dir=save_dir, max_images=args.max_images,
             panel_title=f"{head} head", box_lines=box,
+            label_mode=label_mode, detect=args.detect,
         )
         sample = dataset[0]["surface"].unsqueeze(0)
         ms = measure_seg_latency(model, sample, device)
-        print(f"Head: {head}")
+        print(f"Head: {head}  label_mode: {label_mode}")
         print(f"Seg loss: {metrics['loss']:.4f}")
         print(f"mIoU:     {metrics['miou']:.4f}")
+        if label_mode == "motion":
+            print(f"FG IoU (moving vs background): {metrics.get('fg_iou', float('nan')):.4f}")
+            if "instance_miou" in metrics:
+                print(f"Instance mIoU (matched):      {metrics['instance_miou']:.4f}")
+                print(f"Instance P / R @0.5:          "
+                      f"{metrics['precision']:.3f} / {metrics['recall']:.3f}")
+                print(f"Instances pred / gt (avg):    "
+                      f"{metrics['mean_pred_instances']:.2f} / {metrics['mean_gt_instances']:.2f}")
+        if "det_precision" in metrics:
+            print("--- object detection (boxes from instances) ---")
+            print(f"Box P / R @0.5:  {metrics['det_precision']:.3f} / {metrics['det_recall']:.3f}")
+            print(f"Box mIoU:        {metrics['det_miou']:.4f}")
+            print(f"TP / pred / gt:  {metrics['det_tp']} / {metrics['det_n_pred']} / {metrics['det_n_gt']}")
         print(f"Latency:  {ms:.2f} ms/frame ({device})")
         print(f"Head params: {model.seg_head_param_count():,}  "
               f"(trainable total: {model.num_trainable_params:,})")
