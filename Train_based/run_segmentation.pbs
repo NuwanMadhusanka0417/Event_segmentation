@@ -17,12 +17,15 @@ set -eo pipefail   # stop immediately if fit fails, so eval never runs on a stal
 # ---------------------------------------------------------------------------
 # PARAMETERS  (edit these; everything below is derived from them)
 # ---------------------------------------------------------------------------
-AX_COMBINE=bind        # bind | bundle
-EV_COMBINE=concat        # bind | bundle | concat
-HEAD=cnn         # prototype | ridge | motion | cnn
-SAMPLES=300            # max train samples,  valid 1-4000
-VAL_SAMPLES=150        # max val samples while training  (integer count)
-TEST_SAMPLES=50       # max eval images for testing   (integer count)
+AX_COMBINE=bind        # bind | bundle          (combine Vx,Vy)
+EV_COMBINE=concat      # bind | bundle | concat (combine Phi with the velocity code)
+HEAD=cnn               # cnn | prototype | ridge | motion
+LABEL_MODE=motion      # motion = moving vs background (Option A)
+                       # objects = per-object id        (Option B)
+DETECT=yes             # yes | no  -> also report object detection (boxes from instances)
+SAMPLES=300            # max train frames   (train split has 9,446 usable)
+VAL_SAMPLES=150        # val frames used to pick the best epoch / alpha
+TEST_SAMPLES=50        # max eval panels saved
 
 CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
 CONFIG=configs/evimo_seg.yaml
@@ -37,7 +40,7 @@ source "${VENV}"
 cd "${CODE_DIR}"
 
 # Derived names -------------------------------------------------------------
-RUN_NAME="${HEAD}_${AX_COMBINE}_${EV_COMBINE}_${SAMPLES}"
+RUN_NAME="${HEAD}_${AX_COMBINE}_${EV_COMBINE}_${LABEL_MODE}_${SAMPLES}"
 CKPT="checkpoints/${RUN_NAME}.pt"
 RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${RESULTS_DIR}"
@@ -54,17 +57,22 @@ echo "---------------------------------------------------------------"
 # ---------------------------------------------------------------------------
 # 1. FIT THE HEAD
 # ---------------------------------------------------------------------------
-echo ">>> [$(date +%T)] fitting ${HEAD} head"
+echo ">>> [$(date +%T)] fitting ${HEAD} head (label_mode=${LABEL_MODE})"
 python scripts/fit_ridge_head.py --config "${CONFIG}" \
   --head "${HEAD}" --axis-combine "${AX_COMBINE}" --event-combine "${EV_COMBINE}" \
+  --label-mode "${LABEL_MODE}" --out "${CKPT}" \
   --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"
 
 # ---------------------------------------------------------------------------
 # 2. EVALUATE
 # ---------------------------------------------------------------------------
+# --detect adds box-level detection metrics (instances -> boxes) on top of segmentation
+DETECT_FLAG=""
+if [ "${DETECT}" = "yes" ]; then DETECT_FLAG="--detect"; fi
+
 echo ">>> [$(date +%T)] evaluating -> ${RESULTS_DIR}/eval_images"
 python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
-  --prototype-checkpoint "${CKPT}" \
+  --checkpoint "${CKPT}" ${DETECT_FLAG} \
   --device cuda --save-images "${RESULTS_DIR}/eval_images" \
   --max-images "${TEST_SAMPLES}"
 
