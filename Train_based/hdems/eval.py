@@ -20,6 +20,7 @@ from hdems.data.labels import num_classes_for, resolve_label_mode
 from hdems.detection import detection_metrics, masks_to_boxes
 from hdems.instances import binary_iou, connected_components, instance_metrics
 from hdems.models.hdems import HDEMS
+from hdems.vsa.velocity import EVENT_COMBINES
 from hdems.seg_features import event_pixel_mask
 
 
@@ -240,8 +241,10 @@ def main() -> None:
     parser.add_argument("--head", type=str, choices=["cnn", "ridge", "prototype", "motion"], default=None)
     parser.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
                         help="Override velocity.axis_combine (else taken from the checkpoint).")
-    parser.add_argument("--event-combine", type=str, choices=["bind", "bundle", "concat"], default=None,
+    parser.add_argument("--event-combine", type=str, choices=list(EVENT_COMBINES), default=None,
                         help="Override velocity.event_combine (else taken from the checkpoint).")
+    parser.add_argument("--event-feature", type=str, choices=["phi", "f"], default=None,
+                        help="Override velocity.event_feature (else taken from the checkpoint).")
     parser.add_argument("--label-mode", type=str, choices=["motion", "objects", "remap"], default=None,
                         help="Override dataset.label_mode (else taken from the checkpoint).")
     parser.add_argument("--device", type=str, default="cuda")
@@ -258,12 +261,14 @@ def main() -> None:
     cfg = load_config(args.config)
     if args.label_mode:
         cfg["dataset"] = {**cfg.get("dataset", {}), "label_mode": args.label_mode}
-    if args.axis_combine or args.event_combine:                 # CLI overrides config
+    if args.axis_combine or args.event_combine or args.event_feature:   # CLI overrides config
         vel = dict(cfg.get("velocity", {}))
         if args.axis_combine:
             vel["axis_combine"] = args.axis_combine
         if args.event_combine:
             vel["event_combine"] = args.event_combine
+        if args.event_feature:
+            vel["event_feature"] = args.event_feature
         cfg["velocity"] = vel
     head = args.head or cfg.get("segmentation", {}).get("head", "cnn")
     # Whichever checkpoint flag was given (compare mode keeps them separate).
@@ -282,6 +287,8 @@ def main() -> None:
                     vel["axis_combine"] = _meta["axis_combine"]
                 if not args.event_combine and _meta.get("event_combine"):
                     vel["event_combine"] = _meta["event_combine"]
+                if not args.event_feature:          # checkpoints older than the option = phi
+                    vel["event_feature"] = _meta.get("event_feature", "phi")
                 cfg["velocity"] = vel
                 if not args.label_mode and _meta.get("label_mode"):
                     cfg["dataset"] = {**cfg.get("dataset", {}),
@@ -308,6 +315,8 @@ def main() -> None:
                 model.axis_combine = meta["axis_combine"]
             if not args.event_combine and meta.get("event_combine"):
                 model.event_combine = meta["event_combine"]
+            if not args.event_feature:
+                model.event_feature = meta.get("event_feature", "phi")
 
         if head_name == "ridge":
             rpath = args.ridge_checkpoint or any_ckpt or seg_cfg.get("ridge_weights")
@@ -409,7 +418,8 @@ def main() -> None:
         )
         sample = dataset[0]["surface"].unsqueeze(0)
         ms = measure_seg_latency(model, sample, device)
-        print(f"Head: {head}  label_mode: {label_mode}")
+        print(f"Head: {head}  label_mode: {label_mode}  event_feature: {model.event_feature}  "
+              f"axis_combine: {model.axis_combine}  event_combine: {model.event_combine}")
         print(f"Seg loss: {metrics['loss']:.4f}")
         print(f"mIoU:     {metrics['miou']:.4f}")
         if label_mode == "motion":

@@ -59,7 +59,8 @@ class HDEMS(nn.Module):
         vel = cfg.get("velocity", {})
         self.vel_bw = float(vel.get("vel_bw", 6.0))
         self.axis_combine = str(vel.get("axis_combine", "bind"))     # bind | bundle
-        self.event_combine = str(vel.get("event_combine", "bind"))   # bind | bundle | concat
+        self.event_combine = str(vel.get("event_combine", "bind"))   # bind | bundle | bindbundle | concat
+        self.event_feature = str(vel.get("event_feature", "phi"))    # phi | f
         self.register_buffer("phi_vx", make_base_phases(d, seed=7))
         self.register_buffer("phi_vy", make_base_phases(d, seed=8))
         # paper feature dim fed to a per-pixel head: concat -> 4d, else 2d
@@ -107,25 +108,36 @@ class HDEMS(nn.Module):
         """Encode each time-frame of a multi-time stack (B, T, 2, H, W) -> [F_t]."""
         return [self.encoder(surfaces[:, t]) for t in range(surfaces.shape[1])]
 
+    def event_hv(self, f0: torch.Tensor) -> torch.Tensor:
+        """Event hypervector fused with velocity (velocity.event_feature).
+
+        phi -> bundled 7x7 neighbourhood of F0, each neighbour bound to its offset code
+        f   -> the VFA descriptor F0 itself (paper Eq.4, F = T * K)
+        """
+        if self.event_feature == "phi":
+            return self.matcher([f0])[0]
+        if self.event_feature == "f":
+            return f0
+        raise ValueError(f"event_feature must be phi|f, got {self.event_feature!r}")
+
     def paper_features(self, surfaces: torch.Tensor):
         """Paper front-end features for a linear (Ridge) readout.
 
         (B, T, 2, H, W) -> (feats, flow):
-          feats = [Phi.real | Phi.imag | residual_vx, residual_vy, |r|]  (B, 2d+3, H, W)
+          feats = event HV X (Phi or F, event_feature) fused with the residual-velocity
+                  HV Mv (event_combine): (B, 2d, H, W), or (B, 4d, H, W) for concat
           flow  = decoded optical flow (B, 2, H, W)
-        Same construction the motion head consumes, but concatenated so a linear
-        classifier can read it directly.
         """
         fields = self.encode_times(surfaces)
         cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
         flow = flow_from_cost(cost, self.matcher.M, alpha=self.flow_alpha,
                               vel_scale=self.vel_scale, smooth=self.flow_smooth)
         residual, _mag = ego_residual(flow, iters=self.ego_iters)
-        phi = self.matcher([fields[0]])[0]
-        # residual velocity -> hypervector (axis_combine), fused with Phi (event_combine)
+        x = self.event_hv(fields[0])
+        # residual velocity -> hypervector (axis_combine), fused with X (event_combine)
         mv = encode_velocity(residual[:, 0], residual[:, 1], self.phi_vx, self.phi_vy,
                              vel_bw=self.vel_bw, axis_combine=self.axis_combine)
-        feats = combine_event_velocity(phi, mv, self.event_combine)
+        feats = combine_event_velocity(x, mv, self.event_combine)
         return feats, flow
 
     def forward(
@@ -148,7 +160,7 @@ class HDEMS(nn.Module):
                                   vel_scale=self.vel_scale, smooth=self.flow_smooth)
             residual, mag = ego_residual(flow, iters=self.ego_iters)
             motion = torch.cat([residual, mag], dim=1)
-            phi = self.matcher([fields[0]])[0]                       # HV context (reference)
+            phi = self.event_hv(fields[0])                           # HV context (Phi or F)
             outputs["flow"] = flow
             outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface[:, -1])
             return outputs

@@ -34,16 +34,26 @@ With `dataset.time_frames` set, all heads use the paper front-end.
 
 ## Velocity → event combination (selectable)
 
-The residual velocity is FPE-encoded (`Vx`, `Vy`) and fused with Φ. Two choices,
-set in the config **or** on the command line:
+The residual velocity is FPE-encoded (`Vx`, `Vy`) into a velocity hypervector `Mv`
+and fused with an event hypervector `X`. Three choices, set in the config **or** on
+the command line:
 
 | Option | Values | Meaning |
 |---|---|---|
-| `velocity.axis_combine` / `--axis-combine` | `bind` · `bundle` | combine `Vx, Vy` |
-| `velocity.event_combine` / `--event-combine` | `bind` · `bundle` · `concat` | combine Φ with the velocity code |
+| `velocity.event_feature` / `--event-feature` | `phi` · `f` | event HV `X`: `phi` = 7×7 bundled neighbourhood field Φ (default), `f` = VFA descriptor F0 (paper Eq.4) |
+| `velocity.axis_combine` / `--axis-combine` | `bind` · `bundle` | combine `Vx, Vy` → `Mv` |
+| `velocity.event_combine` / `--event-combine` | `bind` · `bundle` · `bindbundle` · `concat` | combine `X` with `Mv` |
 
-Feature dim: `2d` for `bind`/`bundle`, `4d` for `concat`. Natural pairings:
-`prototype`+`bind`, `ridge`+`concat` — but measure them.
+`event_combine`:
+- `bind` → `X ⊙ Mv`
+- `bundle` → `X + Mv`
+- `bindbundle` → `(X̂ ⊙ Mv) + Mv`, where `X̂ = X / RMS(X)` per frame. The rescale is
+  needed because `|Mv| = 1` while F is ~5–11× and Φ ~100–350× larger on event pixels,
+  so an unscaled bundle would drown the velocity term.
+- `concat` → `[X | Mv]`
+
+Feature dim: `4d` for `concat`, `2d` for the others. Old checkpoints without
+`event_feature` load as `phi`.
 
 ## Layout
 
@@ -56,7 +66,7 @@ Train_based/
 │   │   └── evimo.py             EVIMODataset (raw or cached .pt shards)
 │   ├── vsa/
 │   │   ├── fpe.py               FPE, HRR bind/bundle/similarity
-│   │   ├── velocity.py          residual-velocity hypervector + combine (bind/bundle/concat)
+│   │   ├── velocity.py          residual-velocity hypervector + combine (bind/bundle/bindbundle/concat)
 │   │   └── kernel.py, temporal.py
 │   ├── models/
 │   │   ├── encoder.py           paper VFA kernel  F = T ∗ K  (FPE over positions)
@@ -116,26 +126,27 @@ source scripts/nci_env.sh
 # 1) Build the multi-time cache ONCE (see cache note below).
 python scripts/prepare_evimo.py --config configs/evimo_seg.yaml
 
-# 2) Fit a readout. Combine + head are CLI options; the checkpoint is auto-named
-#    checkpoints/[head]_[axis]_[event]_[num_train_frames].pt  (omit --out).
+# 2) Fit a readout. Feature + combine + head are CLI options; the checkpoint is
+#    auto-named checkpoints/[head]_[feature]_[axis]_[event]_[label_mode]_[N].pt (omit --out).
 python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml \
-  --head prototype --axis-combine bind --event-combine bind \
+  --head prototype --event-feature phi --axis-combine bind --event-combine bind \
   --device cuda --max-train-samples 500 --max-val-samples 50
-#  -> checkpoints/prototype_bind_bind_500.pt
+#  -> checkpoints/prototype_phi_bind_bind_motion_500.pt
 
-# 3) Evaluate: mIoU + PNG panels. The combo is read from the checkpoint.
+# 3) Evaluate: mIoU + PNG panels. Feature + combine are read from the checkpoint.
 python -m hdems.eval --config configs/evimo_seg.yaml --head prototype \
-  --prototype-checkpoint checkpoints/prototype_bind_bind_500.pt \
+  --checkpoint checkpoints/prototype_phi_bind_bind_motion_500.pt \
   --device cuda --save-images eval_out --max-images 50
 ```
 
-Ridge example:
+Ridge example, F0 with bind+bundle:
 ```bash
 python scripts/fit_ridge_head.py --config configs/evimo_seg.yaml \
-  --head ridge --axis-combine bind --event-combine concat --max-train-samples 500
-#  -> checkpoints/ridge_bind_concat_500.pt
+  --head ridge --event-feature f --axis-combine bind --event-combine bindbundle \
+  --max-train-samples 500
+#  -> checkpoints/ridge_f_bind_bindbundle_motion_500.pt
 python -m hdems.eval --config configs/evimo_seg.yaml --head ridge \
-  --ridge-checkpoint checkpoints/ridge_bind_concat_500.pt --save-images eval_out/ridge
+  --checkpoint checkpoints/ridge_f_bind_bindbundle_motion_500.pt --save-images eval_out/ridge
 ```
 
 Trained CNN motion head (uses `hdems.train`, not the fit script):
@@ -168,8 +179,9 @@ python scripts/prepare_evimo.py --config configs/evimo_seg.yaml
 | `matching.alpha` | Eq.12 probability-volume threshold (0.3) |
 | `dataset.time_frames` | `[0,0.25,0.5,1.0]` multi-time (paper); `[]` = single-time |
 | `dataset.height/width` | working resolution (240×320) |
+| `velocity.event_feature` | `phi` · `f` |
 | `velocity.axis_combine` | `bind` · `bundle` |
-| `velocity.event_combine` | `bind` · `bundle` · `concat` |
+| `velocity.event_combine` | `bind` · `bundle` · `bindbundle` · `concat` |
 | `segmentation.head` | `prototype` (default) · `ridge` · `motion` · `cnn` |
 
 ## Notes

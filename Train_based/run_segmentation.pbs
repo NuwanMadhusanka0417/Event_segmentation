@@ -17,8 +17,10 @@ set -eo pipefail   # stop immediately if fit fails, so eval never runs on a stal
 # ---------------------------------------------------------------------------
 # PARAMETERS  (edit these; everything below is derived from them)
 # ---------------------------------------------------------------------------
+EV_FEATURE=phi         # phi | f                (event HV: Phi neighbourhood field, or descriptor F0)
 AX_COMBINE=bind        # bind | bundle          (combine Vx,Vy)
-EV_COMBINE=concat      # bind | bundle | concat (combine Phi with the velocity code)
+EV_COMBINE=concat      # bind | bundle | bindbundle | concat   (combine event HV X with velocity Mv)
+                       #   bindbundle = (X^ o Mv) + Mv
 HEAD=cnn               # cnn | prototype | ridge | motion
 LABEL_MODE=motion      # motion = moving vs background (Option A)
                        # objects = per-object id        (Option B)
@@ -40,26 +42,85 @@ source "${VENV}"
 cd "${CODE_DIR}"
 
 # Derived names -------------------------------------------------------------
-RUN_NAME="${HEAD}_${AX_COMBINE}_${EV_COMBINE}_${LABEL_MODE}_${SAMPLES}"
+RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_COMBINE}_${LABEL_MODE}_${SAMPLES}"
 CKPT="checkpoints/${RUN_NAME}.pt"
 RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${RESULTS_DIR}"
 
 # ---------------------------------------------------------------------------
-# SANITY / PROVENANCE  (cheap, printed to the log so you can trust the run)
+# RUN CONFIGURATION  (printed first, so every log explains its own results)
+# Also saved to ${RESULTS_DIR}/run_config.txt next to the eval images.
 # ---------------------------------------------------------------------------
-echo "=== Job ${PBS_JOBID} starting $(date) ==="
-echo "Run name : ${RUN_NAME}"
-echo "Results  : ${CODE_DIR}/${RESULTS_DIR}"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-echo "---------------------------------------------------------------"
+{
+echo "==============================================================="
+echo " RUN CONFIGURATION"
+echo "==============================================================="
+echo " Job        : ${PBS_JOBID:-local}"
+echo " Started    : $(date '+%Y-%m-%d %H:%M:%S')"
+echo " Host       : $(hostname)"
+echo " Run name   : ${RUN_NAME}"
+echo " Checkpoint : ${CODE_DIR}/${CKPT}"
+echo " Results    : ${CODE_DIR}/${RESULTS_DIR}"
+echo
+echo "--- run parameters (this script) ------------------------------"
+printf '  %-16s %s\n' \
+  HEAD         "${HEAD}" \
+  EV_FEATURE   "${EV_FEATURE}" \
+  AX_COMBINE   "${AX_COMBINE}" \
+  EV_COMBINE   "${EV_COMBINE}" \
+  LABEL_MODE   "${LABEL_MODE}" \
+  DETECT       "${DETECT}" \
+  SAMPLES      "${SAMPLES}  (train frames)" \
+  VAL_SAMPLES  "${VAL_SAMPLES}  (val frames)" \
+  TEST_SAMPLES "${TEST_SAMPLES}  (eval panels)" \
+  CONFIG       "${CONFIG}"
+echo
+echo "--- PBS resources ---------------------------------------------"
+qstat -f "${PBS_JOBID}" 2>/dev/null | grep -E 'Resource_List\.(ncpus|ngpus|mem|walltime|jobfs)|queue =' \
+  | sed 's/^ */  /' || echo "  (qstat unavailable)"
+echo
+echo "--- hardware / software ---------------------------------------"
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader 2>/dev/null \
+  | sed 's/^/  GPU /' || echo "  (nvidia-smi unavailable)"
+python -c "import sys, torch; print(f'  python {sys.version.split()[0]} | torch {torch.__version__} | cuda {torch.version.cuda} | gpus visible {torch.cuda.device_count()}')" 2>/dev/null \
+  || echo "  (torch not importable)"
+if git -C "${CODE_DIR}" rev-parse --short HEAD >/dev/null 2>&1; then
+  echo "  git $(git -C "${CODE_DIR}" rev-parse --abbrev-ref HEAD)@$(git -C "${CODE_DIR}" rev-parse --short HEAD)" \
+       "$(git -C "${CODE_DIR}" diff --quiet 2>/dev/null || echo '(uncommitted changes)')"
+fi
+echo
+echo "--- config file: ${CONFIG}  (* = overridden by this script) ----"
+python - "${CONFIG}" "${HEAD}" "${AX_COMBINE}" "${EV_COMBINE}" "${LABEL_MODE}" "${EV_FEATURE}" <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
+import sys, yaml
+path, head, ax, ev, lm, feat = sys.argv[1:7]
+cfg = yaml.safe_load(open(path)) or {}
+# CLI flags passed by this script win over the YAML -- show the value actually used
+override = {"segmentation.head": head, "velocity.axis_combine": ax,
+            "velocity.event_combine": ev, "dataset.label_mode": lm,
+            "velocity.event_feature": feat}
+def walk(node, prefix=""):
+    for k, v in node.items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict):
+            walk(v, key + ".")
+        elif key in override and str(v) != override[key]:
+            print(f"  * {key:<34} = {override[key]}   (yaml: {v})")
+        else:
+            print(f"    {key:<34} = {v}")
+walk(cfg)
+PY
+echo "==============================================================="
+} 2>&1 | tee "${RESULTS_DIR}/run_config.txt"
+cp "${CONFIG}" "${RESULTS_DIR}/" 2>/dev/null || true
+SECONDS=0
 
 # ---------------------------------------------------------------------------
 # 1. FIT THE HEAD
 # ---------------------------------------------------------------------------
 echo ">>> [$(date +%T)] fitting ${HEAD} head (label_mode=${LABEL_MODE})"
 python scripts/fit_ridge_head.py --config "${CONFIG}" \
-  --head "${HEAD}" --axis-combine "${AX_COMBINE}" --event-combine "${EV_COMBINE}" \
+  --head "${HEAD}" --event-feature "${EV_FEATURE}" \
+  --axis-combine "${AX_COMBINE}" --event-combine "${EV_COMBINE}" \
   --label-mode "${LABEL_MODE}" --out "${CKPT}" \
   --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"
 
@@ -80,7 +141,7 @@ python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
 # 3. COLLECT  (keep a copy of the checkpoint + this log next to the results)
 # ---------------------------------------------------------------------------
 cp "${CKPT}" "${RESULTS_DIR}/" 2>/dev/null || true
-echo "=== Job ${PBS_JOBID} finished $(date) ==="
+echo "=== Job ${PBS_JOBID} (${RUN_NAME}) finished $(date)  --  elapsed $((SECONDS/3600))h $((SECONDS%3600/60))m ==="
 # When this line completes, PBS tears the job down and stops billing. No qdel needed.
 
 

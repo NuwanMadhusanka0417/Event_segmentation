@@ -16,6 +16,7 @@ from hdems.losses.flow import epe_loss
 from hdems.losses.seg import dice_loss, seg_loss
 from hdems.models.hdems import HDEMS
 from hdems.seg_features import event_pixel_mask
+from hdems.vsa.velocity import EVENT_COMBINES
 
 
 def load_config(path: str | Path) -> dict:
@@ -97,8 +98,10 @@ def main() -> None:
     )
     parser.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
                         help="Override velocity.axis_combine (cnn head).")
-    parser.add_argument("--event-combine", type=str, choices=["bind", "bundle", "concat"], default=None,
+    parser.add_argument("--event-combine", type=str, choices=list(EVENT_COMBINES), default=None,
                         help="Override velocity.event_combine (cnn head).")
+    parser.add_argument("--event-feature", type=str, choices=["phi", "f"], default=None,
+                        help="Override velocity.event_feature: phi | f (cnn head).")
     parser.add_argument("--label-mode", type=str, choices=["motion", "objects", "remap"], default=None,
                         help="motion = moving vs background (Option A); objects = per-object id (Option B).")
     args = parser.parse_args()
@@ -106,15 +109,18 @@ def main() -> None:
     cfg = load_config(args.config)
     if args.label_mode:
         cfg["dataset"] = {**cfg.get("dataset", {}), "label_mode": args.label_mode}
-    if args.axis_combine or args.event_combine:                 # CLI overrides config
+    if args.axis_combine or args.event_combine or args.event_feature:   # CLI overrides config
         vel = dict(cfg.get("velocity", {}))
         if args.axis_combine:
             vel["axis_combine"] = args.axis_combine
         if args.event_combine:
             vel["event_combine"] = args.event_combine
+        if args.event_feature:
+            vel["event_feature"] = args.event_feature
         cfg["velocity"] = vel
     axis = cfg.get("velocity", {}).get("axis_combine", "bind")
     event = cfg.get("velocity", {}).get("event_combine", "bind")
+    feature = cfg.get("velocity", {}).get("event_feature", "phi")
     # The label mode fixes the class count, so the head can never disagree with the labels.
     label_mode = resolve_label_mode(cfg)
     n_classes = num_classes_for(label_mode, cfg.get("segmentation", {}).get("num_classes", 32))
@@ -153,10 +159,11 @@ def main() -> None:
         lr=train_cfg.get("lr", 1e-4),
     )
 
-    # Checkpoints: train.out_dir, else checkpoints/[head]_[axis]_[event] so the
-    # combine is recorded in the path (last.pt / best.pt live inside).
+    # Checkpoints: train.out_dir, else checkpoints/[head]_[feature]_[axis]_[event]_[label_mode]
+    # so the settings are recorded in the path (last.pt / best.pt live inside).
     head = cfg.get("segmentation", {}).get("head", "cnn")
-    ckpt_dir = Path(train_cfg.get("out_dir", f"checkpoints/{head}_{axis}_{event}_{label_mode}"))
+    ckpt_dir = Path(train_cfg.get(
+        "out_dir", f"checkpoints/{head}_{feature}_{axis}_{event}_{label_mode}"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_loss = float("inf")
 
@@ -171,7 +178,7 @@ def main() -> None:
         # Save after every epoch: always refresh last.pt, keep best.pt too.
         ckpt = {"model": model.state_dict(), "epoch": epoch + 1,
                 "loss": loss, "task": task,
-                "axis_combine": axis, "event_combine": event,
+                "axis_combine": axis, "event_combine": event, "event_feature": feature,
                 "label_mode": label_mode, "num_classes": n_classes}
         torch.save(ckpt, ckpt_dir / "last.pt")
         if loss < best_loss:

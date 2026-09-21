@@ -41,6 +41,7 @@ from hdems.ridge_fit import (
 from hdems.ridge_head import RidgeHead
 from hdems.feature_extract import extract_phi
 from hdems.models.prototype_head import PrototypeHead, fit_prototypes, save_prototypes
+from hdems.vsa.velocity import EVENT_COMBINES
 
 
 def _cap_dataset(ds, max_samples: int | None):
@@ -115,15 +116,20 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Fit or train a segmentation head")
     ap.add_argument("--config", type=str, default="configs/evimo_seg.yaml")
     ap.add_argument("--out", type=str, default=None,
-                    help="Output .pt. Default: checkpoints/[head]_[axis]_[event]_[N].pt")
+                    help="Output .pt. Default: "
+                         "checkpoints/[head]_[feature]_[axis]_[event]_[label_mode]_[N].pt")
     ap.add_argument("--head", type=str, choices=["ridge", "prototype", "cnn", "motion"],
                     default=None,
                     help="ridge/prototype: closed-form fit; cnn/motion: backprop training "
                          "(overrides segmentation.head).")
     ap.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
                     help="Vx,Vy combine (overrides velocity.axis_combine).")
-    ap.add_argument("--event-combine", type=str, choices=["bind", "bundle", "concat"], default=None,
-                    help="Phi+velocity combine (overrides velocity.event_combine).")
+    ap.add_argument("--event-combine", type=str, choices=list(EVENT_COMBINES), default=None,
+                    help="Event HV + velocity combine: bind | bundle | bindbundle ((X o Mv) + Mv) "
+                         "| concat (overrides velocity.event_combine).")
+    ap.add_argument("--event-feature", type=str, choices=["phi", "f"], default=None,
+                    help="Event HV fused with velocity: phi (bundled neighbourhood field) | "
+                         "f (VFA descriptor F0) (overrides velocity.event_feature).")
     ap.add_argument("--label-mode", type=str, choices=["motion", "objects", "remap"], default=None,
                     help="motion = moving vs background (Option A); objects = per-object id (Option B).")
     ap.add_argument("--device", type=str, default="cpu")
@@ -146,15 +152,19 @@ def main() -> None:
     cfg = load_config(args.config)
     if args.label_mode:
         cfg["dataset"] = {**cfg.get("dataset", {}), "label_mode": args.label_mode}
-    if args.axis_combine or args.event_combine:                 # CLI overrides config
+    if args.axis_combine or args.event_combine or args.event_feature:   # CLI overrides config
         vel = dict(cfg.get("velocity", {}))
         if args.axis_combine:
             vel["axis_combine"] = args.axis_combine
         if args.event_combine:
             vel["event_combine"] = args.event_combine
+        if args.event_feature:
+            vel["event_feature"] = args.event_feature
         cfg["velocity"] = vel
     axis = cfg.get("velocity", {}).get("axis_combine", "bind")
     event = cfg.get("velocity", {}).get("event_combine", "bind")
+    feature = cfg.get("velocity", {}).get("event_feature", "phi")
+    print(f"[fit] event_feature={feature}  axis_combine={axis}  event_combine={event}")
     ridge_cfg = cfg.get("ridge", {})
     # Label mode fixes the class count so head size and labels always agree.
     label_mode = resolve_label_mode(cfg)
@@ -221,7 +231,7 @@ def main() -> None:
     if trainable:
         out_path = (Path(args.out) if args.out else
                     Path("checkpoints")
-                    / f"{head_type}_{axis}_{event}_{label_mode}_{len(train_ds)}.pt")
+                    / f"{head_type}_{feature}_{axis}_{event}_{label_mode}_{len(train_ds)}.pt")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         train_cfg = cfg.get("train", {})
         net = HDEMS({**cfg, "segmentation": {**seg_cfg, "head": head_type}}).to(device)
@@ -251,7 +261,7 @@ def main() -> None:
                     "epoch": best_epoch, "val_miou": best_score if len(val_ds) else None,
                     "num_samples": len(train_ds), "num_classes": num_classes,
                     "axis_combine": axis, "event_combine": event,
-                    "label_mode": label_mode}, out_path)
+                    "event_feature": feature, "label_mode": label_mode}, out_path)
         print(f"[train] saved {out_path}  best epoch={best_epoch}  score={best_score:.4f}")
         return
 
@@ -279,12 +289,12 @@ def main() -> None:
     n_pix = sum(b[0].shape[0] for b in train_batches)
     print(f"[fit] train pixels: {n_pix}")
 
-    # Output path: explicit --out, else [head]_[axis]_[event]_[num_samples].pt
+    # Output path: explicit --out, else [head]_[feature]_[axis]_[event]_[label_mode]_[N].pt
     if args.out:
         out_path = Path(args.out)
     else:
         out_path = (Path("checkpoints")
-                    / f"{head_type}_{axis}_{event}_{label_mode}_{len(train_ds)}.pt")
+                    / f"{head_type}_{feature}_{axis}_{event}_{label_mode}_{len(train_ds)}.pt")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # ---- prototype head: class-mean centroids, no alpha sweep -----------------
@@ -298,7 +308,7 @@ def main() -> None:
                         extra={"val_miou": miou, "seed": args.seed,
                                "num_samples": len(train_ds),
                                "axis_combine": axis, "event_combine": event,
-                               "label_mode": label_mode})
+                               "event_feature": feature, "label_mode": label_mode})
         print(f"[proto] saved {out_path}  val_mIoU={miou:.4f}  "
               f"prototypes={tuple(protos.shape)}")
         return
@@ -350,7 +360,7 @@ def main() -> None:
         extra={"val_miou": best_miou, "seed": args.seed, "backend": backend,
                "num_samples": len(train_ds),
                "axis_combine": axis, "event_combine": event,
-               "label_mode": label_mode},
+               "event_feature": feature, "label_mode": label_mode},
     )
     print(f"[ridge] saved {out_path}  alpha={best_alpha:g}  val_mIoU={best_miou:.4f}  "
           f"W shape={tuple(best_result.weight.shape)}  imbalance={imbalance}")

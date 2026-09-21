@@ -44,8 +44,10 @@ eval:
 
 velocity:
   vel_bw: 6.0            # FPE bandwidth for residual velocity (topological similarity)
+  event_feature: phi     # event HV fused with velocity -> phi (7x7 bundled field) | f (descriptor F0)
   axis_combine: bind     # combine Vx,Vy -> bind | bundle
-  event_combine: bind    # combine Phi with velocity code -> bind | bundle | concat
+  event_combine: bind    # combine event HV X with velocity code Mv ->
+  #                        bind (X o Mv) | bundle (X + Mv) | bindbundle ((X^ o Mv) + Mv) | concat
 
 segmentation:
   head: cnn             # cnn (HV-channels CNN, trained) | prototype | ridge | motion
