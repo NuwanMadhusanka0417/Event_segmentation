@@ -1,0 +1,196 @@
+#!/bin/bash
+#PBS -N hdems_eval_all
+#PBS -P mi23
+#PBS -q gpuvolta
+#PBS -l ncpus=12
+#PBS -l mem=64GB
+#PBS -l ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+#PBS -l wd
+#PBS -j oe
+# Live logs: submit from Train_based/, note the job id, then:
+#   tail -f hdems_eval_all.o<JOBID>
+# Output is line-flushed (PYTHONUNBUFFERED + python -u) so tail updates during the run,
+# not only when the job finishes.
+
+set -eo pipefail
+
+# ---------------------------------------------------------------------------
+# PARAMETERS
+# ---------------------------------------------------------------------------
+MAX_IMAGES=50
+DETECT=no              # yes | no  (--detect on hdems.eval)
+CONFIG=configs/evimo_seg.yaml
+CKPT_DIR=checkpoints
+
+CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
+VENV=/scratch/jq77/nk8155/seg/bin/activate
+
+# All checkpoints to evaluate (basename under ${CKPT_DIR}/).
+# best.pt / last.pt are skipped unless you set GENERIC_CKPT_HEAD (see below).
+CHECKPOINTS=(
+  cnn_bind_concat_300.pt
+  cnn_bind_concat_500.pt
+  cnn_bind_concat_motion_300.pt
+  cnn_bind_concat_objects_300.pt
+  cnn_bundle_concat_300.pt
+  cnn_bundle_concat_motion_300.pt
+  cnn_bundle_concat_objects_300.pt
+  cnn_f_bind_bindbundle_motion_100.pt
+  cnn_f_bind_bindbundle_objects_200.pt
+  cnn_f_bind_concat_motion_100.pt
+  cnn_f_bind_concat_motion_300.pt
+  cnn_f_bind_concat_objects_100.pt
+  motion_bundle_concat_300.pt
+  prototype_bind_bind_100.pt
+  prototype_bind_bind_500.pt
+  ridge_bind_bind_300.pt
+  ridge_bind_bind_500.pt
+  ridge_bind_bundle_300.pt
+  ridge_bind_concat_300.pt
+  ridge_bundle_bind_300.pt
+  ridge_bundle_bundle_300.pt
+  ridge_bundle_concat_300.pt
+  ridge_head.pt
+  ridge_head_200.pt
+  ridge_head_450.pt
+  ridge_head_500.pt
+  best.pt
+  last.pt
+)
+
+# If you really want flat checkpoints/best.pt or last.pt, set head explicitly:
+#   GENERIC_CKPT_HEAD=cnn
+GENERIC_CKPT_HEAD=""
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT  (scratch caches + unbuffered Python for live PBS logs)
+# ---------------------------------------------------------------------------
+module load cuda
+module load python3/3.9.2
+source "${VENV}"
+cd "${CODE_DIR}"
+source scripts/nci_env.sh
+export PYTHONUNBUFFERED=1
+
+BATCH_TAG="$(date +%Y%m%d_%H%M%S)"
+OUT_ROOT="results/batch_eval_${BATCH_TAG}"
+mkdir -p "${OUT_ROOT}"
+
+DETECT_FLAG=""
+if [ "${DETECT}" = "yes" ]; then DETECT_FLAG="--detect"; fi
+
+if command -v stdbuf >/dev/null 2>&1; then
+  PY=(stdbuf -oL -eL python -u)
+else
+  PY=(python -u)
+fi
+
+infer_head() {
+  local base="$1"
+  case "${base}" in
+    prototype_*) echo prototype ;;
+    ridge_*|ridge_head*) echo ridge ;;
+    motion_*) echo motion ;;
+    cnn_*|cnn_f_*) echo cnn ;;
+    best|last)
+      if [ -n "${GENERIC_CKPT_HEAD}" ]; then
+        echo "${GENERIC_CKPT_HEAD}"
+      else
+        echo ""
+      fi
+      ;;
+    *) echo "" ;;
+  esac
+}
+
+log() {
+  echo "$@" | tee -a "${OUT_ROOT}/batch.log"
+}
+
+log "=== Batch eval ${PBS_JOBID:-local} started $(date) ==="
+log "Host: $(hostname)"
+log "Output root: ${CODE_DIR}/${OUT_ROOT}"
+log "Max panels per model: ${MAX_IMAGES}"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | tee -a "${OUT_ROOT}/batch.log" || true
+log "---------------------------------------------------------------"
+
+SECONDS=0
+N_OK=0
+N_FAIL=0
+N_SKIP=0
+IDX=0
+TOTAL=${#CHECKPOINTS[@]}
+
+set +e
+for ckpt_name in "${CHECKPOINTS[@]}"; do
+  IDX=$((IDX + 1))
+  base="${ckpt_name%.pt}"
+  ckpt_path="${CKPT_DIR}/${ckpt_name}"
+
+  if [ ! -f "${ckpt_path}" ]; then
+    log ">>> [${IDX}/${TOTAL}] SKIP missing: ${ckpt_path}"
+    N_SKIP=$((N_SKIP + 1))
+    continue
+  fi
+
+  head=$(infer_head "${base}")
+  if [ -z "${head}" ]; then
+    log ">>> [${IDX}/${TOTAL}] SKIP ${ckpt_name}: cannot infer --head (set GENERIC_CKPT_HEAD for best/last)"
+    N_SKIP=$((N_SKIP + 1))
+    continue
+  fi
+
+  model_dir="${OUT_ROOT}/${base}"
+  img_dir="${model_dir}/eval_images"
+  metrics_log="${model_dir}/metrics.log"
+  mkdir -p "${model_dir}"
+
+  log ""
+  log ">>> [$(date +%T)] [${IDX}/${TOTAL}] ${ckpt_name}  head=${head}"
+  log "    checkpoint: ${ckpt_path}"
+  log "    images:     ${img_dir}"
+
+  {
+    echo "=== ${ckpt_name} head=${head} $(date) ==="
+    "${PY[@]}" -m hdems.eval --config "${CONFIG}" \
+      --head "${head}" \
+      --checkpoint "${ckpt_path}" \
+      ${DETECT_FLAG} \
+      --device cuda \
+      --save-images "${img_dir}" \
+      --max-images "${MAX_IMAGES}"
+    echo "=== exit=$? ==="
+  } 2>&1 | tee -a "${metrics_log}" "${OUT_ROOT}/batch.log"
+
+  ec=${PIPESTATUS[0]}
+  if [ "${ec}" -eq 0 ]; then
+    N_OK=$((N_OK + 1))
+    log ">>> [$(date +%T)] OK ${ckpt_name}"
+  else
+    N_FAIL=$((N_FAIL + 1))
+    log ">>> [$(date +%T)] FAILED ${ckpt_name} (exit ${ec}) — continuing"
+  fi
+done
+set -e
+
+log ""
+log "=== Batch eval finished $(date) ==="
+log "OK=${N_OK}  FAILED=${N_FAIL}  SKIPPED=${N_SKIP}  elapsed $((SECONDS/3600))h $((SECONDS%3600/60))m"
+log "Summary: ${OUT_ROOT}/summary.tsv"
+{
+  printf 'checkpoint\thead\tmetrics_log\tpanels_dir\n'
+  for ckpt_name in "${CHECKPOINTS[@]}"; do
+    base="${ckpt_name%.pt}"
+    printf '%s\t%s\t%s\t%s\n' \
+      "${ckpt_name}" "$(infer_head "${base}")" \
+      "${OUT_ROOT}/${base}/metrics.log" \
+      "${OUT_ROOT}/${base}/eval_images"
+  done
+} > "${OUT_ROOT}/summary.tsv"
+
+# qsub run_eval_all.pbs
+# qstat -u nk8155
+# tail -f hdems_eval_all.o<JOBID>
+# tail -f results/batch_eval_*/batch.log
