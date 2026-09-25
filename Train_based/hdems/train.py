@@ -9,9 +9,9 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
-from hdems.data.dsec import DSECDataset
-from hdems.data.evimo import EVIMODataset
-from hdems.data.labels import num_classes_for, resolve_label_mode
+from hdems.data.build import build_dataset as _build_dataset
+from hdems.data.labels import LABEL_MODES, num_classes_for, resolve_label_mode
+from hdems.data.motion_labels import IGNORE_LABEL
 from hdems.losses.flow import epe_loss
 from hdems.losses.seg import dice_loss, seg_loss
 from hdems.models.hdems import HDEMS
@@ -24,26 +24,7 @@ def load_config(path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
-def build_dataset(cfg: dict, split: str | None = None):
-    ds_cfg = cfg.get("dataset", {})
-    name = ds_cfg.get("name", "dsec")
-    split = split or ds_cfg.get("split", "train")
-
-    if name == "dsec":
-        return DSECDataset(ds_cfg["root"], split)
-    if name == "evimo":
-        return EVIMODataset(
-            ds_cfg["root"],
-            split,
-            ds_cfg.get("version"),
-            height=ds_cfg.get("height", 480),
-            width=ds_cfg.get("width", 640),
-            window_ms=ds_cfg.get("window_ms", 50.0),
-            decay=cfg.get("time_surface", {}).get("decay", 0.8),
-            time_frames=ds_cfg.get("time_frames"),
-            label_mode=resolve_label_mode(cfg),
-        )
-    raise ValueError(f"Unknown dataset: {name}")
+build_dataset = _build_dataset      # re-exported: scripts import it from here
 
 
 def train_one_epoch(
@@ -71,13 +52,18 @@ def train_one_epoch(
             target = batch["mask"].to(device).long()
             # Train on EVENT pixels only: pixels with no events carry no evidence
             # and would otherwise flood the loss with trivial background.
-            valid = event_pixel_mask(surface)
+            # Ignore label 255 = ambiguous object speed or mask boundary band.
+            valid = event_pixel_mask(surface) & (target != IGNORE_LABEL)
             if not valid.any():
                 continue
-            loss = seg_loss(logits, target.masked_fill(~valid, 255))
+            loss = seg_loss(logits, target.masked_fill(~valid, IGNORE_LABEL))
             if use_dice:
-                # Dice counters heavy background/foreground imbalance.
-                loss = loss + dice_loss(logits, target, num_classes, mask=valid)
+                # Dice counters heavy background/foreground imbalance. Pass a target
+                # with ignore pixels zeroed AND masked out, so clamp() inside dice
+                # cannot turn a 255 into a foreground pixel.
+                loss = loss + dice_loss(
+                    logits, target.masked_fill(~valid, 0), num_classes, mask=valid,
+                )
 
         loss.backward()
         optimizer.step()
@@ -102,8 +88,9 @@ def main() -> None:
                         help="Override velocity.event_combine (cnn head).")
     parser.add_argument("--event-feature", type=str, choices=["phi", "f"], default=None,
                         help="Override velocity.event_feature: phi | f (cnn head).")
-    parser.add_argument("--label-mode", type=str, choices=["motion", "objects", "remap"], default=None,
-                        help="motion = moving vs background (Option A); objects = per-object id (Option B).")
+    parser.add_argument("--label-mode", type=str, choices=list(LABEL_MODES), default=None,
+                        help="motion = pose-derived moving (Option A); objects = per-object id "
+                             "(Option B); tracked = legacy mask>0 baseline.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from hdems.data.motion_labels import MotionParams, sequence_motion
 from hdems.data.time_surface import events_to_time_surface
 
 
@@ -214,16 +217,124 @@ def load_frame_sample(
     return {"surface": surface.float(), "mask": mask, "mask_raw": True}
 
 
-def build_sample_index(root: Path, split: str, min_match: float = 0.5) -> list[tuple[Path, int]]:
+def scene_of(seq_name: str) -> str:
+    """``scene13_dyn_test_00_000000`` -> ``scene13`` (takes of one physical scene)."""
+    return seq_name.split("_", 1)[0].lower()
+
+
+def scenes_in_split(root: Path, split: str) -> set[str]:
+    """Scene names present in a split -- used to keep train/eval scene-disjoint."""
+    return {scene_of(p.name) for p in find_sequence_dirs(Path(root), split)}
+
+
+def _event_time_range(seq_dir: Path) -> tuple[float, float]:
+    """(first, last) event timestamp -- read from the mmap, no decode."""
+    t = np.load(seq_dir / "dataset_events_t.npy", mmap_mode="r").reshape(-1)
+    if t.size == 0:
+        return (float("inf"), float("-inf"))
+    return float(t[0]), float(t[-1])
+
+
+def _visible_moving_frames(
+    seq_dir: Path,
+    meta: dict[str, Any],
+    hits: list[int],
+    params: MotionParams,
+    min_px: int,
+) -> set[int]:
+    """Frames whose mask actually SHOWS a moving object.
+
+    Pose motion alone is not enough: an object can be moving while out of frame or
+    occluded, and such a frame has no moving pixels to learn from (its label would
+    be all-background). Masks are tiny compressed arrays, so this is cheap.
+    """
+    sm = sequence_motion(seq_dir, params, meta)
+    frames = meta["frames"]
+    out: set[int] = set()
+    with np.load(seq_dir / "dataset_mask.npz") as masks:
+        for fi in hits:
+            moving = sm.moving.get(fi, frozenset())
+            if not moving:
+                continue
+            key = f"mask_{int(frames[fi]['id']):010d}"
+            if key not in masks.files:
+                continue
+            obj = masks[key] // 1000
+            if int(np.isin(obj, np.array(sorted(moving))).sum()) >= min_px:
+                out.add(fi)
+    return out
+
+
+def _spread(pos: list[int], neg: list[int]) -> list[int]:
+    """Distribute negatives evenly through the positives.
+
+    Sorting instead would put every negative (and every pre-event frame) at the
+    front of the sequence, so a `--max-train-samples N` prefix would be all
+    negatives with nothing to learn from.
+    """
+    if not neg:
+        return pos
+    if not pos:
+        return neg
+    step = len(pos) / len(neg)
+    out, ni = [], 0
+    for k, p in enumerate(pos):
+        out.append(p)
+        while ni < len(neg) and (ni + 1) * step <= k + 1:
+            out.append(neg[ni])
+            ni += 1
+    out.extend(neg[ni:])
+    return out
+
+
+def _interleave(per_seq: list[list[tuple[Path, int]]]) -> list[tuple[Path, int]]:
+    """Round-robin across sequences.
+
+    ``--max-train-samples N`` takes the FIRST N entries, so a sequence-ordered
+    index means N=300 trains on one sequence. Interleaving makes any prefix a
+    balanced sample of every sequence.
+    """
+    out: list[tuple[Path, int]] = []
+    for row in zip_longest(*per_seq):
+        out.extend(item for item in row if item is not None)
+    return out
+
+
+def build_sample_index(
+    root: Path,
+    split: str,
+    min_match: float = 0.5,
+    *,
+    exclude_scenes: Iterable[str] = (),
+    require_mover: bool = False,
+    negative_ratio: float = 0.0,
+    interleave: bool = True,
+    motion_params: MotionParams | None = None,
+    min_moving_px: int = 100,
+    window_s: float = 0.05,
+) -> list[tuple[Path, int]]:
     """List of (sequence_dir, frame_index) for frames that HAVE a GT mask.
 
     ``meta["frames"]`` lists every camera frame, but ``dataset_mask.npz`` only
     stores masks for frames with segmentation ground truth. Frames without a
     matching ``mask_<id>`` key are skipped so ``load_frame_sample`` never raises
     a KeyError and ``len(dataset)`` reflects only loadable samples.
+
+    ``exclude_scenes``  drop sequences from these scenes (train/eval leakage).
+    ``require_mover``   keep only frames where >=1 object is moving, plus
+                        ``negative_ratio`` x that many all-static frames as negatives.
+    ``interleave``      round-robin across sequences so a prefix is balanced.
     """
-    index: list[tuple[Path, int]] = []
+    exclude = {s.lower() for s in exclude_scenes}
+    params = motion_params or MotionParams()
+    per_seq: list[list[tuple[Path, int]]] = []
+    n_pos_all = n_neg_all = 0
+
     for seq_dir in find_sequence_dirs(root, split):
+        if scene_of(seq_dir.name) in exclude:
+            print(f"[data] excluding {seq_dir.name}: scene {scene_of(seq_dir.name)} "
+                  f"also appears in the other split (scene-disjoint splits)")
+            continue
         meta = load_meta(seq_dir)
         with np.load(seq_dir / "dataset_mask.npz") as masks:
             present = set(masks.files)
@@ -238,5 +349,36 @@ def build_sample_index(root: Path, split: str, min_match: float = 0.5) -> list[t
             print(f"[data] skipping {seq_dir.name}: only {len(hits)}/{len(frames)} "
                   f"frames match a mask ({ratio:.0%}) — inconsistent mask indexing")
             continue
-        index.extend((seq_dir, fi) for fi in hits)
-    return index
+
+        # Drop frames whose surfaces would be empty: the multi-time stack reaches
+        # back 2 windows before ts, so earlier frames have no events at all.
+        t_first, t_last = _event_time_range(seq_dir)
+        hits = [fi for fi in hits
+                if float(frames[fi]["ts"]) - 2.0 * window_s >= t_first
+                and float(frames[fi]["ts"]) <= t_last]
+        if not hits:
+            print(f"[data] skipping {seq_dir.name}: no frame has events in its window")
+            continue
+
+        if require_mover:
+            visible = _visible_moving_frames(seq_dir, meta, hits, params, min_moving_px)
+            pos = [fi for fi in hits if fi in visible]
+            neg = [fi for fi in hits if fi not in visible]
+            keep_neg = int(round(negative_ratio * len(pos)))
+            if keep_neg and neg:                       # evenly spaced, not the first ones
+                step = max(1, len(neg) // keep_neg)
+                neg = neg[::step][:keep_neg]
+            else:
+                neg = []
+            n_pos_all += len(pos)
+            n_neg_all += len(neg)
+            hits = _spread(pos, neg)                   # negatives spread through, not clumped
+            if not hits:
+                print(f"[data] skipping {seq_dir.name}: no frame shows a moving object")
+                continue
+        per_seq.append([(seq_dir, fi) for fi in hits])
+
+    if require_mover:
+        print(f"[data] {split}: {n_pos_all} frames with a mover + {n_neg_all} static "
+              f"negatives from {len(per_seq)} sequence(s)")
+    return _interleave(per_seq) if interleave else [s for seq in per_seq for s in seq]

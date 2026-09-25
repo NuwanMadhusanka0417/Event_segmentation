@@ -62,6 +62,8 @@ def ego_residual(
     flow: torch.Tensor,
     iters: int = 3,
     eps: float = 1e-4,
+    *,
+    valid: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Subtract a robust global affine motion model -> residual (IMO) velocity.
 
@@ -71,7 +73,13 @@ def ego_residual(
 
     Parameters
     ----------
-    flow : (B, 2, H, W)
+    flow  : (B, 2, H, W)
+    valid : (B, H, W) bool, optional — pixels the model is fitted ON, normally the
+        EVENT pixels. Pixels without events carry no flow evidence (the cost volume
+        is flat there, so the soft-argmax returns ~0). They are 70-90% of a frame,
+        so including them drags the global fit toward zero and the "residual"
+        collapses to the raw flow — i.e. no ego compensation happens at all.
+        The residual is still returned for every pixel.
 
     Returns
     -------
@@ -87,16 +95,24 @@ def ego_residual(
 
     residual = torch.empty_like(flow)
     for b in range(B):
+        if valid is None:
+            sel = torch.ones(H * W, dtype=torch.bool, device=dev)
+        else:
+            sel = valid[b].reshape(-1).to(dev)
+            if int(sel.sum()) < 16:          # too few events to fit: keep raw flow
+                residual[b] = flow[b]
+                continue
+        sel_f = sel.to(flow.dtype)
         for c in range(C):
             f = flow[b, c].reshape(-1)
-            w = torch.ones_like(f)
+            w = sel_f.clone()
             coef = torch.zeros(3, device=dev)
             for _ in range(iters):
                 Aw = A * w[:, None]
                 coef = torch.linalg.solve(A.t() @ Aw + eps * eye, Aw.t() @ f)
                 r = f - A @ coef
-                s = r.abs().median() + 1e-6
-                w = 1.0 / (1.0 + (r / (2.0 * s)) ** 2)       # Cauchy robust weights
+                s = r[sel].abs().median() + 1e-6
+                w = sel_f / (1.0 + (r / (2.0 * s)) ** 2)     # Cauchy weights, event px only
             residual[b, c] = (f - A @ coef).reshape(H, W)
 
     magnitude = residual.pow(2).sum(1, keepdim=True).clamp_min(1e-12).sqrt()

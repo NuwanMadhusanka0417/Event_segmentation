@@ -16,6 +16,7 @@ from hdems.models.paper_flow import flow_from_cost, multiscale_cost_volume
 from hdems.models.prototype_head import PrototypeHead
 from hdems.models.segmentation import HVConvHead, MotionSegHead, SegmentationHead
 from hdems.ridge_head import RidgeHead
+from hdems.seg_features import event_pixel_mask
 from hdems.vsa.fpe import make_base_phases
 from hdems.vsa.temporal import bind_trajectory, make_time_phases
 from hdems.vsa.velocity import combine_event_velocity, encode_velocity
@@ -132,7 +133,10 @@ class HDEMS(nn.Module):
         cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
         flow = flow_from_cost(cost, self.matcher.M, alpha=self.flow_alpha,
                               vel_scale=self.vel_scale, smooth=self.flow_smooth)
-        residual, _mag = ego_residual(flow, iters=self.ego_iters)
+        # Fit the global model on EVENT pixels only -- empty pixels have flow ~0 and
+        # would drag the fit to zero, leaving the "residual" equal to the raw flow.
+        residual, _mag = ego_residual(flow, iters=self.ego_iters,
+                                      valid=event_pixel_mask(surfaces))
         x = self.event_hv(fields[0])
         # residual velocity -> hypervector (axis_combine), fused with X (event_combine)
         mv = encode_velocity(residual[:, 0], residual[:, 1], self.phi_vx, self.phi_vy,
@@ -158,7 +162,8 @@ class HDEMS(nn.Module):
             cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
             flow = flow_from_cost(cost, self.matcher.M, alpha=self.flow_alpha,
                                   vel_scale=self.vel_scale, smooth=self.flow_smooth)
-            residual, mag = ego_residual(flow, iters=self.ego_iters)
+            residual, mag = ego_residual(flow, iters=self.ego_iters,
+                                         valid=event_pixel_mask(surface))
             motion = torch.cat([residual, mag], dim=1)
             phi = self.event_hv(fields[0])                           # HV context (Phi or F)
             outputs["flow"] = flow
@@ -186,7 +191,8 @@ class HDEMS(nn.Module):
         elif self.head_type == "motion":
             flow = decode_flow(f, phi, self.matcher.phx, self.matcher.phy,
                                M=self.matcher.M, beta=self.flow_beta)
-            residual, mag = ego_residual(flow, iters=self.ego_iters)
+            residual, mag = ego_residual(flow, iters=self.ego_iters,
+                                         valid=event_pixel_mask(surface))
             motion = torch.cat([residual, mag], dim=1)
             outputs["flow"] = flow
             outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface)

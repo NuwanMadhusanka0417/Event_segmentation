@@ -20,6 +20,51 @@ events → multi-time surfaces (F0,F1,F2,F4)
 The whole VSA front-end (kernel, descriptors, cost volume, flow estimator,
 ego-fit) is **parameter-free**. Only the (optional) CNN heads train.
 
+## Labels: what "moving" means
+
+EVIMO2 masks annotate **every tracked surface** — the table and the static props
+included — so `mask > 0` means "on a tracked object", not "moving". Measured on
+`samsung_mono/imo`: `mask > 0` covers 61% (train) / 72% (eval) of pixels, while
+objects that actually move cover 0.9% / 4.1%.
+
+`label_mode: motion` therefore derives labels from the **pose metadata**: each
+object's camera-frame pose is composed with the camera pose to get its WORLD
+pose, and per frame its speed is converted to image-plane displacement
+(`fx·v/Z·Δt`, plus a rotation term so spin-in-place counts):
+
+| displacement per window | label |
+|---|---|
+| ≥ `motion_label.move_px` (1.0) | moving (1) |
+| ≤ `motion_label.static_px` (0.3) | static (0) |
+| in between | ignore (255) |
+| within `boundary_ignore_px` of a mask edge | ignore (255) |
+
+Ignore pixels are excluded from the loss, from the ridge/prototype fit and from
+every metric. `label_mode: tracked` keeps the old `mask > 0` rule as a baseline.
+
+**Report foreground IoU, not mIoU** — moving pixels are a few percent of event
+pixels, so mIoU stays near 0.5 for a model that predicts "static" everywhere.
+`hdems.eval` prints FG IoU as the headline.
+
+## Gates before you train
+
+Both need no GPU and no training. If gate 1 fails, a retrain tells you nothing.
+
+```bash
+# Gate 1 (signal) + Gate 2 (events-only control), writes four-panel figures
+python scripts/diagnose_motion.py --config configs/evimo_seg.yaml \
+  --split train --frames 6 --d 256 --out diagnostics
+
+# Gate 2 on the full eval set, through the normal eval path
+python -m hdems.eval --config configs/evimo_seg.yaml --head cnn \
+  --checkpoint <ckpt> --events-only-baseline
+```
+
+- Gate 1 passes when AUC(|residual|) ≥ 0.6: the ego-compensated flow is larger on
+  moving objects than on static ones.
+- Gate 2 passes when the events-only foreground IoU is poor (≲ 0.35): the task is
+  no longer solvable by "there are events here".
+
 ## Heads (`segmentation.head`, or `--head`)
 
 With `dataset.time_frames` set, all heads use the paper front-end.
@@ -177,17 +222,36 @@ python scripts/prepare_evimo.py --config configs/evimo_seg.yaml
 | `matching.M` | cost-volume window (7 → ±3 px per scale) |
 | `matching.scales` | `[0,1,2]` two-time pairs F0↔F1/F2/F4 at pool 1/2/4 |
 | `matching.alpha` | Eq.12 probability-volume threshold (0.3) |
+| `matching.smooth` | Eq.12 cost-volume average pooling, stride 1 (paper `sc`: 71) |
 | `dataset.time_frames` | `[0,0.25,0.5,1.0]` multi-time (paper); `[]` = single-time |
 | `dataset.height/width` | working resolution (240×320) |
+| `dataset.label_mode` | `motion` (pose-derived) · `tracked` (legacy mask>0) · `objects` |
+| `dataset.scene_disjoint` | drop train sequences whose scene also appears in `eval/` |
+| `dataset.require_mover` | train only on frames with ≥1 moving object |
+| `dataset.negative_ratio` | share of all-static frames kept as negatives |
+| `dataset.interleave` | round-robin across sequences, so `--max-train-samples N` is balanced |
+| `motion_label.move_px` / `static_px` | moving / static thresholds, px per window |
+| `motion_label.boundary_ignore_px` | ignore band around mask edges |
 | `velocity.event_feature` | `phi` · `f` |
 | `velocity.axis_combine` | `bind` · `bundle` |
 | `velocity.event_combine` | `bind` · `bundle` · `bindbundle` · `concat` |
 | `segmentation.head` | `prototype` (default) · `ridge` · `motion` · `cnn` |
 
+## Colouring the moving events
+
+```bash
+python -m hdems.eval --config configs/evimo_seg.yaml --head cnn \
+  --checkpoint checkpoints/<run>.pt --color-events results/<run>/colour
+```
+
+Writes, per frame: events | predicted moving (red) vs static (grey) | per-instance
+colours (connected components of the predicted moving mask) | ground-truth moving.
+Everything is drawn **only at event pixels** — the rest is untrained guesswork.
+
 ## Notes
 
-- Masks are remapped to consecutive class IDs (background = 0); EVIMO masks are
-  the independently-moving objects, so this is genuinely motion segmentation.
+- EVIMO2 masks cover every tracked surface, including the static table — see
+  "Labels" above. `label_mode: motion` is the only mode that means motion.
 - Record results in `docs/RIDGE_RESULTS.md`; `docs/SPEC.md` has the VSA constraints.
 - CLI combine/head options override the config; the chosen combo is stored inside
   each checkpoint so eval auto-matches it.

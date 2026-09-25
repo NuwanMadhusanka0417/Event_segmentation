@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hdems.data.labels import num_classes_for, resolve_label_mode
+from hdems.data.labels import LABEL_MODES, num_classes_for, resolve_label_mode
 from hdems.eval import build_dataset, evaluate_segmentation, load_config
 from hdems.train import train_one_epoch
 from hdems.feature_extract import (
@@ -130,8 +130,9 @@ def main() -> None:
     ap.add_argument("--event-feature", type=str, choices=["phi", "f"], default=None,
                     help="Event HV fused with velocity: phi (bundled neighbourhood field) | "
                          "f (VFA descriptor F0) (overrides velocity.event_feature).")
-    ap.add_argument("--label-mode", type=str, choices=["motion", "objects", "remap"], default=None,
-                    help="motion = moving vs background (Option A); objects = per-object id (Option B).")
+    ap.add_argument("--label-mode", type=str, choices=list(LABEL_MODES), default=None,
+                    help="motion = pose-derived moving (Option A); objects = per-object id "
+                         "(Option B); tracked = legacy mask>0 baseline.")
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--backend", choices=["streaming", "sklearn"], default=None)

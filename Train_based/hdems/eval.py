@@ -11,12 +11,13 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
-from hdems.data.dsec import DSECDataset
-from hdems.data.evimo import EVIMODataset
+from hdems.data.build import build_dataset as _build_dataset
 from hdems.losses.flow import epe_loss
 from hdems.losses.seg import seg_loss
 from hdems.metrics import mean_iou
-from hdems.data.labels import num_classes_for, resolve_label_mode
+from hdems.data.labels import LABEL_MODES, num_classes_for, resolve_label_mode
+from hdems.data.motion_labels import IGNORE_LABEL
+from hdems.visualize import save_event_colour_figure
 from hdems.detection import detection_metrics, masks_to_boxes
 from hdems.instances import binary_iou, connected_components, instance_metrics
 from hdems.models.hdems import HDEMS
@@ -30,24 +31,11 @@ def load_config(path: str | Path) -> dict:
 
 
 def build_dataset(cfg: dict, split: str | None = None):
-    ds_cfg = cfg.get("dataset", {})
-    name = ds_cfg.get("name", "dsec")
+    """Eval defaults to the eval split; otherwise the shared builder."""
     if split is None:
-        split = cfg.get("eval", {}).get("split", ds_cfg.get("eval_split", "eval"))
-
-    if name == "dsec":
-        return DSECDataset(ds_cfg["root"], split)
-    return EVIMODataset(
-        ds_cfg["root"],
-        split,
-        ds_cfg.get("version"),
-        height=ds_cfg.get("height", 480),
-        width=ds_cfg.get("width", 640),
-        window_ms=ds_cfg.get("window_ms", 50.0),
-        decay=cfg.get("time_surface", {}).get("decay", 0.8),
-        time_frames=ds_cfg.get("time_frames"),
-        label_mode=resolve_label_mode(cfg),
-    )
+        split = cfg.get("eval", {}).get("split",
+                                        cfg.get("dataset", {}).get("eval_split", "eval"))
+    return _build_dataset(cfg, split)
 
 
 @torch.no_grad()
@@ -121,40 +109,49 @@ def evaluate_segmentation(
     label_mode: str = "motion",
     min_instance: int = 50,
     detect: bool = False,
+    color_dir: Path | None = None,
+    events_only_baseline: bool = False,
 ) -> dict[str, float]:
     model.eval()
     ious: list[float] = []
     total_loss = 0.0
     n = 0
     saved = 0
-    fg_ious: list[float] = []          # motion mode: foreground IoU
+    fg_ious: list[float] = []          # motion mode: foreground IoU (the headline)
     inst_scores: list[dict] = []       # motion mode: instance matching
     det_scores: list[dict] = []        # object detection: box matching
 
     if save_dir is not None:
         save_dir.mkdir(parents=True, exist_ok=True)
+    if color_dir is not None:
+        color_dir.mkdir(parents=True, exist_ok=True)
 
     for batch in loader:
         surface = batch["surface"].to(device)
         mask = batch["mask"].to(device).long()
         out = model(surface, task="segmentation")
         logits = out["seg_logits"]
-        # Score on EVENT pixels only (pixels without events carry no evidence).
-        valid = event_pixel_mask(surface) & (mask >= 0)
+        # Score on EVENT pixels only (pixels without events carry no evidence),
+        # and never on the ignore label (ambiguous speed / mask boundary band).
+        valid = event_pixel_mask(surface) & (mask >= 0) & (mask != IGNORE_LABEL)
         if valid.any():
-            total_loss += seg_loss(logits, mask.masked_fill(~valid, 255)).item()
+            total_loss += seg_loss(logits, mask.masked_fill(~valid, IGNORE_LABEL)).item()
         pred = logits.argmax(dim=1)
+        if events_only_baseline:      # control: call EVERY event pixel "moving"
+            pred = event_pixel_mask(surface).long()
         ious.append(mean_iou(pred[0], mask[0], num_classes, valid=valid[0]))
 
-        if label_mode == "motion":
+        if label_mode in ("motion", "tracked"):
             # Option A: foreground IoU + class-agnostic instance matching.
             v = valid[0].cpu().numpy()
             pred_fg = (pred[0] > 0).cpu().numpy()
             gt_fg = (mask[0] > 0).cpu().numpy()
             fg_ious.append(binary_iou(pred_fg, gt_fg, valid=v))
-            gt_raw = batch.get("gt_raw")
-            if gt_raw is not None:
-                gt_inst = (gt_raw[0].cpu().numpy().astype(np.int64)) // 1000
+            # gt_moving holds the raw ids of MOVING objects only; falling back to
+            # gt_raw would count the static table as an object to be detected.
+            gt_ids = batch.get("gt_moving", batch.get("gt_raw"))
+            if gt_ids is not None:
+                gt_inst = (gt_ids[0].cpu().numpy().astype(np.int64)) // 1000
                 pred_inst = connected_components(np.logical_and(pred_fg, v),
                                                  min_size=min_instance)
                 inst_scores.append(instance_metrics(pred_inst, gt_inst, valid=v))
@@ -171,17 +168,26 @@ def evaluate_segmentation(
                 save_dir / f"eval_{n:05d}.png", num_classes,
                 title=panel_title, box_lines=box_lines,
             )
+            if color_dir is not None:
+                save_event_colour_figure(
+                    surface[0], pred[0], event_pixel_mask(surface)[0],
+                    color_dir / f"events_{n:05d}.png",
+                    gt_moving=(batch["gt_moving"][0] if "gt_moving" in batch else None),
+                    min_instance=min_instance,
+                )
             saved += 1
         n += 1
 
     if save_dir is not None:
         print(f"Saved {saved} panels to {save_dir.resolve()}")
+    if color_dir is not None:
+        print(f"Saved {saved} event-colour figures to {color_dir.resolve()}")
 
     out: dict[str, float] = {
         "loss": total_loss / max(n, 1),
         "miou": sum(ious) / max(len(ious), 1),
     }
-    if label_mode == "motion":
+    if label_mode in ("motion", "tracked"):
         fin = [v for v in fg_ious if v == v]                      # drop NaN frames
         out["fg_iou"] = sum(fin) / max(len(fin), 1)
         if inst_scores:
@@ -245,8 +251,9 @@ def main() -> None:
                         help="Override velocity.event_combine (else taken from the checkpoint).")
     parser.add_argument("--event-feature", type=str, choices=["phi", "f"], default=None,
                         help="Override velocity.event_feature (else taken from the checkpoint).")
-    parser.add_argument("--label-mode", type=str, choices=["motion", "objects", "remap"], default=None,
-                        help="Override dataset.label_mode (else taken from the checkpoint).")
+    parser.add_argument("--label-mode", type=str, choices=list(LABEL_MODES), default=None,
+                        help="Override dataset.label_mode (else taken from the checkpoint). "
+                             "motion = pose-derived moving; tracked = legacy mask>0 baseline.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save-images", type=str, default=None)
     parser.add_argument("--max-images", type=int, default=50)
@@ -254,6 +261,12 @@ def main() -> None:
                         help="Evaluate on only the first N dataset frames (smoke test).")
     parser.add_argument("--detect", action="store_true",
                         help="Also report object detection (boxes from predicted instances).")
+    parser.add_argument("--color-events", type=str, default=None,
+                        help="Directory for event-colour figures: moving events red, "
+                             "static grey, plus per-instance colours.")
+    parser.add_argument("--events-only-baseline", action="store_true",
+                        help="CONTROL: ignore the model and call every event pixel "
+                             "'moving'. Foreground IoU must be poor once labels are motion.")
     parser.add_argument("--compare-heads", action="store_true",
                         help="Run CNN and Ridge on same loader; write compare panels")
     args = parser.parse_args()
@@ -415,15 +428,21 @@ def main() -> None:
             save_dir=save_dir, max_images=args.max_images,
             panel_title=f"{head} head", box_lines=box,
             label_mode=label_mode, detect=args.detect,
+            color_dir=Path(args.color_events) if args.color_events else None,
+            events_only_baseline=args.events_only_baseline,
         )
         sample = dataset[0]["surface"].unsqueeze(0)
         ms = measure_seg_latency(model, sample, device)
-        print(f"Head: {head}  label_mode: {label_mode}  event_feature: {model.event_feature}  "
+        title = "EVENTS-ONLY BASELINE (control)" if args.events_only_baseline else f"Head: {head}"
+        print(f"{title}  label_mode: {label_mode}  event_feature: {model.event_feature}  "
               f"axis_combine: {model.axis_combine}  event_combine: {model.event_combine}")
+        if label_mode in ("motion", "tracked"):
+            # Headline: foreground IoU. mIoU averages in the easy static class and
+            # stays near 0.5 even for a model that predicts "static" everywhere.
+            print(f"FG IoU (moving vs rest) [HEADLINE]: {metrics.get('fg_iou', float('nan')):.4f}")
         print(f"Seg loss: {metrics['loss']:.4f}")
-        print(f"mIoU:     {metrics['miou']:.4f}")
-        if label_mode == "motion":
-            print(f"FG IoU (moving vs background): {metrics.get('fg_iou', float('nan')):.4f}")
+        print(f"mIoU:     {metrics['miou']:.4f}   (secondary — see FG IoU)")
+        if label_mode in ("motion", "tracked"):
             if "instance_miou" in metrics:
                 print(f"Instance mIoU (matched):      {metrics['instance_miou']:.4f}")
                 print(f"Instance P / R @0.5:          "

@@ -30,6 +30,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hdems.data.evimo2_reader import build_sample_index, load_frame_sample, load_meta
+from hdems.data.motion_labels import frame_motion, params_from_config
 
 
 def main() -> None:
@@ -50,6 +51,7 @@ def main() -> None:
     window_s = ds.get("window_ms", 50.0) / 1000.0
     decay = cfg.get("time_surface", {}).get("decay", 0.8)
     time_fracs = ds.get("time_frames")
+    motion_params = params_from_config(cfg)
 
     for split in args.splits:
         index = build_sample_index(root, split)
@@ -69,8 +71,17 @@ def main() -> None:
                 window_s=window_s, decay=decay,
                 time_fracs=time_fracs,
             )
+            moving, ambiguous = frame_motion(seq_dir, fi, motion_params, meta_cache[seq_dir])
             out_path = out_dir / f"{seq_dir.name}_{fi:06d}.pt"
-            torch.save({"surface": sample["surface"], "mask": sample["mask"]}, out_path)
+            # mask_raw MUST be stored: the shard holds raw object ids, and the label
+            # mode (motion needs the per-frame moving set) is applied at load time.
+            torch.save({
+                "surface": sample["surface"],
+                "mask": sample["mask"],
+                "mask_raw": True,
+                "moving_ids": sorted(int(i) for i in moving),
+                "ambiguous_ids": sorted(int(i) for i in ambiguous),
+            }, out_path)
 
             if (k + 1) % 200 == 0 or (k + 1) == len(index):
                 print(f"  {k + 1}/{len(index)}")

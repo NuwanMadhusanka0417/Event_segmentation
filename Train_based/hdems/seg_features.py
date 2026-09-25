@@ -16,6 +16,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from hdems.data.motion_labels import IGNORE_LABEL
+
 _SOBEL_X = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]).view(1, 1, 3, 3)
 _SOBEL_Y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]).view(1, 1, 3, 3)
 
@@ -90,7 +92,10 @@ def flatten_valid_features(
     if mask.dim() == 2:
         mask = mask.unsqueeze(0)
     b, d, h, w = features.shape
-    valid = event_valid_mask(surface, threshold=event_threshold) & (mask >= 0)
+    # Drop ignore-label pixels (ambiguous object speed, mask boundary band) as well
+    # as pixels without events -- a 255 label would otherwise be fitted as a class.
+    valid = (event_valid_mask(surface, threshold=event_threshold)
+             & (mask >= 0) & (mask != IGNORE_LABEL))
     x_flat = features.permute(0, 2, 3, 1).reshape(b * h * w, d)
     y_flat = mask.reshape(b * h * w)
     v = valid.reshape(b * h * w)

@@ -135,7 +135,14 @@ echo ">>> [$(date +%T)] evaluating -> ${RESULTS_DIR}/eval_images"
 python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
   --checkpoint "${CKPT}" ${DETECT_FLAG} \
   --device cuda --save-images "${RESULTS_DIR}/eval_images" \
+  --color-events "${RESULTS_DIR}/event_colours" \
   --max-images "${TEST_SAMPLES}"
+
+# CONTROL: predict "moving" at every event pixel. With motion labels this must
+# score far below the model — if it does not, the labels are not motion.
+echo ">>> [$(date +%T)] events-only baseline (control)"
+python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
+  --checkpoint "${CKPT}" --events-only-baseline --device cuda
 
 # ---------------------------------------------------------------------------
 # 3. COLLECT  (keep a copy of the checkpoint + this log next to the results)

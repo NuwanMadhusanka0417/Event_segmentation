@@ -25,8 +25,24 @@ dataset:
   width: 640
   window_ms: 50.0
   time_frames: [0.0, 0.25, 0.5, 1.0]   # paper multi-time surfaces (F0,F1,F2,F4); [] = single-time
-  label_mode: motion     # motion = moving vs background (Option A, 2 classes)
+  label_mode: motion     # motion  = MOVING vs rest, from the pose metadata (Option A, 2 classes)
+  #                        tracked = legacy mask>0 ("on a tracked surface" — includes the
+  #                                  static table, so NOT motion; baseline/ablation only)
   #                        objects = per-object id (Option B; ids 5..28 -> needs >=29)
+  scene_disjoint: true   # drop train sequences whose scene also appears in eval/
+  #                        (train/ and eval/ hold different takes of scene13/14/15)
+  require_mover: true    # train only on frames where >=1 object is moving ...
+  negative_ratio: 0.1    # ... plus this share of all-static frames as negatives
+  interleave: true       # round-robin across sequences so --max-train-samples N
+  #                        is a balanced sample, not the first sequence only
+
+motion_label:            # label_mode: motion — thresholds in IMAGE PIXELS per window
+  move_px: 1.0           # >= this displacement -> moving
+  static_px: 0.3         # <= this -> static; in between -> ignore (255)
+  boundary_ignore_px: 2  # ignore a band this wide around every mask boundary
+  rot_radius_m: 0.05     # nominal object radius, so spin-in-place counts as motion
+  min_moving_px: 100     # a frame "has a mover" only if that object is visible
+  #                        in the mask with at least this many pixels
 
 train:
   task: segmentation
