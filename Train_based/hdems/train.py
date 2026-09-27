@@ -9,6 +9,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
+from hdems.config import apply_resolution_ratio, frontend_settings, resolution_ratio_of
 from hdems.data.build import build_dataset as _build_dataset
 from hdems.data.labels import LABEL_MODES, num_classes_for, resolve_label_mode
 from hdems.data.motion_labels import IGNORE_LABEL
@@ -20,7 +21,7 @@ from hdems.vsa.velocity import EVENT_COMBINES
 
 
 def load_config(path: str | Path) -> dict:
-    with open(path) as f:
+    with open(path, encoding="utf-8-sig") as f:     # config comments are UTF-8
         return yaml.safe_load(f)
 
 
@@ -91,6 +92,9 @@ def main() -> None:
     parser.add_argument("--label-mode", type=str, choices=list(LABEL_MODES), default=None,
                         help="motion = pose-derived moving (Option A); objects = per-object id "
                              "(Option B); tracked = legacy mask>0 baseline.")
+    parser.add_argument("--resolution-ratio", type=int, default=None,
+                        help="Process at 1/R resolution: 1 full, 2 half, 4 quarter "
+                             "(overrides dataset.resolution_ratio).")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -105,6 +109,9 @@ def main() -> None:
         if args.event_feature:
             vel["event_feature"] = args.event_feature
         cfg["velocity"] = vel
+    cfg = apply_resolution_ratio(cfg, args.resolution_ratio, verbose=True)
+    ratio = resolution_ratio_of(cfg)
+    frontend = frontend_settings(cfg)
     axis = cfg.get("velocity", {}).get("axis_combine", "bind")
     event = cfg.get("velocity", {}).get("event_combine", "bind")
     feature = cfg.get("velocity", {}).get("event_feature", "phi")
@@ -150,7 +157,7 @@ def main() -> None:
     # so the settings are recorded in the path (last.pt / best.pt live inside).
     head = cfg.get("segmentation", {}).get("head", "cnn")
     ckpt_dir = Path(train_cfg.get(
-        "out_dir", f"checkpoints/{head}_{feature}_{axis}_{event}_{label_mode}"))
+        "out_dir", f"checkpoints/{head}_{feature}_{axis}_{event}_{label_mode}_r{ratio}"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_loss = float("inf")
 
@@ -166,7 +173,8 @@ def main() -> None:
         ckpt = {"model": model.state_dict(), "epoch": epoch + 1,
                 "loss": loss, "task": task,
                 "axis_combine": axis, "event_combine": event, "event_feature": feature,
-                "label_mode": label_mode, "num_classes": n_classes}
+                "label_mode": label_mode, "num_classes": n_classes,
+                "resolution_ratio": ratio, "frontend": frontend}
         torch.save(ckpt, ckpt_dir / "last.pt")
         if loss < best_loss:
             best_loss = loss

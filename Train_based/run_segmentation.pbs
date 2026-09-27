@@ -5,7 +5,7 @@
 #PBS -l ncpus=24
 #PBS -l mem=128GB
 #PBS -l ngpus=2
-#PBS -l walltime=12:00:00
+#PBS -l walltime=24:00:00
 #PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
 #PBS -l wd
 #PBS -j oe
@@ -25,7 +25,9 @@ HEAD=cnn               # cnn | prototype | ridge | motion
 LABEL_MODE=motion      # motion = moving vs background (Option A)
                        # objects = per-object id        (Option B)
 DETECT=yes             # yes | no  -> also report object detection (boxes from instances)
-SAMPLES=300            # max train frames   (train split has 9,446 usable)
+RES_RATIO=1            # 1 = full 480x640 | 2 = half 240x320 | 4 = quarter 120x160
+                       #   kernel N, search M and Eq.12 pooling scale with it (~ratio^4 cheaper)
+SAMPLES=300            # max train frames   (2,495 usable after the motion-label fix)
 VAL_SAMPLES=150        # val frames used to pick the best epoch / alpha
 TEST_SAMPLES=50        # max eval panels saved
 
@@ -42,7 +44,7 @@ source "${VENV}"
 cd "${CODE_DIR}"
 
 # Derived names -------------------------------------------------------------
-RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_COMBINE}_${LABEL_MODE}_${SAMPLES}"
+RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_COMBINE}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}"
 CKPT="checkpoints/${RUN_NAME}.pt"
 RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${RESULTS_DIR}"
@@ -70,6 +72,7 @@ printf '  %-16s %s\n' \
   EV_COMBINE   "${EV_COMBINE}" \
   LABEL_MODE   "${LABEL_MODE}" \
   DETECT       "${DETECT}" \
+  RES_RATIO    "${RES_RATIO}  (1 full, 2 half, 4 quarter)" \
   SAMPLES      "${SAMPLES}  (train frames)" \
   VAL_SAMPLES  "${VAL_SAMPLES}  (val frames)" \
   TEST_SAMPLES "${TEST_SAMPLES}  (eval panels)" \
@@ -90,14 +93,14 @@ if git -C "${CODE_DIR}" rev-parse --short HEAD >/dev/null 2>&1; then
 fi
 echo
 echo "--- config file: ${CONFIG}  (* = overridden by this script) ----"
-python - "${CONFIG}" "${HEAD}" "${AX_COMBINE}" "${EV_COMBINE}" "${LABEL_MODE}" "${EV_FEATURE}" <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
+python - "${CONFIG}" "${HEAD}" "${AX_COMBINE}" "${EV_COMBINE}" "${LABEL_MODE}" "${EV_FEATURE}" "${RES_RATIO}" <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
 import sys, yaml
-path, head, ax, ev, lm, feat = sys.argv[1:7]
-cfg = yaml.safe_load(open(path)) or {}
+path, head, ax, ev, lm, feat, rr = sys.argv[1:8]
+cfg = yaml.safe_load(open(path, encoding="utf-8")) or {}
 # CLI flags passed by this script win over the YAML -- show the value actually used
 override = {"segmentation.head": head, "velocity.axis_combine": ax,
             "velocity.event_combine": ev, "dataset.label_mode": lm,
-            "velocity.event_feature": feat}
+            "velocity.event_feature": feat, "dataset.resolution_ratio": rr}
 def walk(node, prefix=""):
     for k, v in node.items():
         key = f"{prefix}{k}"
@@ -121,7 +124,7 @@ echo ">>> [$(date +%T)] fitting ${HEAD} head (label_mode=${LABEL_MODE})"
 python scripts/fit_ridge_head.py --config "${CONFIG}" \
   --head "${HEAD}" --event-feature "${EV_FEATURE}" \
   --axis-combine "${AX_COMBINE}" --event-combine "${EV_COMBINE}" \
-  --label-mode "${LABEL_MODE}" --out "${CKPT}" \
+  --label-mode "${LABEL_MODE}" --resolution-ratio "${RES_RATIO}" --out "${CKPT}" \
   --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"
 
 # ---------------------------------------------------------------------------

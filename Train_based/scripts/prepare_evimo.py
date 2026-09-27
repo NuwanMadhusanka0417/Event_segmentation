@@ -29,6 +29,7 @@ import yaml
 # not just via `python -m`. Adds the project root (parent of scripts/) to path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from hdems.config import apply_resolution_ratio, surface_decay
 from hdems.data.evimo2_reader import build_sample_index, load_frame_sample, load_meta
 from hdems.data.motion_labels import frame_motion, params_from_config
 
@@ -41,15 +42,16 @@ def main() -> None:
                     help="output root (default: the dataset root from the config)")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(open(args.config))
+    with open(args.config, encoding="utf-8-sig") as f:
+        cfg = apply_resolution_ratio(yaml.safe_load(f), verbose=True)
     ds = cfg.get("dataset", {})
     root = Path(ds["root"])
     out_root = Path(args.out) if args.out else root
 
-    height = ds.get("height", 480)
+    height = ds.get("height", 480)             # already divided by resolution_ratio
     width = ds.get("width", 640)
     window_s = ds.get("window_ms", 50.0) / 1000.0
-    decay = cfg.get("time_surface", {}).get("decay", 0.8)
+    decay = surface_decay(cfg)                 # time_surface.tau_ms (paper: 35 ms)
     time_fracs = ds.get("time_frames")
     motion_params = params_from_config(cfg)
 

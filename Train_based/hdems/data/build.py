@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from hdems.config import apply_resolution_ratio, surface_decay
 from hdems.data.dsec import DSECDataset
 from hdems.data.evimo import EVIMODataset
 from hdems.data.evimo2_reader import scenes_in_split
@@ -18,6 +19,7 @@ from hdems.data.motion_labels import params_from_config
 
 def build_dataset(cfg: dict[str, Any], split: str | None = None):
     """Dataset for ``split`` (default: dataset.split)."""
+    cfg = apply_resolution_ratio(cfg)          # no-op if the entry point already did
     ds_cfg = cfg.get("dataset", {})
     name = ds_cfg.get("name", "dsec")
     split = split or ds_cfg.get("split", "train")
@@ -44,7 +46,7 @@ def build_dataset(cfg: dict[str, Any], split: str | None = None):
         height=ds_cfg.get("height", 480),
         width=ds_cfg.get("width", 640),
         window_ms=ds_cfg.get("window_ms", 50.0),
-        decay=cfg.get("time_surface", {}).get("decay", 0.8),
+        decay=surface_decay(cfg),              # time_surface.tau_ms (paper: 35 ms)
         time_frames=ds_cfg.get("time_frames"),
         label_mode=resolve_label_mode(cfg),
         motion_params=params_from_config(cfg),

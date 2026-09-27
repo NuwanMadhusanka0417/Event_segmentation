@@ -197,15 +197,19 @@ def load_frame_sample(
     if out_height and out_width and (
         surface.shape[-2] != out_height or surface.shape[-1] != out_width
     ):
+        # Downsampling uses AREA averaging so every event still contributes.
+        # Bilinear at 1/4 scale samples only 2x2 of each 4x4 block and silently
+        # drops ~75% of the events (resolution_ratio=4).
+        down = out_height < surface.shape[-2]
+        mode = "area" if down else "bilinear"
+        kw = {} if down else {"align_corners": False}
         if surface.dim() == 3:                               # (2, H, W)
             surface = F.interpolate(
-                surface.unsqueeze(0), size=(out_height, out_width),
-                mode="bilinear", align_corners=False,
+                surface.unsqueeze(0), size=(out_height, out_width), mode=mode, **kw,
             ).squeeze(0)
         else:                                                # (T, 2, H, W)
             surface = F.interpolate(
-                surface, size=(out_height, out_width),
-                mode="bilinear", align_corners=False,
+                surface, size=(out_height, out_width), mode=mode, **kw,
             )
         mask = F.interpolate(
             mask.unsqueeze(0).unsqueeze(0).float(),

@@ -1,19 +1,32 @@
 # EV-IMO motion segmentation config
 
-d: 1024                  # higher d -> less random-feature noise in the cost volume
+d: 512                   # 1024 OOMs a 32GB V100 at 480x640; measured flow is identical
+#                          for d = 64..1024 on EVIMO2, so this costs no accuracy
 
+flow_cache:              # the frozen cost volume is ~80% of a training step: compute
+  enabled: true          # its flow once per sample and reuse it every epoch / run.
+  dir: cache/flow        # ~1.2 MB per frame (~5 GB for train+eval). Keyed on the kernel
+  #                        weights + M/alpha/smooth + the surface itself, so changing
+  #                        any of them recomputes automatically. Safe to delete anytime.
+
+# Values below follow the VSA-Flow paper, Table A1 (DSEC column). Pixel-sized
+# values (patch_size, M, smooth) are FULL-resolution; dataset.resolution_ratio
+# divides them automatically.
 encoder:
-  patch_size: 21
-  sigma_k: 1.5
-  rank: 16
-  separable_terms: 2
+  patch_size: 21          # paper N — HD kernel aperture
+  sigma_k: 1.5            # paper σ_K — Gaussian G in K = D ∗ G
+  kernel: conv            # conv = paper Eq.6 (K = D ∗ G); window = old Gaussian window
+  polarity_binding: true  # paper Eq.7-8: per-polarity kernels, role-bound  (old: summed)
+  scales: 2               # paper S (Eq.9 multi-scale descriptor)           (old: 1)
 
 matching:
-  M: 7
+  M: 31                   # paper M — cost-volume search window (±15 px). Was 7 (±3 px):
+  #                         real motion on the moving-camera train scenes is 5-9 px, so
+  #                         M=7 could not represent it and the flow was noise there
   pyramid_levels: 4
   scales: [0, 1, 2]       # paper two-time cost volume: F0 vs F1/F2/F4 at pool 1/2/4
-  alpha: 0.3              # Eq.12 probability-volume threshold coefficient
-  smooth: 3               # Eq.12 cost-volume pre-smoothing (odd; 1 = off)
+  alpha: 0.85             # paper α — Eq.12 probability-volume threshold   (was 0.3)
+  smooth: 71              # paper sc — Eq.12 cost-volume average pooling   (was 3)
   vel_scale: 1.0          # displacement->velocity scale (1.0 = pixel units)
 
 dataset:
@@ -21,8 +34,12 @@ dataset:
   root: ../Data/EVIMO2_new/samsung_mono/imo   # EVENT camera (Samsung DVS, 640x480)
   split: train
   eval_split: eval
-  height: 480            # full resolution (accuracy); REBUILD CACHE after changing
+  height: 480            # full sensor resolution
   width: 640
+  resolution_ratio: 1    # 1 = full, 2 = half (240x320), 4 = quarter (120x160).
+  #                        Also divides patch_size / M / smooth, so they keep covering
+  #                        the same physical area; the cost volume gets ~ratio^4 cheaper.
+  #                        Override per run with --resolution-ratio.
   window_ms: 50.0
   time_frames: [0.0, 0.25, 0.5, 1.0]   # paper multi-time surfaces (F0,F1,F2,F4); [] = single-time
   label_mode: motion     # motion  = MOVING vs rest, from the pose metadata (Option A, 2 classes)
@@ -47,7 +64,9 @@ motion_label:            # label_mode: motion — thresholds in IMAGE PIXELS per
 train:
   task: segmentation
   batch_size: 1
-  epochs: 30
+  epochs: 30             # upper bound; early stopping usually ends much sooner
+  patience: 5            # stop after this many validations without improvement (0 = off)
+  val_every: 2           # validate every N epochs (always on the last epoch)
   lr: 1.0e-4
   num_workers: 8
   use_dice: true          # add Dice to CE (background/foreground imbalance)
@@ -90,4 +109,6 @@ ridge:
   # max_val_samples: 10
 
 time_surface:
-  decay: 0.8
+  tau_ms: 35.0           # paper τ_TS (Eq.3): event weight exp(-age / 35 ms).
+  #                        The old `decay: 0.8` was per SECOND, i.e. 0.989 across 50 ms:
+  #                        effectively no decay, so each surface smeared 50 ms of motion.

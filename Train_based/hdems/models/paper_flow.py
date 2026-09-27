@@ -31,26 +31,37 @@ def avg_pool_complex(field: torch.Tensor, k: int) -> torch.Tensor:
     return torch.complex(r, i)
 
 
-def _cosine_shift(A: torch.Tensor, B: torch.Tensor, a: int, b: int, eps: float = 1e-8) -> torch.Tensor:
-    """Per-pixel complex cosine similarity  cos(A(x), B(x + (a, b)))  -> (B, H, W)."""
-    Bs = torch.roll(B, shifts=(-a, -b), dims=(2, 3))
-    num = (A * Bs.conj()).sum(1).real
-    den = A.abs().pow(2).sum(1).sqrt() * Bs.abs().pow(2).sum(1).sqrt() + eps
-    return num / den
+def _unit_realimag(Z: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Complex (B, d, H, W) -> per-pixel unit-norm [real | imag] (B, 2d, H, W).
+
+    Re<a, b> for complex vectors equals the real dot product of [Re|Im] stacks, so
+    the cosine becomes a plain real channel sum on pre-normalised fields.
+    """
+    n = Z.abs().pow(2).sum(1, keepdim=True).sqrt() + eps
+    return torch.cat([Z.real / n, Z.imag / n], dim=1)
 
 
 def cross_cost_volume(A: torch.Tensor, B: torch.Tensor, M: int = 7) -> torch.Tensor:
-    """Two-time cost volume C[b, ia, ib, y, x] = cos(A(y,x), B(y+a, x+b)).
+    """Two-time cost volume C[b, ia, ib, y, x] = cos(A(y,x), B(y+a, x+b))  (Eq. 10).
 
     A, B : (B, d, H, W) complex   reference and target descriptor fields
     out  : (B, M, M, H, W) float32
+
+    Both fields are normalised ONCE and B is zero-padded ONCE; every displacement
+    is then a slice VIEW of the padded field. The previous version recomputed both
+    norms and made a full ``torch.roll`` copy of B for each of the M^2 shifts,
+    which made the paper's M = 31 (961 shifts) impractical. Zero padding also
+    fixes a border artefact: roll wrapped around, so pixels on the left edge were
+    matched against the right edge. Out-of-frame displacements now score 0.
     """
     m = M // 2
     Bn, _, H, W = A.shape
-    C = torch.zeros(Bn, M, M, H, W, device=A.device)
-    for ia, a in enumerate(range(-m, m + 1)):
-        for ib, b in enumerate(range(-m, m + 1)):
-            C[:, ia, ib] = _cosine_shift(A, B, a, b)
+    a_n = _unit_realimag(A)
+    b_p = F.pad(_unit_realimag(B), (m, m, m, m))
+    C = torch.empty(Bn, M, M, H, W, device=A.device, dtype=a_n.dtype)
+    for ia in range(M):
+        for ib in range(M):
+            C[:, ia, ib] = (a_n * b_p[:, :, ia:ia + H, ib:ib + W]).sum(1)
     return C
 
 
@@ -83,6 +94,25 @@ def multiscale_cost_volume(
     return total
 
 
+def box_filter(x: torch.Tensor, k: int) -> torch.Tensor:
+    """k x k mean, stride 1, zero padding -- same result as
+    ``F.avg_pool2d(x, k, 1, k // 2)`` but O(1) per pixel via cumulative sums.
+
+    The paper pools the cost volume with sc = 71. A direct 71x71 average pool over
+    all M^2 = 961 displacement channels costs 71^2 operations per value; running
+    sums make it two subtractions per value regardless of k.
+    """
+    if k <= 1:
+        return x
+    p = k // 2
+    x = F.pad(x, (p, p, p, p))
+    c = F.pad(x.cumsum(-1), (1, 0))
+    x = c[..., k:] - c[..., :-k]
+    c = F.pad(x.cumsum(-2), (0, 0, 1, 0))
+    x = c[..., k:, :] - c[..., :-k, :]
+    return x / float(k * k)
+
+
 def flow_from_cost(
     C: torch.Tensor,
     M: int = 7,
@@ -97,8 +127,8 @@ def flow_from_cost(
     """
     Bn, _, _, H, W = C.shape
     Cf = C.reshape(Bn, M * M, H, W)
-    if smooth > 1:                                            # optional spatial denoise
-        Cf = F.avg_pool2d(Cf, smooth, 1, smooth // 2)
+    if smooth > 1:                    # Eq.12 spatial average pooling, kernel sc, stride 1
+        Cf = box_filter(Cf, smooth)
     cmax = Cf.max(1, keepdim=True).values
     cmean = Cf.mean(1, keepdim=True)
     cbar = (Cf - alpha * cmax - (1.0 - alpha) * cmean).clamp_min(0)   # Eq. 12

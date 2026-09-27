@@ -1,0 +1,52 @@
+#!/bin/bash
+#PBS -N hdems_flow
+#PBS -P mi23
+#PBS -q gpuvolta
+#PBS -l ncpus=12
+#PBS -l mem=95GB
+#PBS -l ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+#PBS -l wd
+#PBS -j oe
+# Short job, NO training. Checks whether the VSA flow is real optical flow by
+# comparing it with ground-truth flow (EVIMO2 depth + poses), for each
+# resolution ratio. Run this BEFORE run_segmentation.pbs: if the flow fails
+# here, the classifier would only learn from noise.
+#
+#   qsub run_flow_check.pbs
+#   tail -f hdems_flow.o<JOBID>        # read the "FLOW CHECK" summary at the end
+#
+# Result: a table per ratio -- pick a ratio whose train AND eval rows say PASS,
+# then set RES_RATIO to it in run_segmentation.pbs.
+
+set -eo pipefail
+
+# ---------------------------------------------------------------------------
+# PARAMETERS
+# ---------------------------------------------------------------------------
+RATIOS=(4 2 1)         # resolution ratios to check (cheapest first)
+FRAMES=20              # frames per split per ratio
+CONFIG=configs/evimo_seg.yaml
+
+CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
+VENV=/scratch/jq77/nk8155/seg/bin/activate
+
+module load cuda
+module load python3/3.9.2
+source "${VENV}"
+cd "${CODE_DIR}"
+source scripts/nci_env.sh
+export PYTHONUNBUFFERED=1
+
+echo "=== Flow check ${PBS_JOBID:-local} started $(date) ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+SECONDS=0
+for r in "${RATIOS[@]}"; do
+  echo
+  echo "################  resolution_ratio = ${r}  ################"
+  python -u scripts/flow_epe.py --config "${CONFIG}" --resolution-ratio "${r}" \
+    --frames "${FRAMES}" --device cuda
+done
+echo
+echo "=== Flow check finished $(date) -- elapsed $((SECONDS/60)) min ==="

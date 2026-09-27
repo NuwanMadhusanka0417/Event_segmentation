@@ -28,6 +28,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from hdems.config import apply_resolution_ratio                 # noqa: E402
 from hdems.data.build import build_dataset                      # noqa: E402
 from hdems.data.labels import resolve_label_mode                # noqa: E402
 from hdems.data.motion_labels import IGNORE_LABEL               # noqa: E402
@@ -81,12 +82,15 @@ def main() -> None:
     ap.add_argument("--stride", type=int, default=0, help="frame stride (0 = spread evenly)")
     ap.add_argument("--out", default="diagnostics", help="output directory for figures")
     ap.add_argument("--d", type=int, default=None, help="override hypervector dim (CPU runs)")
+    ap.add_argument("--resolution-ratio", type=int, default=None,
+                    help="1 full (default), 2 half, 4 quarter resolution")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     if args.d:
         cfg["d"] = args.d
+    cfg = apply_resolution_ratio(cfg, args.resolution_ratio, verbose=True)
     label_mode = resolve_label_mode(cfg)
     if label_mode != "motion":
         print(f"[warn] label_mode={label_mode!r}: these gates are meant for 'motion'")

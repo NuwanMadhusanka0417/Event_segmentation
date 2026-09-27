@@ -237,6 +237,64 @@ python scripts/prepare_evimo.py --config configs/evimo_seg.yaml
 | `velocity.event_combine` | `bind` · `bundle` · `bindbundle` · `concat` |
 | `segmentation.head` | `prototype` (default) · `ridge` · `motion` · `cnn` |
 
+## Front end = the paper (Table A1)
+
+| | paper | setting |
+|---|---|---|
+| Time surface decay τ (Eq. 3) | 35 ms | `time_surface.tau_ms: 35` |
+| HD kernel `K = D ∗ G` (Eq. 6) | convolution, N = 21, σ = 1.5 | `encoder.kernel: conv` |
+| Per-polarity kernels + role binding (Eq. 7–8) | yes | `encoder.polarity_binding: true` |
+| Multi-scale descriptor (Eq. 9) | S = 2 | `encoder.scales: 2` |
+| Cost-volume search window | M = 31 | `matching.M: 31` |
+| Eq. 12 threshold / pooling | α = 0.85, sc = 71 | `matching.alpha`, `matching.smooth` |
+
+Measured against the previous implementation: the old Gaussian-*window* kernel
+held 0% of its energy beyond a 4 px radius (the "21×21" kernel was effectively
+9×9) — the paper's convolution keeps 87%. Summing polarities made a positive and
+a negative edge identical (cosine +1.00); role-binding makes them orthogonal.
+`kernel: window`, `polarity_binding: false`, `scales: 1` rebuild the old encoder.
+
+### Resolution ratio
+
+`dataset.resolution_ratio` (or `--resolution-ratio`): 1 = 480×640, 2 = 240×320,
+4 = 120×160. The pixel-sized settings are divided with it so they cover the same
+physical area — N 21→11→5, M 31→15→7, sc 71→35→17 — which makes the cost volume
+roughly ratio⁴ cheaper. Surfaces are downsampled by area averaging (bilinear at
+1/4 would ignore 12 of every 16 pixels). Motion labels stay in sensor pixels, so
+every ratio is scored on the same task. Checkpoints store their front end
+(including the ratio), and eval rebuilds exactly that.
+
+### Check the flow before training
+
+```bash
+qsub run_flow_check.pbs                       # ~minutes, no training
+python scripts/flow_epe.py --config configs/evimo_seg.yaml --resolution-ratio 2 --device cuda
+```
+
+Compares the VSA flow with ground-truth flow (EVIMO2 depth + poses,
+`hdems/data/gt_flow.py`): EPE, zero-flow EPE and correlation per split. PASS =
+correlation ≥ 0.7 and EPE < 0.6 × zero-flow EPE on **both** splits. Train the
+classifier only at a ratio that passes — otherwise it learns from noise.
+
+## Training speed: flow cache + early stopping
+
+The cost volume is ~80% of a training step and has no trainable parameters, so
+recomputing it every epoch was what made training take >24 h. With
+`flow_cache.enabled: true` the flow is computed **once per frame** and stored in
+`cache/flow/` (~1.2 MB/frame fp16); every later epoch, validation pass, eval run
+and any later run that shares the same front end (e.g. a different head or
+combine mode) reads it back instead.
+
+- The cache key covers the encoder's actual kernel weights, `M`, `alpha`,
+  `smooth`, `vel_scale` and the time surface itself, so changing any of them
+  recomputes automatically — it cannot serve stale flow. Delete the folder any time.
+- A cache hit and a cache miss give bit-identical features (both go through fp16).
+- The latency printed by `hdems.eval` bypasses the cache, so it is the real speed.
+
+`train.patience` stops training after that many validations without improvement,
+and `train.val_every` validates every N epochs. The best epoch is selected on
+foreground IoU in motion mode.
+
 ## Colouring the moving events
 
 ```bash

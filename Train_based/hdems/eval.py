@@ -11,6 +11,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
+from hdems.config import apply_resolution_ratio, restore_frontend
 from hdems.data.build import build_dataset as _build_dataset
 from hdems.losses.flow import epe_loss
 from hdems.losses.seg import seg_loss
@@ -26,7 +27,9 @@ from hdems.seg_features import event_pixel_mask
 
 
 def load_config(path: str | Path) -> dict:
-    with open(path) as f:
+    # utf-8 explicitly: the config comments use α, τ, ± and Windows would
+    # otherwise decode it with its locale code page
+    with open(path, encoding="utf-8-sig") as f:
         return yaml.safe_load(f)
 
 
@@ -129,16 +132,18 @@ def evaluate_segmentation(
     for batch in loader:
         surface = batch["surface"].to(device)
         mask = batch["mask"].to(device).long()
-        out = model(surface, task="segmentation")
-        logits = out["seg_logits"]
         # Score on EVENT pixels only (pixels without events carry no evidence),
         # and never on the ignore label (ambiguous speed / mask boundary band).
         valid = event_pixel_mask(surface) & (mask >= 0) & (mask != IGNORE_LABEL)
-        if valid.any():
-            total_loss += seg_loss(logits, mask.masked_fill(~valid, IGNORE_LABEL)).item()
-        pred = logits.argmax(dim=1)
-        if events_only_baseline:      # control: call EVERY event pixel "moving"
+        if events_only_baseline:
+            # Control: call EVERY event pixel "moving". It never looks at the model,
+            # so the front end is skipped entirely (no loss is reported).
             pred = event_pixel_mask(surface).long()
+        else:
+            logits = model(surface, task="segmentation")["seg_logits"]
+            if valid.any():
+                total_loss += seg_loss(logits, mask.masked_fill(~valid, IGNORE_LABEL)).item()
+            pred = logits.argmax(dim=1)
         ious.append(mean_iou(pred[0], mask[0], num_classes, valid=valid[0]))
 
         if label_mode in ("motion", "tracked"):
@@ -210,17 +215,23 @@ def evaluate_segmentation(
 
 @torch.no_grad()
 def measure_seg_latency(model: HDEMS, surface: torch.Tensor, device: torch.device, repeats: int = 30) -> float:
+    """Real per-frame latency -- the flow cache is bypassed, otherwise this would
+    report the speed of a disk read instead of the VSA front end."""
     model.eval()
     surface = surface.to(device)
-    for _ in range(5):
-        model(surface, task="segmentation")
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(repeats):
-        model(surface, task="segmentation")
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+    cache, model.flow_cache = model.flow_cache, None
+    try:
+        for _ in range(5):
+            model(surface, task="segmentation")
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            model(surface, task="segmentation")
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+    finally:
+        model.flow_cache = cache
     return (time.perf_counter() - t0) / repeats * 1000.0
 
 
@@ -269,6 +280,9 @@ def main() -> None:
                              "'moving'. Foreground IoU must be poor once labels are motion.")
     parser.add_argument("--compare-heads", action="store_true",
                         help="Run CNN and Ridge on same loader; write compare panels")
+    parser.add_argument("--resolution-ratio", type=int, default=None,
+                        help="Override the resolution ratio (default: the checkpoint's). "
+                             "A head trained at one ratio will not load at another.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -306,8 +320,16 @@ def main() -> None:
                 if not args.label_mode and _meta.get("label_mode"):
                     cfg["dataset"] = {**cfg.get("dataset", {}),
                                       "label_mode": _meta["label_mode"]}
-        except Exception:
-            pass
+                # A trained head is only valid for the front end it was trained on
+                # (kernel, M, alpha, smooth, tau, resolution...). Rebuild exactly
+                # that, even if the YAML has changed since training.
+                if _meta.get("frontend"):
+                    cfg = restore_frontend(cfg, _meta["frontend"])
+                    print("[eval] front end restored from checkpoint")
+        except Exception as e:
+            print(f"[eval] could not read checkpoint metadata ({e}); using the YAML")
+    # --resolution-ratio overrides; otherwise the checkpoint's (via frontend) or YAML's.
+    cfg = apply_resolution_ratio(cfg, args.resolution_ratio, verbose=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     # Label mode fixes the class count -> must match what the head was trained with.
     label_mode = resolve_label_mode(cfg)
@@ -431,8 +453,11 @@ def main() -> None:
             color_dir=Path(args.color_events) if args.color_events else None,
             events_only_baseline=args.events_only_baseline,
         )
-        sample = dataset[0]["surface"].unsqueeze(0)
-        ms = measure_seg_latency(model, sample, device)
+        if model.flow_cache is not None:
+            print(model.flow_cache.summary())
+        # The control never runs the model, so its latency would be meaningless.
+        ms = float("nan") if args.events_only_baseline else measure_seg_latency(
+            model, dataset[0]["surface"].unsqueeze(0), device)
         title = "EVENTS-ONLY BASELINE (control)" if args.events_only_baseline else f"Head: {head}"
         print(f"{title}  label_mode: {label_mode}  event_feature: {model.event_feature}  "
               f"axis_combine: {model.axis_combine}  event_combine: {model.event_combine}")
@@ -440,7 +465,8 @@ def main() -> None:
             # Headline: foreground IoU. mIoU averages in the easy static class and
             # stays near 0.5 even for a model that predicts "static" everywhere.
             print(f"FG IoU (moving vs rest) [HEADLINE]: {metrics.get('fg_iou', float('nan')):.4f}")
-        print(f"Seg loss: {metrics['loss']:.4f}")
+        if not args.events_only_baseline:
+            print(f"Seg loss: {metrics['loss']:.4f}")
         print(f"mIoU:     {metrics['miou']:.4f}   (secondary — see FG IoU)")
         if label_mode in ("motion", "tracked"):
             if "instance_miou" in metrics:

@@ -7,7 +7,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from hdems.config import apply_resolution_ratio
 from hdems.data.time_surface import build_pyramid
+from hdems.flow_cache import FlowCache
 from hdems.models.decoder import FlowDecoder
 from hdems.models.encoder import VSAEncoder
 from hdems.models.matching import HierarchicalMatcher
@@ -27,6 +29,9 @@ class HDEMS(nn.Module):
 
     def __init__(self, cfg: dict[str, Any]) -> None:
         super().__init__()
+        # patch_size / M / smooth are scaled by dataset.resolution_ratio (no-op if the
+        # entry point already applied it)
+        cfg = apply_resolution_ratio(cfg)
         d = cfg.get("d", 1024)
         enc = cfg.get("encoder", {})
         match = cfg.get("matching", {})
@@ -40,6 +45,11 @@ class HDEMS(nn.Module):
             sigma_k=enc.get("sigma_k", 1.5),
             rank=enc.get("rank", 64),
             separable_terms=enc.get("separable_terms", 2),
+            # paper defaults; set kernel=window, polarity_binding=false, scales=1 to
+            # rebuild the pre-2026-09-28 encoder for old checkpoints
+            kernel=str(enc.get("kernel", "conv")),
+            polarity_binding=bool(enc.get("polarity_binding", True)),
+            scales=int(enc.get("scales", 2)),
         )
         self.matcher = HierarchicalMatcher(
             d=d,
@@ -101,6 +111,13 @@ class HDEMS(nn.Module):
         self.temporal_window = temp.get("window", 8)
         self.register_buffer("time_phases", make_time_phases(d))
 
+        # The cost volume is ~80% of a training step and has no trainable parameters,
+        # so its flow is cached per sample instead of recomputed every epoch.
+        fc = cfg.get("flow_cache", {}) or {}
+        self.flow_cache: FlowCache | None = (
+            FlowCache(fc.get("dir", "cache/flow")) if fc.get("enabled", False) else None
+        )
+
     def encode_pyramid(self, surface: torch.Tensor) -> list[torch.Tensor]:
         pyr_surfaces = build_pyramid(surface, self.pyramid_levels)
         return [self.encoder(s.unsqueeze(0) if s.dim() == 3 else s) for s in pyr_surfaces]
@@ -121,6 +138,34 @@ class HDEMS(nn.Module):
             return f0
         raise ValueError(f"event_feature must be phi|f, got {self.event_feature!r}")
 
+    @torch.no_grad()
+    def _flow_uncached(self, surfaces: torch.Tensor) -> torch.Tensor:
+        """Paper Eq.10-14: multi-time fields -> multi-scale cost volume -> flow."""
+        fields = self.encode_times(surfaces)
+        cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
+        return flow_from_cost(cost, self.matcher.M, alpha=self.flow_alpha,
+                              vel_scale=self.vel_scale, smooth=self.flow_smooth)
+
+    @torch.no_grad()
+    def compute_flow(self, surfaces: torch.Tensor) -> torch.Tensor:
+        """(B, T, 2, H, W) -> flow (B, 2, H, W), from the flow cache when attached.
+
+        Only the samples that miss are sent through the cost volume. Cached and
+        fresh flow both pass through the same fp16 round trip, so the features are
+        bit-identical whether or not a sample was cached.
+        """
+        if self.flow_cache is None:
+            return self._flow_uncached(surfaces)
+        self.flow_cache.bind(self)
+        flows: list[torch.Tensor | None] = [self.flow_cache.load(s) for s in surfaces]
+        miss = [b for b, f in enumerate(flows) if f is None]
+        if miss:
+            fresh = self._flow_uncached(surfaces[miss])
+            for j, b in enumerate(miss):
+                self.flow_cache.save(surfaces[b], fresh[j])
+                flows[b] = fresh[j].to(torch.float16)
+        return torch.stack([f.to(device=surfaces.device, dtype=torch.float32) for f in flows])
+
     def paper_features(self, surfaces: torch.Tensor):
         """Paper front-end features for a linear (Ridge) readout.
 
@@ -129,15 +174,14 @@ class HDEMS(nn.Module):
                   HV Mv (event_combine): (B, 2d, H, W), or (B, 4d, H, W) for concat
           flow  = decoded optical flow (B, 2, H, W)
         """
-        fields = self.encode_times(surfaces)
-        cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
-        flow = flow_from_cost(cost, self.matcher.M, alpha=self.flow_alpha,
-                              vel_scale=self.vel_scale, smooth=self.flow_smooth)
+        flow = self.compute_flow(surfaces)
         # Fit the global model on EVENT pixels only -- empty pixels have flow ~0 and
         # would drag the fit to zero, leaving the "residual" equal to the raw flow.
         residual, _mag = ego_residual(flow, iters=self.ego_iters,
                                       valid=event_pixel_mask(surfaces))
-        x = self.event_hv(fields[0])
+        # Only the reference surface is needed for X, so a cache hit skips the other
+        # three encodes as well as the cost volume.
+        x = self.event_hv(self.encoder(surfaces[:, 0]))
         # residual velocity -> hypervector (axis_combine), fused with X (event_combine)
         mv = encode_velocity(residual[:, 0], residual[:, 1], self.phi_vx, self.phi_vy,
                              vel_bw=self.vel_bw, axis_combine=self.axis_combine)
@@ -158,14 +202,11 @@ class HDEMS(nn.Module):
 
         # ---- paper two-time / multi-scale motion path -----------------------
         if task == "segmentation" and self.head_type == "motion" and multitime:
-            fields = self.encode_times(surface)                      # [F0, F1, F2, F4]
-            cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
-            flow = flow_from_cost(cost, self.matcher.M, alpha=self.flow_alpha,
-                                  vel_scale=self.vel_scale, smooth=self.flow_smooth)
+            flow = self.compute_flow(surface)                        # cached when enabled
             residual, mag = ego_residual(flow, iters=self.ego_iters,
                                          valid=event_pixel_mask(surface))
             motion = torch.cat([residual, mag], dim=1)
-            phi = self.event_hv(fields[0])                           # HV context (Phi or F)
+            phi = self.event_hv(self.encoder(surface[:, 0]))         # HV context (Phi or F)
             outputs["flow"] = flow
             outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface[:, -1])
             return outputs

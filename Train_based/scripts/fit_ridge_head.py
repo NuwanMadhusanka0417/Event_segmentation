@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from hdems.config import apply_resolution_ratio, frontend_settings, resolution_ratio_of
 from hdems.data.labels import LABEL_MODES, num_classes_for, resolve_label_mode
 from hdems.eval import build_dataset, evaluate_segmentation, load_config
 from hdems.train import train_one_epoch
@@ -133,6 +134,10 @@ def main() -> None:
     ap.add_argument("--label-mode", type=str, choices=list(LABEL_MODES), default=None,
                     help="motion = pose-derived moving (Option A); objects = per-object id "
                          "(Option B); tracked = legacy mask>0 baseline.")
+    ap.add_argument("--resolution-ratio", type=int, default=None,
+                    help="Process at 1/R resolution: 1 full (default), 2 half, 4 quarter. "
+                         "Kernel size, search window M and Eq.12 pooling scale with it "
+                         "(overrides dataset.resolution_ratio).")
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--backend", choices=["streaming", "sklearn"], default=None)
@@ -162,6 +167,10 @@ def main() -> None:
         if args.event_feature:
             vel["event_feature"] = args.event_feature
         cfg["velocity"] = vel
+    # Resolution ratio: scales image size, kernel N, search M and Eq.12 pooling.
+    cfg = apply_resolution_ratio(cfg, args.resolution_ratio, verbose=True)
+    ratio = resolution_ratio_of(cfg)
+    frontend = frontend_settings(cfg)          # stored in the checkpoint for eval
     axis = cfg.get("velocity", {}).get("axis_combine", "bind")
     event = cfg.get("velocity", {}).get("event_combine", "bind")
     feature = cfg.get("velocity", {}).get("event_feature", "phi")
@@ -232,7 +241,7 @@ def main() -> None:
     if trainable:
         out_path = (Path(args.out) if args.out else
                     Path("checkpoints")
-                    / f"{head_type}_{feature}_{axis}_{event}_{label_mode}_{len(train_ds)}.pt")
+                    / f"{head_type}_{feature}_{axis}_{event}_{label_mode}_r{ratio}_{len(train_ds)}.pt")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         train_cfg = cfg.get("train", {})
         net = HDEMS({**cfg, "segmentation": {**seg_cfg, "head": head_type}}).to(device)
@@ -243,26 +252,49 @@ def main() -> None:
                                      lr=train_cfg.get("lr", 1e-4))
         use_dice = bool(train_cfg.get("use_dice", False))
         epochs = int(train_cfg.get("epochs", 30))
+        # Early stopping: past runs all picked epoch 1 of 30, so most epochs were
+        # wasted. Stop after `patience` validations without improvement.
+        patience = int(train_cfg.get("patience", 5))
+        val_every = max(1, int(train_cfg.get("val_every", 1)))
+        print(f"[train] epochs<={epochs}  validate every {val_every}  "
+              f"early-stop patience {patience or 'off'}")
 
         best_score, best_state, best_epoch = float("-inf"), None, 0
+        stale = 0                                  # validations since the last improvement
         for epoch in range(1, epochs + 1):
             loss = train_one_epoch(net, tr_loader, optimizer, device, "segmentation",
                                    use_dice=use_dice, num_classes=num_classes)
             if len(val_ds):
-                score = evaluate_segmentation(net, val_loader, device, num_classes)["miou"]
-                print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}  val_mIoU={score:.4f}")
+                if epoch % val_every and epoch != epochs:
+                    print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}")
+                    continue
+                m = evaluate_segmentation(net, val_loader, device, num_classes,
+                                          label_mode=label_mode)
+                # motion mode: select on foreground IoU (the headline metric)
+                score = m.get("fg_iou", m["miou"])
+                print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}  "
+                      f"val_{'fgIoU' if 'fg_iou' in m else 'mIoU'}={score:.4f}")
             else:                                   # no val split: lowest train loss wins
                 score = -loss
                 print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}")
             if score > best_score:
-                best_score, best_epoch = score, epoch
+                best_score, best_epoch, stale = score, epoch, 0
                 best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+            else:
+                stale += 1
+                if patience and stale >= patience:
+                    print(f"[train] early stop at epoch {epoch}: no improvement in "
+                          f"{patience} validations (best epoch {best_epoch})")
+                    break
+        if net.flow_cache is not None:
+            print(net.flow_cache.summary())
 
         torch.save({"model": best_state, "task": "segmentation", "head": head_type,
                     "epoch": best_epoch, "val_miou": best_score if len(val_ds) else None,
                     "num_samples": len(train_ds), "num_classes": num_classes,
                     "axis_combine": axis, "event_combine": event,
-                    "event_feature": feature, "label_mode": label_mode}, out_path)
+                    "event_feature": feature, "label_mode": label_mode,
+                    "resolution_ratio": ratio, "frontend": frontend}, out_path)
         print(f"[train] saved {out_path}  best epoch={best_epoch}  score={best_score:.4f}")
         return
 
@@ -295,7 +327,7 @@ def main() -> None:
         out_path = Path(args.out)
     else:
         out_path = (Path("checkpoints")
-                    / f"{head_type}_{feature}_{axis}_{event}_{label_mode}_{len(train_ds)}.pt")
+                    / f"{head_type}_{feature}_{axis}_{event}_{label_mode}_r{ratio}_{len(train_ds)}.pt")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # ---- prototype head: class-mean centroids, no alpha sweep -----------------
@@ -309,7 +341,8 @@ def main() -> None:
                         extra={"val_miou": miou, "seed": args.seed,
                                "num_samples": len(train_ds),
                                "axis_combine": axis, "event_combine": event,
-                               "event_feature": feature, "label_mode": label_mode})
+                               "event_feature": feature, "label_mode": label_mode,
+                               "resolution_ratio": ratio, "frontend": frontend})
         print(f"[proto] saved {out_path}  val_mIoU={miou:.4f}  "
               f"prototypes={tuple(protos.shape)}")
         return
@@ -361,10 +394,13 @@ def main() -> None:
         extra={"val_miou": best_miou, "seed": args.seed, "backend": backend,
                "num_samples": len(train_ds),
                "axis_combine": axis, "event_combine": event,
-               "event_feature": feature, "label_mode": label_mode},
+               "event_feature": feature, "label_mode": label_mode,
+               "resolution_ratio": ratio, "frontend": frontend},
     )
     print(f"[ridge] saved {out_path}  alpha={best_alpha:g}  val_mIoU={best_miou:.4f}  "
           f"W shape={tuple(best_result.weight.shape)}  imbalance={imbalance}")
+    if model.flow_cache is not None:
+        print(model.flow_cache.summary())
 
 
 if __name__ == "__main__":
