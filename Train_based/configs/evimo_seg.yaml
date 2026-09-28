@@ -61,6 +61,18 @@ motion_label:            # label_mode: motion — thresholds in IMAGE PIXELS per
   min_moving_px: 100     # a frame "has a mover" only if that object is visible
   #                        in the mask with at least this many pixels
 
+grouping:                # ONE COLOUR PER MOVING OBJECT (eval + event-colour figures)
+  enabled: true          # the CNN's moving pixels are grouped by the motion model they fit
+  #                        (affine flow per object, sequential RANSAC + merge of neighbours),
+  #                        so a whole object gets one colour even if its flow direction varies.
+  #                        Distances below are FULL-resolution; resolution_ratio scales them.
+  tol_px: 0.7            # a pixel belongs to a motion model within this flow error (px/interval)
+  min_object_px: 160     # smaller groups are not objects
+  max_objects: 8
+  merge_tol_px: 0.7      # neighbouring groups whose joint motion fits within this are one object
+  adjacency_px: 6        # groups this close count as neighbours
+  ransac_iters: 300
+
 train:
   task: segmentation
   batch_size: 1

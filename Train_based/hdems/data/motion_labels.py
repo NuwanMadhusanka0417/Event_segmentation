@@ -199,6 +199,69 @@ def _angular_speed(q_lo: np.ndarray, q_hi: np.ndarray, dt: float) -> float:
     return 2.0 * float(np.arccos(dot)) / dt
 
 
+def _world_pose(frame: dict[str, Any], oid: int) -> tuple[np.ndarray, np.ndarray]:
+    """Object pose in the WORLD frame: (rotation, translation)."""
+    Rc, _, tc = _pose(frame["cam"])
+    Ro, _, to = _pose(frame[str(oid)])
+    return Rc @ Ro, Rc @ to + tc
+
+
+def _has(frame: Any, *oids: int) -> bool:
+    return isinstance(frame, dict) and "cam" in frame and all(str(o) in frame for o in oids)
+
+
+def rigid_groups(
+    meta: dict[str, Any],
+    frame_index: int,
+    ids: list[int] | frozenset[int],
+    *,
+    span: int = 10,
+    tol_t: float = 0.01,
+    tol_r: float = 0.05,
+) -> dict[int, int]:
+    """Which moving objects move TOGETHER (one rigid unit)? -> {object id: group id}.
+
+    EVIMO2 gives every tracked part its own id, but motion segmentation can only --
+    and should only -- separate things that move INDEPENDENTLY (the definition used
+    by EMSGC and the cascaded-fitting paper). Two objects are one unit when their
+    relative pose stays constant: the pose of b expressed in a's frame changes by
+    less than tol_t metres / tol_r radians between frame k-span and k+span.
+    """
+    ids = sorted(int(i) for i in ids)
+    frames = meta.get("frames", [])
+    parent = {i: i for i in ids}
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for ai, a in enumerate(ids):
+        for b in ids[ai + 1:]:
+            # nearest frames on each side (within span) where both objects have poses
+            lo = next((k for k in range(max(0, frame_index - span), frame_index + 1)
+                       if _has(frames[k], a, b)), None)
+            hi = next((k for k in range(min(len(frames) - 1, frame_index + span), frame_index - 1, -1)
+                       if _has(frames[k], a, b)), None)
+            if lo is None or hi is None or lo == hi:
+                continue                               # cannot tell -> keep separate
+            rel = []
+            for k in (lo, hi):
+                Ra, ta = _world_pose(frames[k], a)
+                Rb, tb = _world_pose(frames[k], b)
+                rel.append((Ra.T @ Rb, Ra.T @ (tb - ta)))
+            dR = rel[0][0].T @ rel[1][0]
+            angle = float(np.arccos(np.clip((np.trace(dR) - 1.0) / 2.0, -1.0, 1.0)))
+            shift = float(np.linalg.norm(rel[0][1] - rel[1][1]))
+            if shift < tol_t and angle < tol_r:
+                parent[find(b)] = find(a)
+
+    roots = sorted({find(i) for i in ids})
+    gid = {r: g for g, r in enumerate(roots, start=1)}
+    return {i: gid[find(i)] for i in ids}
+
+
 _CACHE: dict[tuple[str, MotionParams], SequenceMotion] = {}
 
 

@@ -295,6 +295,32 @@ combine mode) reads it back instead.
 and `train.val_every` validates every N epochs. The best epoch is selected on
 foreground IoU in motion mode.
 
+## One colour per moving object
+
+The CNN answers *"is this pixel moving?"*. `hdems/grouping.py` then answers
+*"which object?"*, the way EMSGC and cascaded multi-model fitting do: every
+independently moving object has one rigid motion, so its pixels share one
+parametric (affine) flow model — even when the flow **direction** varies across
+the object (rotation, scaling). Pixels are grouped by the model they fit:
+
+1. sequential RANSAC on the ego-compensated VSA flow of the CNN's moving pixels
+2. each pixel joins the model it fits best
+3. one model covering two separate regions → two objects
+4. neighbouring groups whose joint motion still fits one model are merged (so one
+   object does not split into several colours); small leftovers join a neighbour
+
+Settings: `grouping:` in the config (full-resolution units, scaled by
+`resolution_ratio`). It runs in `hdems.eval` only — training is unchanged.
+
+**Ground truth.** EVIMO2 gives every tracked part its own id, but motion
+segmentation can only separate things that move *independently*. Parts whose
+relative pose stays constant (from the poses) are merged into one object
+(`rigid_groups` → `gt_instances`), matching the papers' definition.
+
+**Reported:** object mIoU / precision / recall over frames that contain a moving
+object, the same grouping run on the ground-truth moving pixels (best case — the
+gap is the CNN's share), and how often a static frame gets a false object.
+
 ## Colouring the moving events
 
 ```bash
@@ -302,9 +328,10 @@ python -m hdems.eval --config configs/evimo_seg.yaml --head cnn \
   --checkpoint checkpoints/<run>.pt --color-events results/<run>/colour
 ```
 
-Writes, per frame: events | predicted moving (red) vs static (grey) | per-instance
-colours (connected components of the predicted moving mask) | ground-truth moving.
-Everything is drawn **only at event pixels** — the rest is untrained guesswork.
+Writes, per frame: events | CNN moving (red) vs static (grey) | **objects: CNN +
+motion grouping, one colour each** | the same grouping on the ground-truth moving
+pixels (best case) | ground-truth objects. Everything is drawn **only at event
+pixels** — the rest is untrained guesswork.
 
 ## Notes
 

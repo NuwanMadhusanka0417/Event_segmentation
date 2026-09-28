@@ -18,6 +18,9 @@ from hdems.losses.seg import seg_loss
 from hdems.metrics import mean_iou
 from hdems.data.labels import LABEL_MODES, num_classes_for, resolve_label_mode
 from hdems.data.motion_labels import IGNORE_LABEL
+from hdems.grouping import GroupingParams, group_objects
+from hdems.grouping import params_from_config as grouping_params
+from hdems.models.motion import ego_residual
 from hdems.visualize import save_event_colour_figure
 from hdems.detection import detection_metrics, masks_to_boxes
 from hdems.instances import binary_iou, connected_components, instance_metrics
@@ -114,7 +117,10 @@ def evaluate_segmentation(
     detect: bool = False,
     color_dir: Path | None = None,
     events_only_baseline: bool = False,
+    grouping: GroupingParams | None = None,
 ) -> dict[str, float]:
+    """``grouping``: split the CNN's moving pixels into OBJECTS by motion model
+    (hdems.grouping) -- one colour per object -- instead of connected components."""
     model.eval()
     ious: list[float] = []
     total_loss = 0.0
@@ -122,6 +128,7 @@ def evaluate_segmentation(
     saved = 0
     fg_ious: list[float] = []          # motion mode: foreground IoU (the headline)
     inst_scores: list[dict] = []       # motion mode: instance matching
+    oracle_scores: list[dict] = []     # grouping on the GT moving pixels (best case)
     det_scores: list[dict] = []        # object detection: box matching
 
     if save_dir is not None:
@@ -134,31 +141,49 @@ def evaluate_segmentation(
         mask = batch["mask"].to(device).long()
         # Score on EVENT pixels only (pixels without events carry no evidence),
         # and never on the ignore label (ambiguous speed / mask boundary band).
-        valid = event_pixel_mask(surface) & (mask >= 0) & (mask != IGNORE_LABEL)
+        events_t = event_pixel_mask(surface)
+        valid = events_t & (mask >= 0) & (mask != IGNORE_LABEL)
+        flow = None
         if events_only_baseline:
             # Control: call EVERY event pixel "moving". It never looks at the model,
             # so the front end is skipped entirely (no loss is reported).
-            pred = event_pixel_mask(surface).long()
+            pred = events_t.long()
         else:
-            logits = model(surface, task="segmentation")["seg_logits"]
+            out_m = model(surface, task="segmentation")
+            logits, flow = out_m["seg_logits"], out_m.get("flow")
             if valid.any():
                 total_loss += seg_loss(logits, mask.masked_fill(~valid, IGNORE_LABEL)).item()
             pred = logits.argmax(dim=1)
         ious.append(mean_iou(pred[0], mask[0], num_classes, valid=valid[0]))
 
+        objects = objects_gt_mask = gt_inst = None
         if label_mode in ("motion", "tracked"):
             # Option A: foreground IoU + class-agnostic instance matching.
             v = valid[0].cpu().numpy()
+            ev = events_t[0].cpu().numpy()
             pred_fg = (pred[0] > 0).cpu().numpy()
             gt_fg = (mask[0] > 0).cpu().numpy()
             fg_ious.append(binary_iou(pred_fg, gt_fg, valid=v))
-            # gt_moving holds the raw ids of MOVING objects only; falling back to
-            # gt_raw would count the static table as an object to be detected.
-            gt_ids = batch.get("gt_moving", batch.get("gt_raw"))
-            if gt_ids is not None:
-                gt_inst = (gt_ids[0].cpu().numpy().astype(np.int64)) // 1000
+            # Ground-truth OBJECTS: independently moving objects, with parts that move
+            # rigidly together merged (gt_instances). Older data: raw moving ids.
+            gt_src = batch.get("gt_instances")
+            if gt_src is not None:
+                gt_inst = gt_src[0].cpu().numpy().astype(np.int64)
+            elif batch.get("gt_moving", batch.get("gt_raw")) is not None:
+                gt_inst = batch.get("gt_moving", batch.get("gt_raw"))[0].cpu().numpy().astype(np.int64) // 1000
+            if grouping is not None and flow is not None:
+                # objects = the CNN's moving pixels grouped by motion model
+                res, _ = ego_residual(flow, iters=model.ego_iters, valid=events_t)
+                res = res[0].cpu().numpy()
+                objects = group_objects(res, pred_fg & ev, grouping)
+                if gt_inst is not None and ((gt_inst > 0) & ev).any():
+                    objects_gt_mask = group_objects(res, (gt_inst > 0) & ev, grouping)
+                    oracle_scores.append(instance_metrics(objects_gt_mask, gt_inst, valid=v))
+                pred_inst = objects
+            else:
                 pred_inst = connected_components(np.logical_and(pred_fg, v),
                                                  min_size=min_instance)
+            if gt_inst is not None:
                 inst_scores.append(instance_metrics(pred_inst, gt_inst, valid=v))
                 if detect:                       # boxes = extent of each instance
                     det_scores.append(detection_metrics(
@@ -175,9 +200,10 @@ def evaluate_segmentation(
             )
             if color_dir is not None:
                 save_event_colour_figure(
-                    surface[0], pred[0], event_pixel_mask(surface)[0],
+                    surface[0], pred[0], events_t[0],
                     color_dir / f"events_{n:05d}.png",
                     gt_moving=(batch["gt_moving"][0] if "gt_moving" in batch else None),
+                    objects=objects, objects_gt_mask=objects_gt_mask, gt_objects=gt_inst,
                     min_instance=min_instance,
                 )
             saved += 1
@@ -196,12 +222,23 @@ def evaluate_segmentation(
         fin = [v for v in fg_ious if v == v]                      # drop NaN frames
         out["fg_iou"] = sum(fin) / max(len(fin), 1)
         if inst_scores:
-            im = [s["instance_miou"] for s in inst_scores if s["instance_miou"] == s["instance_miou"]]
-            out["instance_miou"] = sum(im) / max(len(im), 1)
-            out["precision"] = sum(s["precision"] for s in inst_scores) / len(inst_scores)
-            out["recall"] = sum(s["recall"] for s in inst_scores) / len(inst_scores)
-            out["mean_pred_instances"] = sum(s["n_pred"] for s in inst_scores) / len(inst_scores)
-            out["mean_gt_instances"] = sum(s["n_gt"] for s in inst_scores) / len(inst_scores)
+            # Averaged over frames that CONTAIN a moving object: frames without one
+            # give NaN precision/recall, and a plain mean turned the whole result NaN.
+            with_gt = [s for s in inst_scores if s["n_gt"] > 0]
+            out["instance_miou"] = float(np.nanmean([s["instance_miou"] for s in with_gt])) if with_gt else float("nan")
+            out["precision"] = float(np.nanmean([s["precision"] for s in with_gt])) if with_gt else float("nan")
+            out["recall"] = float(np.nanmean([s["recall"] for s in with_gt])) if with_gt else float("nan")
+            out["mean_pred_instances"] = float(np.mean([s["n_pred"] for s in with_gt])) if with_gt else 0.0
+            out["mean_gt_instances"] = float(np.mean([s["n_gt"] for s in with_gt])) if with_gt else 0.0
+            out["frames_with_objects"] = len(with_gt)
+            # static frames: how often the model invents an object where nothing moves
+            static = [s for s in inst_scores if s["n_gt"] == 0]
+            out["static_frames"] = len(static)
+            out["static_false_object_rate"] = (float(np.mean([s["n_pred"] > 0 for s in static]))
+                                               if static else float("nan"))
+        if oracle_scores:
+            out["oracle_instance_miou"] = float(np.nanmean([s["instance_miou"] for s in oracle_scores]))
+            out["oracle_mean_pred_instances"] = float(np.mean([s["n_pred"] for s in oracle_scores]))
     if det_scores:
         k = len(det_scores)
         out["det_precision"] = sum(s["det_precision"] for s in det_scores) / k
@@ -452,6 +489,10 @@ def main() -> None:
             label_mode=label_mode, detect=args.detect,
             color_dir=Path(args.color_events) if args.color_events else None,
             events_only_baseline=args.events_only_baseline,
+            # one colour per object: group moving pixels by motion model
+            grouping=(grouping_params(cfg)
+                      if (cfg.get("grouping", {}) or {}).get("enabled", True)
+                      and not args.events_only_baseline else None),
         )
         if model.flow_cache is not None:
             print(model.flow_cache.summary())
@@ -470,11 +511,21 @@ def main() -> None:
         print(f"mIoU:     {metrics['miou']:.4f}   (secondary — see FG IoU)")
         if label_mode in ("motion", "tracked"):
             if "instance_miou" in metrics:
-                print(f"Instance mIoU (matched):      {metrics['instance_miou']:.4f}")
-                print(f"Instance P / R @0.5:          "
+                src = "motion grouping" if not args.events_only_baseline else "connected pieces"
+                print(f"--- OBJECTS ({src}), over {metrics.get('frames_with_objects', 0)} frames "
+                      f"that contain a moving object ---")
+                print(f"Object mIoU (matched):        {metrics['instance_miou']:.4f}")
+                print(f"Object P / R @0.5:            "
                       f"{metrics['precision']:.3f} / {metrics['recall']:.3f}")
-                print(f"Instances pred / gt (avg):    "
+                print(f"Objects pred / gt (avg):      "
                       f"{metrics['mean_pred_instances']:.2f} / {metrics['mean_gt_instances']:.2f}")
+                if "oracle_instance_miou" in metrics:
+                    print(f"Object mIoU, grouping on GT moving px [best case]: "
+                          f"{metrics['oracle_instance_miou']:.4f}  "
+                          f"(objects/frame {metrics['oracle_mean_pred_instances']:.2f})")
+                if metrics.get("static_frames"):
+                    print(f"Static frames with a false object: "
+                          f"{metrics['static_false_object_rate']:.1%} of {metrics['static_frames']}")
         if "det_precision" in metrics:
             print("--- object detection (boxes from instances) ---")
             print(f"Box P / R @0.5:  {metrics['det_precision']:.3f} / {metrics['det_recall']:.3f}")

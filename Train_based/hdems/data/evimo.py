@@ -16,7 +16,7 @@ from hdems.data.evimo2_reader import (
     load_meta,
 )
 from hdems.data.labels import to_labels
-from hdems.data.motion_labels import MotionParams, frame_motion
+from hdems.data.motion_labels import MotionParams, frame_motion, rigid_groups
 
 
 class EVIMODataset(Dataset):
@@ -103,6 +103,8 @@ class EVIMODataset(Dataset):
         meta = load_meta(seq_dir)
         frame = meta["frames"][frame_idx]
         moving, ambiguous = frame_motion(seq_dir, frame_idx, self.motion_params, meta)
+        # moving objects that move TOGETHER are one object (independent motion)
+        rigid = rigid_groups(meta, frame_idx, moving) if moving else {}
         return self._apply_labels(
             load_frame_sample(
                 seq_dir,
@@ -115,6 +117,7 @@ class EVIMODataset(Dataset):
             ),
             moving=moving,
             ambiguous=ambiguous,
+            rigid=rigid,
         )
 
     def _apply_labels(
@@ -123,6 +126,7 @@ class EVIMODataset(Dataset):
         *,
         moving: Iterable[int] | None,
         ambiguous: Iterable[int] | None,
+        rigid: dict[int, int] | None = None,
     ) -> dict[str, Any]:
         """Raw mask -> labels for the chosen label_mode; keep raw ids as gt_raw.
 
@@ -161,4 +165,13 @@ class EVIMODataset(Dataset):
             ids = torch.tensor(sorted(int(i) for i in moving), dtype=raw.dtype)
             keep = torch.isin(raw // 1000, ids) if ids.numel() else torch.zeros_like(raw, dtype=torch.bool)
             out["gt_moving"] = raw.masked_fill(~keep, 0)
+            # Independently moving OBJECTS: parts that move rigidly together share
+            # one instance id (1..G). This is what object colouring is scored against.
+            inst = torch.zeros_like(raw)
+            obj = raw // 1000
+            for oid, gid in (rigid or {}).items():
+                inst[obj == int(oid)] = int(gid)
+            if not rigid:                       # e.g. cached shards: fall back to raw ids
+                inst = out["gt_moving"] // 1000
+            out["gt_instances"] = inst
         return out
