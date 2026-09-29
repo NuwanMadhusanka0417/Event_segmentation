@@ -73,6 +73,18 @@ def test_touching_parts_with_same_motion_are_one_object():
     assert _one_label(lbl, a | b, mask)
 
 
+def test_group_without_motion_relative_to_camera_is_not_an_object():
+    # the flow is ego-compensated: a region with ~zero residual is background the
+    # CNN marked by mistake -- it must not become a (false) object
+    a, b = _box(20, 60, 20, 60), _box(20, 60, 90, 130)
+    flow, mask = _flow_for([(a, lambda y, x: (np.full_like(x, 2.0), np.zeros_like(x))),
+                            (b, lambda y, x: (np.zeros_like(x), np.zeros_like(x)))])
+    gated = GroupingParams(tol=0.35, min_support=40, adjacency_px=3, merge_tol=0.35, min_motion=0.5)
+    lbl = group_objects(flow, mask, gated)
+    assert _one_label(lbl, a, mask)                  # the moving object is kept
+    assert lbl[b & mask].max() == 0                  # the static region is dropped
+
+
 def test_nothing_moving_gives_no_objects():
     flow = np.zeros((2, H, W))
     assert group_objects(flow, np.zeros((H, W), bool), P).max() == 0

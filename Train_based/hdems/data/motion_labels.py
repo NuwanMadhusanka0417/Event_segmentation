@@ -50,6 +50,7 @@ class MotionParams:
     window_s: float = 0.05      # the time surface window the labels must agree with
     rot_radius_m: float = 0.05  # nominal object radius for the rotation term
     min_depth_m: float = 0.05   # guard against degenerate Z
+    speed_span: int = 5         # frames each side for the speed fit (noise-robust)
 
 
 @dataclass
@@ -146,16 +147,24 @@ def compute_sequence_motion(meta: dict[str, Any], params: MotionParams) -> Seque
             continue
         mov, amb, speeds = set(), set(), {}
         for i in ids:
-            lo, hi = _neighbours(ts, world_pos[i], k)
-            if lo is None or hi is None:
+            # Speed = least-squares slope of the world position over +-speed_span frames.
+            # A plain difference of the two neighbouring frames (33 ms apart) turned
+            # ~0.1 mm of motion-capture jitter into 0.2-0.6 px of "motion": the static
+            # table was routinely labelled "moving slowly". Over +-5 frames (167 ms)
+            # the table measures 0.08 px (95th pct 0.18) while real motion is unchanged.
+            js = [j for j in range(max(0, k - params.speed_span), min(n, k + params.speed_span + 1))
+                  if not np.isnan(ts[j]) and not np.isnan(world_pos[i][j]).any()]
+            if np.isnan(world_pos[i][k]).any() or len(js) < 2:
                 amb.add(int(i))                     # object present but unmeasurable
                 continue
-            dt = ts[hi] - ts[lo]
-            if dt <= 0:
+            tj = ts[js]
+            if tj[-1] - tj[0] <= 0:
                 amb.add(int(i))
                 continue
-            v_trans = float(np.linalg.norm(world_pos[i][hi] - world_pos[i][lo]) / dt)
-            omega = _angular_speed(world_quat[i][lo], world_quat[i][hi], dt)
+            A = np.stack([tj - tj.mean(), np.ones_like(tj)], axis=1)
+            slope = np.linalg.lstsq(A, world_pos[i][js], rcond=None)[0][0]
+            v_trans = float(np.linalg.norm(slope))
+            omega = _angular_speed(world_quat[i][js[0]], world_quat[i][js[-1]], tj[-1] - tj[0])
             z = depth[i][k]
             if np.isnan(z):
                 z = np.nanmedian(depth[i])
@@ -171,24 +180,6 @@ def compute_sequence_motion(meta: dict[str, Any], params: MotionParams) -> Seque
         speed_px[k] = speeds
 
     return SequenceMotion(moving=moving, ambiguous=ambiguous, speed_px=speed_px)
-
-
-def _neighbours(ts: np.ndarray, pos: np.ndarray, k: int) -> tuple[int | None, int | None]:
-    """Nearest frames before/after k with a pose (central difference, one-sided at ends)."""
-    if np.isnan(pos[k]).any():
-        return None, None
-    lo = hi = None
-    for j in range(k - 1, -1, -1):
-        if not np.isnan(pos[j]).any() and not np.isnan(ts[j]):
-            lo = j
-            break
-    for j in range(k + 1, len(ts)):
-        if not np.isnan(pos[j]).any() and not np.isnan(ts[j]):
-            hi = j
-            break
-    if lo is None and hi is None:
-        return None, None
-    return (lo if lo is not None else k), (hi if hi is not None else k)
 
 
 def _angular_speed(q_lo: np.ndarray, q_hi: np.ndarray, dt: float) -> float:
@@ -296,4 +287,5 @@ def params_from_config(cfg: dict[str, Any]) -> MotionParams:
         static_px=float(ml.get("static_px", 0.3)),
         window_s=float(ds.get("window_ms", 50.0)) / 1000.0,
         rot_radius_m=float(ml.get("rot_radius_m", 0.05)),
+        speed_span=int(ml.get("speed_span_frames", 5)),
     )

@@ -13,6 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
@@ -46,9 +47,18 @@ from hdems.vsa.velocity import EVENT_COMBINES
 
 
 def _cap_dataset(ds, max_samples: int | None):
+    """Keep ``max_samples`` frames EVENLY SPREAD over the dataset, not the first N.
+
+    The index cycles through the sequences, so the first N frames are the opening
+    ~0.1-0.3 s of every recording -- usually before any object starts moving.
+    Measured on the eval split: the first 150 frames contain a moving object in
+    15% of cases, 150 spread frames in 51%. Validating on the first N therefore
+    chose the best epoch on static frames, which rewards predicting nothing.
+    """
     if max_samples is None or max_samples <= 0 or max_samples >= len(ds):
         return ds
-    return Subset(ds, list(range(max_samples)))
+    idx = np.linspace(0, len(ds) - 1, num=max_samples).round().astype(int)
+    return Subset(ds, sorted(set(idx.tolist())))
 
 
 @torch.no_grad()

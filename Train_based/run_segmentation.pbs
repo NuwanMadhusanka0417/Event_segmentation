@@ -30,6 +30,10 @@ RES_RATIO=1            # 1 = full 480x640 | 2 = half 240x320 | 4 = quarter 120x1
 SAMPLES=300            # max train frames   (2,495 usable after the motion-label fix)
 VAL_SAMPLES=150        # val frames used to pick the best epoch / alpha
 TEST_SAMPLES=50        # max eval panels saved
+PANELS=movers          # which eval frames get figures (scores always use ALL frames):
+                       #   movers = only frames with a visible moving object (see object colours)
+                       #   spread = evenly over the whole eval set (moving + static frames)
+                       #   first  = first N frames (old; mostly the static start of each recording)
 
 CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
 CONFIG=configs/evimo_seg.yaml
@@ -76,6 +80,7 @@ printf '  %-16s %s\n' \
   SAMPLES      "${SAMPLES}  (train frames)" \
   VAL_SAMPLES  "${VAL_SAMPLES}  (val frames)" \
   TEST_SAMPLES "${TEST_SAMPLES}  (eval panels)" \
+  PANELS       "${PANELS}  (which frames get figures)" \
   CONFIG       "${CONFIG}"
 echo
 echo "--- PBS resources ---------------------------------------------"
@@ -139,7 +144,7 @@ python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
   --checkpoint "${CKPT}" ${DETECT_FLAG} \
   --device cuda --save-images "${RESULTS_DIR}/eval_images" \
   --color-events "${RESULTS_DIR}/event_colours" \
-  --max-images "${TEST_SAMPLES}"
+  --panels "${PANELS}" --max-images "${TEST_SAMPLES}"
 
 # CONTROL: predict "moving" at every event pixel. With motion labels this must
 # score far below the model — if it does not, the labels are not motion.

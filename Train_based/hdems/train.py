@@ -135,7 +135,9 @@ def main() -> None:
         n_full = len(dataset)
         max_n = args.max_samples or train_cfg.get("max_samples")
         if max_n is not None and 0 < max_n < n_full:
-            dataset = Subset(dataset, list(range(max_n)))
+            # evenly spread, not the first N: those are the static opening of each recording
+            step = [round(i * (n_full - 1) / max(max_n - 1, 1)) for i in range(max_n)]
+            dataset = Subset(dataset, sorted(set(step)))
         print(f"Training samples: {len(dataset)}" + (f" (of {n_full})" if len(dataset) != n_full else ""))
         loader = DataLoader(
             dataset,

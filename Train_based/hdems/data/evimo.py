@@ -65,6 +65,7 @@ class EVIMODataset(Dataset):
         self.label_mode = str(label_mode).lower()
         self.motion_params = motion_params or MotionParams(window_s=self.window_s)
         self.boundary_ignore_px = int(boundary_ignore_px)
+        self.min_moving_px = int(min_moving_px)
 
         self.cached: list[Path] = find_cached_samples(self.root, split)
         self.index: list[tuple[Path, int]] = (
@@ -174,4 +175,10 @@ class EVIMODataset(Dataset):
             if not rigid:                       # e.g. cached shards: fall back to raw ids
                 inst = out["gt_moving"] // 1000
             out["gt_instances"] = inst
+            # Objects moving too slowly to call (between static_px and move_px): their
+            # pixels are IGNORED in training and scoring, but the figures should still
+            # show them -- otherwise a slowly moving object looks like "nothing".
+            slow_ids = torch.tensor(sorted(int(i) for i in (ambiguous or ())), dtype=raw.dtype)
+            slow = torch.isin(obj, slow_ids) if slow_ids.numel() else torch.zeros_like(raw, dtype=torch.bool)
+            out["gt_slow"] = obj.masked_fill(~slow, 0)
         return out

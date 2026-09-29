@@ -80,17 +80,25 @@ def _save_seg_panel(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    surf = surface.detach().cpu().numpy()
-    ev = surf.reshape(-1, surf.shape[-2], surf.shape[-1]).sum(0)  # handles (2,H,W) and (T,2,H,W)
+    from hdems.visualize import event_image
+
     gt = mask.detach().cpu().numpy()
     pr = pred.detach().cpu().numpy()
+    ignore = gt == IGNORE_LABEL
 
     fig, ax = plt.subplots(1, 3, figsize=(12, 4))
-    ax[0].imshow(ev, cmap="gray")
+    ax[0].imshow(event_image(surface), cmap="gray")        # contrast-stretched
     ax[0].set_title("events")
-    ax[1].imshow(gt, cmap="tab20", vmin=0, vmax=num_classes - 1)
-    ax[1].set_title("ground truth")
-    ax[2].imshow(pr, cmap="tab20", vmin=0, vmax=num_classes - 1)
+    # 'nearest': smooth resampling blends the qualitative class colours into
+    # rainbow speckle. Ignore (255) is drawn in its own colour -- it used to be
+    # clipped to the same colour as "moving".
+    ax[1].imshow(np.where(ignore, 0, gt), cmap="tab20", vmin=0, vmax=num_classes - 1,
+                 interpolation="nearest")
+    if ignore.any():
+        ax[1].imshow(np.ma.masked_where(~ignore, np.ones_like(gt, dtype=float)),
+                     cmap="autumn_r", vmin=0, vmax=1, alpha=0.9, interpolation="nearest")
+    ax[1].set_title("ground truth (yellow = ignored)")
+    ax[2].imshow(pr, cmap="tab20", vmin=0, vmax=num_classes - 1, interpolation="nearest")
     ax[2].set_title(title)
     for a in ax:
         a.axis("off")
@@ -99,6 +107,43 @@ def _save_seg_panel(
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
+
+
+def choose_panels(dataset, mode: str, k: int) -> set[int]:
+    """Which eval frames to draw figures for (the metrics always use every frame).
+
+    first  : the first k frames -- the old behaviour. The index cycles through the
+             eval sequences, so these are the first ~0.1-0.3 s of every recording,
+             usually BEFORE any object starts moving: almost all static frames.
+    spread : k frames evenly spaced over the whole eval set (default).
+    movers : k frames, evenly spaced, among frames where a moving object is
+             actually visible -- best for inspecting object colouring.
+    """
+    n = len(dataset)
+    if k <= 0 or n == 0:
+        return set()
+    if mode == "first":
+        return set(range(min(k, n)))
+    candidates = list(range(n))
+    base = dataset.dataset if isinstance(dataset, Subset) else dataset
+    if mode == "movers" and getattr(base, "index", None):
+        from hdems.data.evimo2_reader import _visible_moving_frames, load_meta
+        by_seq: dict = {}
+        for i in range(n):                       # Subset(range(N)) keeps the prefix order
+            seq, fi = base.index[i]
+            by_seq.setdefault(seq, []).append((i, fi))
+        movers = []
+        for seq, items in by_seq.items():
+            visible = _visible_moving_frames(seq, load_meta(seq), [fi for _, fi in items],
+                                             base.motion_params, getattr(base, "min_moving_px", 100))
+            movers += [i for i, fi in items if fi in visible]
+        if movers:
+            candidates = sorted(movers)
+            print(f"[eval] panels: {min(k, len(movers))} of {len(movers)} frames with a visible mover")
+        else:
+            print("[eval] panels: no frame has a visible mover -- spreading over all frames")
+    pick = np.linspace(0, len(candidates) - 1, num=min(k, len(candidates))).round().astype(int)
+    return {candidates[j] for j in pick}
 
 
 @torch.no_grad()
@@ -118,6 +163,7 @@ def evaluate_segmentation(
     color_dir: Path | None = None,
     events_only_baseline: bool = False,
     grouping: GroupingParams | None = None,
+    panel_indices: set[int] | None = None,
 ) -> dict[str, float]:
     """``grouping``: split the CNN's moving pixels into OBJECTS by motion model
     (hdems.grouping) -- one colour per object -- instead of connected components."""
@@ -190,20 +236,23 @@ def evaluate_segmentation(
                         masks_to_boxes(pred_inst, min_area=min_instance),
                         masks_to_boxes(gt_inst, min_area=min_instance)))
 
-        if save_dir is not None and saved < max_images:
-            # show the prediction where it is scored; elsewhere = background
-            pred_vis = pred.masked_fill(~valid, 0)
-            _save_seg_panel(
-                surface[0], mask[0], pred_vis[0],
-                save_dir / f"eval_{n:05d}.png", num_classes,
-                title=panel_title, box_lines=box_lines,
-            )
+        draw = (n in panel_indices) if panel_indices is not None else saved < max_images
+        if (save_dir is not None or color_dir is not None) and draw:
+            if save_dir is not None:
+                # show the prediction where it is scored; elsewhere = background
+                pred_vis = pred.masked_fill(~valid, 0)
+                _save_seg_panel(
+                    surface[0], mask[0], pred_vis[0],
+                    save_dir / f"eval_{n:05d}.png", num_classes,
+                    title=panel_title, box_lines=box_lines,
+                )
             if color_dir is not None:
                 save_event_colour_figure(
                     surface[0], pred[0], events_t[0],
                     color_dir / f"events_{n:05d}.png",
                     gt_moving=(batch["gt_moving"][0] if "gt_moving" in batch else None),
                     objects=objects, objects_gt_mask=objects_gt_mask, gt_objects=gt_inst,
+                    gt_slow=(batch["gt_slow"][0] if "gt_slow" in batch else None),
                     min_instance=min_instance,
                 )
             saved += 1
@@ -320,6 +369,14 @@ def main() -> None:
     parser.add_argument("--resolution-ratio", type=int, default=None,
                         help="Override the resolution ratio (default: the checkpoint's). "
                              "A head trained at one ratio will not load at another.")
+    parser.add_argument("--panels", choices=["spread", "movers", "first"], default="spread",
+                        help="Which frames get figures (metrics always use all frames): "
+                             "spread = evenly over the eval set (default); movers = only frames "
+                             "with a visible moving object; first = the first N (old behaviour: "
+                             "mostly the static start of each recording).")
+    parser.add_argument("--skip-latency", action="store_true",
+                        help="Skip the latency measurement (35 uncached forward passes) "
+                             "-- for quick checks, especially on CPU.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -493,11 +550,13 @@ def main() -> None:
             grouping=(grouping_params(cfg)
                       if (cfg.get("grouping", {}) or {}).get("enabled", True)
                       and not args.events_only_baseline else None),
+            panel_indices=(choose_panels(dataset, args.panels, args.max_images)
+                           if (save_dir is not None or args.color_events) else None),
         )
         if model.flow_cache is not None:
             print(model.flow_cache.summary())
         # The control never runs the model, so its latency would be meaningless.
-        ms = float("nan") if args.events_only_baseline else measure_seg_latency(
+        ms = float("nan") if (args.events_only_baseline or args.skip_latency) else measure_seg_latency(
             model, dataset[0]["surface"].unsqueeze(0), device)
         title = "EVENTS-ONLY BASELINE (control)" if args.events_only_baseline else f"Head: {head}"
         print(f"{title}  label_mode: {label_mode}  event_feature: {model.event_feature}  "

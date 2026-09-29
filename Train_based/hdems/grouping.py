@@ -38,6 +38,8 @@ class GroupingParams:
     score_sample: int = 4000    # pixels used to score a hypothesis (speed)
     merge_tol: float = 0.35     # merge neighbours whose joint affine fit is this good
     adjacency_px: int = 3       # how close two groups must be to count as neighbours
+    min_motion: float = 0.0     # a group moving slower than this relative to the camera is
+    #                             not an independently moving object (stray CNN pixels)
     seed: int = 0
 
 
@@ -52,6 +54,7 @@ def params_from_config(cfg: dict[str, Any]) -> GroupingParams:
         iters=int(g.get("ransac_iters", 300)),
         merge_tol=float(g.get("merge_tol_px", 0.7)) / r,
         adjacency_px=max(1, int(g.get("adjacency_px", 6)) // r),
+        min_motion=float(g.get("min_motion_px", 0.25)) / r,
     )
 
 
@@ -152,6 +155,15 @@ def group_objects(flow: np.ndarray, mask: np.ndarray, p: GroupingParams) -> np.n
 
     # 4. merge neighbours that one motion explains jointly; absorb small groups
     groups = _merge(groups, flow, p)
+
+    # 5. an object must move relative to the camera: the flow here is already
+    #    ego-compensated, so a group with ~zero residual motion is background that
+    #    the CNN marked by mistake, not an independently moving object
+    if p.min_motion > 0:
+        speed = np.hypot(flow[0], flow[1])
+        for i in [int(i) for i in np.unique(groups) if i > 0]:
+            if float(np.median(speed[groups == i])) < p.min_motion:
+                groups[groups == i] = 0
 
     # relabel 1..K by size (largest object first)
     ids, counts = np.unique(groups[groups > 0], return_counts=True)

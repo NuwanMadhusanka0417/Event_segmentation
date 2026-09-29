@@ -33,10 +33,20 @@ def _as_numpy(x) -> np.ndarray:
     return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
 
 
+_SLOW_YELLOW = np.array([0.85, 0.75, 0.25])
+
+
 def event_image(surface) -> np.ndarray:
-    """(T,2,H,W) or (2,H,W) time surface -> per-pixel event activity (H,W)."""
+    """(T,2,H,W) or (2,H,W) time surface -> per-pixel event activity, contrast-stretched.
+
+    With the paper's 35 ms decay most values are tiny, so a plain grey map was almost
+    black; clipping at the 99th percentile of active pixels makes the scene visible.
+    """
     s = _as_numpy(surface)
-    return s.reshape(-1, s.shape[-2], s.shape[-1]).sum(0)
+    img = s.reshape(-1, s.shape[-2], s.shape[-1]).sum(0)
+    active = img[img > 0]
+    top = float(np.percentile(active, 99)) if active.size else 1.0
+    return np.clip(img / max(top, 1e-9), 0.0, 1.0)
 
 
 def colour_binary(moving: np.ndarray, events: np.ndarray) -> np.ndarray:
@@ -70,6 +80,7 @@ def save_event_colour_figure(
     objects=None,
     objects_gt_mask=None,
     gt_objects=None,
+    gt_slow=None,
     min_instance: int = 50,
 ) -> np.ndarray:
     """Write the events / moving / objects / ground-truth figure; returns the object map.
@@ -103,7 +114,16 @@ def save_event_colour_figure(
                        f"grouping on GT moving px ({_count(og)}) [best case]", {}))
     if gt_objects is not None:
         gt = _as_numpy(gt_objects).astype(np.int64)
-        panels.append((colour_instances(gt, events), f"ground-truth objects ({_count(gt)})", {}))
+        rgb = colour_instances(gt, events)
+        title = f"ground-truth objects ({_count(gt)})"
+        if gt_slow is not None:
+            slow = (_as_numpy(gt_slow) > 0) & events & (gt == 0)
+            n_slow = _count(np.where(slow, _as_numpy(gt_slow), 0))
+            if n_slow:
+                # moving, but too slowly to call -> ignored in training and scoring
+                rgb[slow] = _SLOW_YELLOW
+                title += f" + {n_slow} too slow (yellow, ignored)"
+        panels.append((rgb, title, {}))
     elif gt_moving is not None:
         gt = _as_numpy(gt_moving).astype(np.int64) // 1000
         panels.append((colour_instances(gt, events), "ground-truth moving", {}))

@@ -58,6 +58,9 @@ motion_label:            # label_mode: motion — thresholds in IMAGE PIXELS per
   static_px: 0.3         # <= this -> static; in between -> ignore (255)
   boundary_ignore_px: 2  # ignore a band this wide around every mask boundary
   rot_radius_m: 0.05     # nominal object radius, so spin-in-place counts as motion
+  speed_span_frames: 5   # object speed = straight-line fit over +-5 GT frames (~167 ms).
+  #                        Differencing neighbouring frames (33 ms) turned motion-capture
+  #                        jitter into fake motion: the static table was often "moving".
   min_moving_px: 100     # a frame "has a mover" only if that object is visible
   #                        in the mask with at least this many pixels
 
@@ -71,6 +74,9 @@ grouping:                # ONE COLOUR PER MOVING OBJECT (eval + event-colour fig
   max_objects: 8
   merge_tol_px: 0.7      # neighbouring groups whose joint motion fits within this are one object
   adjacency_px: 6        # groups this close count as neighbours
+  min_motion_px: 0.25    # an object must move at least this much RELATIVE TO THE CAMERA
+  #                        (px per 12.5 ms interval = motion_label.move_px 1.0 per 50 ms
+  #                        window), else it is background the CNN marked by mistake
   ransac_iters: 300
 
 train:
