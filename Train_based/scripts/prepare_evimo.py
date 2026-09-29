@@ -1,14 +1,18 @@
 """Precompute EVIMO2 (surface, mask) samples into .pt shards for fast training.
 
-Run this ONCE. The training dataset auto-detects the shards
-(``EVIMODataset`` -> ``find_cached_samples``) and then every epoch just does
+Run this ONCE, then set ``dataset.use_shards: true``: every epoch then just does
 ``torch.load`` instead of decoding events and rebuilding time surfaces, so the
 per-epoch data cost is paid a single time here.
 
+Shards are OFF by default: they bypass the index filters (scene-disjoint split,
+held-out validation scenes, require_mover, rigid object groups), so a stray shard
+folder used to change silently what was trained and scored. Normally the flow cache
+(flow_cache.enabled) already removes the expensive part.
+
 Shards are written to ``<out>/<split>/<sequence>_<frameidx>.pt`` at the
-resolution / window from the config. If you later change height/width/window_ms
-or the time-surface decay, DELETE the shards and re-run (cached shards are
-resolution-baked and take priority over raw sequences).
+resolution / window from the config. If you later change height/width/window_ms,
+time_frames or the time-surface decay, DELETE the shards and re-run (cached shards
+are resolution-baked and take priority over raw sequences).
 
 Usage
 -----
@@ -72,23 +76,28 @@ def main() -> None:
                 out_height=height, out_width=width,
                 window_s=window_s, decay=decay,
                 time_fracs=time_fracs,
+                score_window_s=(float(ds["score_window_ms"]) / 1000.0
+                                if ds.get("score_window_ms") else None),
             )
             moving, ambiguous = frame_motion(seq_dir, fi, motion_params, meta_cache[seq_dir])
             out_path = out_dir / f"{seq_dir.name}_{fi:06d}.pt"
             # mask_raw MUST be stored: the shard holds raw object ids, and the label
             # mode (motion needs the per-frame moving set) is applied at load time.
-            torch.save({
+            shard = {
                 "surface": sample["surface"],
                 "mask": sample["mask"],
                 "mask_raw": True,
                 "moving_ids": sorted(int(i) for i in moving),
                 "ambiguous_ids": sorted(int(i) for i in ambiguous),
-            }, out_path)
+            }
+            if "score_mask" in sample:
+                shard["score_mask"] = sample["score_mask"]
+            torch.save(shard, out_path)
 
             if (k + 1) % 200 == 0 or (k + 1) == len(index):
                 print(f"  {k + 1}/{len(index)}")
 
-    print("done. Shards ready; training will load them automatically.")
+    print("done. Set dataset.use_shards: true to train from these shards.")
 
 
 if __name__ == "__main__":

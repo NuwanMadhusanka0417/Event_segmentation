@@ -28,6 +28,11 @@ matching:
   alpha: 0.85             # paper α — Eq.12 probability-volume threshold   (was 0.3)
   smooth: 71              # paper sc — Eq.12 cost-volume average pooling   (was 3)
   vel_scale: 1.0          # displacement->velocity scale (1.0 = pixel units)
+  phi_window: 7           # Φ's OWN neighbourhood (working px, NOT scaled by the ratio).
+  #                         It used to be M: 31x31 = 961 bundled terms in d=512, far past
+  #                         the bundle's capacity (keep <= 9) -> Φ was 370x larger than
+  #                         the velocity code and drowned it. 0 = old behaviour (= M).
+  phi_pad: zero           # Φ borders: zero = no wrap-around | wrap = torch.roll (old)
 
 dataset:
   name: evimo
@@ -41,7 +46,24 @@ dataset:
   #                        the same physical area; the cost volume gets ~ratio^4 cheaper.
   #                        Override per run with --resolution-ratio.
   window_ms: 50.0
-  time_frames: [0.0, 0.25, 0.5, 1.0]   # paper multi-time surfaces (F0,F1,F2,F4); [] = single-time
+  time_frames: [1.0, 0.75, 0.5, 0.0]   # paper multi-time surfaces (F0,F1,F2,F4); [] = single-time.
+  #                        F0 (the reference: flow, Φ/F and the ego fit all come from it)
+  #                        now ENDS AT THE LABEL TIME ts and matching runs backwards in time.
+  #                        Old [0.0, 0.25, 0.5, 1.0] put F0 at ts-100..ts-50 ms, so the
+  #                        features described where objects were ~70 ms before the label.
+  #                        The flow sign flips; speeds and grouping are unaffected.
+  #                        Measured on 48 eval frames with a mover (ratio 2): AUC(moving vs
+  #                        static) of the raw |flow| 0.683 -> 0.738; after ego compensation
+  #                        0.704 -> 0.700 (the ego fit, not the flow, is now the limit)
+  score_window_ms: 12.5  # train and score only on pixels with an event in the last 12.5 ms
+  #                        before ts (one flow interval). Older events are the trail a mover
+  #                        leaves behind, and the label at ts calls it "static". 0 = all
+  #                        events of the stack (old). Figures colour these events too.
+  val_split: holdout     # picks the best epoch / alpha: holdout = the val_scenes below,
+  #                        taken out of training | eval = the test set (old: optimistic)
+  val_scenes: [scene9]   # 2 train sequences, 433 frames, 112 with a visible mover (~5% of
+  #                        the training movers). scene12 = still camera, scene6 = 67 frames
+  use_shards: false      # .pt shards (prepare_evimo.py) bypass the split/mover filters
   label_mode: motion     # motion  = MOVING vs rest, from the pose metadata (Option A, 2 classes)
   #                        tracked = legacy mask>0 ("on a tracked surface" — includes the
   #                                  static table, so NOT motion; baseline/ablation only)
@@ -88,6 +110,7 @@ train:
   lr: 1.0e-4
   num_workers: 8
   use_dice: true          # add Dice to CE (background/foreground imbalance)
+  max_val_samples: 150    # hdems.train only (the PBS passes --max-val-samples)
   # max_samples: 100      # optional: train on first N frames (or CLI --max-samples)
 
 eval:
@@ -96,17 +119,33 @@ eval:
   # max_samples: 20       # optional: eval on first N frames (or CLI --max-samples)
 
 velocity:
-  vel_bw: 6.0            # FPE bandwidth for residual velocity (topological similarity)
+  vel_norm: fixed        # velocity code units: fixed = vel_unit_px per FPE unit, same in every
+  #                        frame | frame = rescaled by the frame's 95th percentile (old: on a
+  #                        still frame it stretched flow noise into "fast motion")
+  vel_unit_px: 0.5       # fixed units: SENSOR px per 12.5 ms interval per FPE unit (codes of
+  #                        velocities 0.5 px apart have cosine 0.61, 1 px apart 0.14)
+  vel_bw: 6.0            # vel_norm: frame only -- FPE bandwidth after the q95 rescaling
+  x_norm: rms            # event HV X scaled to unit RMS per frame before use (raw F is 5-11x,
+  #                        Φ was 100-370x the |.|=1 velocity code) | none (old)
+  ego_fit: stack         # ego-motion model fitted on the events of all 4 surfaces | reference
+  #                        (reference surface only). Measured on 48 eval frames with a mover:
+  #                        AUC(|residual|) stack 0.700, reference 0.696 -- no gain, so stack
   event_feature: phi     # event HV fused with velocity -> phi (7x7 bundled field) | f (descriptor F0)
   axis_combine: bind     # combine Vx,Vy -> bind | bundle
   event_combine: bind    # combine event HV X with velocity code Mv ->
   #                        bind (X o Mv) | bundle (X + Mv) | bindbundle ((X^ o Mv) + Mv) | concat
+  #                        (not used by head mfcnn: X and Mv go into separate branches)
 
 segmentation:
-  head: cnn             # cnn (HV-channels CNN, trained) | prototype | ridge | motion
-  #                      cnn/motion -> hdems.train ; ridge/prototype -> fit_ridge_head.py
+  head: mfcnn            # mfcnn (motion-first CNN, trained) | cnn (HV-channels CNN on the fused
+  #                        X/Mv feature) | prototype | ridge | motion
+  #                      all -> scripts/fit_ridge_head.py (run_segmentation.pbs)
   num_classes: 32        # used by label_mode=objects/remap; motion forces 2
   embedding_dim: 32
+  mf_motion_dim: 32      # mfcnn: channels read out of the velocity code Mv
+  mf_app_dim: 8          # mfcnn: appearance channels (1x1 projection of unit-RMS X); 0 = none
+  mf_app_dropout: 0.5    # mfcnn: while training, drop ALL appearance channels of a sample with
+  #                        this probability, so the head must also work from motion alone
   ctx_dim: 32            # motion head: compressed HV context channels
   flow_beta: 1.0         # motion head: soft-argmax temperature for Phi->velocity
   ego_iters: 3           # motion head: IRLS passes for global-motion fit
@@ -121,7 +160,7 @@ ridge:
   backend: streaming     # streaming | sklearn
   imbalance: balanced    # balanced | subsample_bg | none
   bg_subsample_ratio: 0.2
-  val_split: eval
+  # validation split: see dataset.val_split
   alphas: [1.0e-3, 1.0e-1, 1.0, 10.0, 100.0]
   # max_train_samples: 50   # optional smoke cap (first N frames)
   # max_val_samples: 10

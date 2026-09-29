@@ -31,10 +31,47 @@ from typing import Any
 # front end it was trained on, so checkpoints store these and eval restores them.
 _FRONTEND_KEYS = {
     "encoder": ("patch_size", "sigma_k", "kernel", "polarity_binding", "scales"),
-    "matching": ("M", "scales", "alpha", "smooth", "vel_scale"),
+    "matching": ("M", "scales", "alpha", "smooth", "vel_scale", "phi_window", "phi_pad"),
     "time_surface": ("tau_ms", "decay"),
     "dataset": ("height", "width", "window_ms", "time_frames", "resolution_ratio"),
+    "velocity": ("vel_norm", "vel_unit_px", "vel_bw", "x_norm", "ego_fit"),
 }
+
+# Front-end options added after checkpoints were already trained (2026-09-29). A
+# checkpoint that does not record one was trained with the OLD behaviour, so eval
+# rebuilds that behaviour instead of silently using the new YAML default.
+_LEGACY_FRONTEND = {
+    ("matching", "phi_window"): 0,       # 0 = Phi bundles the whole cost-volume window M
+    ("matching", "phi_pad"): "wrap",     # torch.roll: Phi wrapped around the image borders
+    ("velocity", "vel_norm"): "frame",   # velocity rescaled by the frame's 95th percentile
+    ("velocity", "x_norm"): "none",      # event HV X fed at its raw magnitude
+    ("velocity", "ego_fit"): "stack",    # ego model fitted on the events of all surfaces
+}
+
+# Current defaults of those options (used when the YAML leaves one out). Checkpoints
+# always record the value actually used, so a missing key never reads as "legacy".
+FRONTEND_DEFAULTS = {
+    ("matching", "phi_window"): 7,
+    ("matching", "phi_pad"): "zero",
+    ("velocity", "vel_norm"): "fixed",
+    ("velocity", "vel_unit_px"): 0.5,
+    ("velocity", "x_norm"): "rms",
+    ("velocity", "ego_fit"): "stack",    # "reference" measured slightly worse (0.696 vs 0.700)
+}
+
+
+def frontend_option(cfg: dict[str, Any], section: str, key: str) -> Any:
+    """``cfg[section][key]``, or its current default."""
+    return (cfg.get(section) or {}).get(key, FRONTEND_DEFAULTS[(section, key)])
+
+
+# Head sizes that decide the checkpoint's tensor shapes (stored, restored by eval).
+_HEAD_KEYS = ("embedding_dim", "ctx_dim", "mf_motion_dim", "mf_app_dim", "mf_app_dropout")
+
+
+def head_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    seg = cfg.get("segmentation", {}) or {}
+    return {k: seg[k] for k in _HEAD_KEYS if k in seg}
 
 
 def _odd_scaled(value: int, ratio: int, minimum: int) -> int:
@@ -98,6 +135,8 @@ def frontend_settings(cfg: dict[str, Any]) -> dict[str, Any]:
         for k in keys:                      # store full-resolution values, not scaled ones
             if k in full:
                 sec[k] = full[k]
+            if (section, k) in FRONTEND_DEFAULTS:
+                sec.setdefault(k, FRONTEND_DEFAULTS[(section, k)])
         out[section] = sec
     return out
 
@@ -115,6 +154,9 @@ def restore_frontend(cfg: dict[str, Any], saved: dict[str, Any] | None) -> dict[
     for section in _FRONTEND_KEYS:
         if saved.get(section):
             cfg[section] = {**cfg.get(section, {}), **saved[section]}
+    for (section, key), old in _LEGACY_FRONTEND.items():
+        if key not in (saved.get(section) or {}):
+            cfg[section] = {**cfg.get(section, {}), key: old}
     return cfg
 
 

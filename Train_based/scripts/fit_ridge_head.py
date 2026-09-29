@@ -2,9 +2,11 @@
 """Fit / train a segmentation head on the frozen HD-EMS front-end (EVIMO2).
 
 Single entry point for every head:
-  ridge, prototype -> closed-form fit (no backprop)
-  cnn, motion      -> backprop training; the best epoch by val mIoU is kept
-All heads save to checkpoints/[head]_[axis]_[event]_[N].pt (unless --out).
+  ridge, prototype   -> closed-form fit (no backprop)
+  cnn, mfcnn, motion -> backprop training; the best epoch by validation FG IoU is kept
+Validation uses dataset.val_split (holdout = held-out TRAIN scenes, dataset.val_scenes).
+All heads save to checkpoints/[head]_[feature]_[axis]_[event]_[label_mode]_r[R]_[N].pt
+(unless --out); for mfcnn the [event] part is "split" (X and Mv are not fused).
 """
 
 from __future__ import annotations
@@ -22,7 +24,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hdems.config import apply_resolution_ratio, frontend_settings, resolution_ratio_of
+from hdems.config import (
+    apply_resolution_ratio,
+    frontend_option,
+    frontend_settings,
+    head_settings,
+    resolution_ratio_of,
+)
+from hdems.data.build import val_split_of
 from hdems.data.labels import LABEL_MODES, num_classes_for, resolve_label_mode
 from hdems.eval import build_dataset, evaluate_segmentation, load_config
 from hdems.train import train_one_epoch
@@ -43,7 +52,10 @@ from hdems.ridge_fit import (
 from hdems.ridge_head import RidgeHead
 from hdems.feature_extract import extract_phi
 from hdems.models.prototype_head import PrototypeHead, fit_prototypes, save_prototypes
+from hdems.seg_features import score_pixel_mask
 from hdems.vsa.velocity import EVENT_COMBINES
+
+TRAINABLE_HEADS = ("cnn", "mfcnn", "motion")
 
 
 def _cap_dataset(ds, max_samples: int | None):
@@ -75,12 +87,14 @@ def collect_batches(
     batches: list[tuple[torch.Tensor, torch.Tensor]] = []
     for batch in loader:
         if paper:
+            surface = batch["surface"].to(device)
             x, y = extract_paper_flat_batch(
                 model,
-                batch["surface"].to(device),
+                surface,
                 batch["mask"].to(device),
                 feature_mean=feature_mean,
                 mean_center=mean_center,
+                score_mask=score_pixel_mask(batch, surface),
             )
         else:
             x, y = extract_flat_batch(
@@ -129,10 +143,12 @@ def main() -> None:
     ap.add_argument("--out", type=str, default=None,
                     help="Output .pt. Default: "
                          "checkpoints/[head]_[feature]_[axis]_[event]_[label_mode]_[N].pt")
-    ap.add_argument("--head", type=str, choices=["ridge", "prototype", "cnn", "motion"],
+    ap.add_argument("--head", type=str, choices=["ridge", "prototype", *TRAINABLE_HEADS],
                     default=None,
-                    help="ridge/prototype: closed-form fit; cnn/motion: backprop training "
-                         "(overrides segmentation.head).")
+                    help="ridge/prototype: closed-form fit; cnn/mfcnn/motion: backprop "
+                         "training. mfcnn = motion-first head (velocity code + motion "
+                         "channels, small appearance context; ignores --event-combine). "
+                         "Overrides segmentation.head.")
     ap.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
                     help="Vx,Vy combine (overrides velocity.axis_combine).")
     ap.add_argument("--event-combine", type=str, choices=list(EVENT_COMBINES), default=None,
@@ -193,9 +209,19 @@ def main() -> None:
     seg_cfg = cfg.get("segmentation", {})
     print(f"[fit] label_mode={label_mode}  num_classes={num_classes}")
     head_type = (args.head or seg_cfg.get("head", "ridge")).lower()
-    if head_type not in ("ridge", "prototype", "cnn", "motion"):
-        raise SystemExit(f"unknown head {head_type!r} (ridge|prototype|cnn|motion)")
-    trainable = head_type in ("cnn", "motion")
+    if head_type not in ("ridge", "prototype", *TRAINABLE_HEADS):
+        raise SystemExit(f"unknown head {head_type!r} (ridge|prototype|cnn|mfcnn|motion)")
+    trainable = head_type in TRAINABLE_HEADS
+    # mfcnn keeps X and Mv in separate branches: event_combine is not used
+    event_tag = "split" if head_type == "mfcnn" else event
+    if head_type == "mfcnn":
+        print(f"[fit] mfcnn: motion-first head, velocity.event_combine ({event}) is not used")
+    def opt(section: str, key: str):
+        return frontend_option(cfg, section, key)
+    print(f"[fit] velocity code: {opt('velocity', 'vel_norm')} units "
+          f"({opt('velocity', 'vel_unit_px')} px/interval)  X norm: {opt('velocity', 'x_norm')}  "
+          f"ego fit on: {opt('velocity', 'ego_fit')} events  "
+          f"Phi window: {opt('matching', 'phi_window')} ({opt('matching', 'phi_pad')} pad)")
     mean_center = bool(seg_cfg.get("ridge_mean_center", True))
     motion_features = bool(seg_cfg.get("ridge_motion_features", True))
     # Paper mode: multi-time surfaces -> fit on the two-time cost-volume features
@@ -206,7 +232,9 @@ def main() -> None:
             raise SystemExit("prototype head requires dataset.time_frames (paper mode)")
         mean_center = False   # cosine-centroid: normalization handles scale
     if paper:
-        print(f"[fit] PAPER mode, head={head_type}: features = Phi (X) velocity code")
+        what = ("velocity code + motion channels, small appearance context"
+                if head_type == "mfcnn" else f"{feature} (X) velocity code")
+        print(f"[fit] PAPER mode, head={head_type}: features = {what}")
     imbalance = ridge_cfg.get("imbalance", "balanced")
     alphas = ridge_cfg.get("alphas", [1e-3, 1e-1, 1.0, 10.0, 100.0])
     backend = args.backend or ridge_cfg.get("backend", "streaming")
@@ -222,8 +250,14 @@ def main() -> None:
             p.requires_grad = False
 
     train_ds = build_dataset(cfg, split=cfg.get("dataset", {}).get("split", "train"))
-    val_split = ridge_cfg.get("val_split", "eval")
+    # Validation picks the best epoch / alpha, so it must not be the test set:
+    # holdout = train scenes never trained on (dataset.val_scenes).
+    val_split = val_split_of(cfg)
     val_ds = build_dataset(cfg, split=val_split)
+    scenes = cfg.get("dataset", {}).get("val_scenes") if val_split == "holdout" else None
+    print(f"[fit] validation split: {val_split}" + (f"  (scenes {scenes})" if scenes else ""))
+    if val_split == cfg.get("dataset", {}).get("eval_split", "eval"):
+        print("[fit] WARNING: validating on the eval split -- eval scores will be optimistic")
 
     max_train = args.max_train_samples
     if max_train is None:
@@ -251,7 +285,7 @@ def main() -> None:
     if trainable:
         out_path = (Path(args.out) if args.out else
                     Path("checkpoints")
-                    / f"{head_type}_{feature}_{axis}_{event}_{label_mode}_r{ratio}_{len(train_ds)}.pt")
+                    / f"{head_type}_{feature}_{axis}_{event_tag}_{label_mode}_r{ratio}_{len(train_ds)}.pt")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         train_cfg = cfg.get("train", {})
         net = HDEMS({**cfg, "segmentation": {**seg_cfg, "head": head_type}}).to(device)
@@ -301,10 +335,12 @@ def main() -> None:
 
         torch.save({"model": best_state, "task": "segmentation", "head": head_type,
                     "epoch": best_epoch, "val_miou": best_score if len(val_ds) else None,
+                    "val_split": val_split,
                     "num_samples": len(train_ds), "num_classes": num_classes,
                     "axis_combine": axis, "event_combine": event,
                     "event_feature": feature, "label_mode": label_mode,
-                    "resolution_ratio": ratio, "frontend": frontend}, out_path)
+                    "resolution_ratio": ratio, "frontend": frontend,
+                    "head_config": head_settings(cfg)}, out_path)
         print(f"[train] saved {out_path}  best epoch={best_epoch}  score={best_score:.4f}")
         return
 

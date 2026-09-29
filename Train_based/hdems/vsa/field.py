@@ -7,16 +7,44 @@ import torch
 from .fpe import fpe
 
 
+def _shift(x: torch.Tensor, s: int, dim: int, pad: str) -> torch.Tensor:
+    """out[..., i, ...] = x[..., i + s, ...] along ``dim``.
+
+    wrap : torch.roll -- the far border wraps in (the old behaviour)
+    zero : positions beyond the border read zero
+    """
+    if pad == "wrap":
+        return torch.roll(x, shifts=-s, dims=dim)
+    if pad != "zero":
+        raise ValueError(f"pad must be zero|wrap, got {pad!r}")
+    n = x.shape[dim]
+    if s == 0:
+        return x
+    out = torch.zeros_like(x)
+    if abs(s) >= n:
+        return out
+    if s > 0:
+        out.narrow(dim, 0, n - s).copy_(x.narrow(dim, s, n - s))
+    else:
+        out.narrow(dim, -s, n + s).copy_(x.narrow(dim, 0, n + s))
+    return out
+
+
 def bundled_field(
     F: torch.Tensor,
     phx: torch.Tensor,
     phy: torch.Tensor,
     M: int = 7,
+    *,
+    pad: str = "wrap",
 ) -> torch.Tensor:
     """Phi(x) = sum_v F(x+v) o P(v),  built with two 1-D passes.
 
     F   : (B, d, H, W) complex   descriptor field
     out : (B, d, H, W) complex   encodes the whole MxM matching function per pixel
+    pad : "zero" -- neighbours beyond the image border contribute nothing;
+          "wrap" -- torch.roll, the opposite border wraps in (old behaviour, kept
+                    so checkpoints trained with it rebuild the same features).
 
     EXACT, not approximate: verified to 5.3e-16 vs the explicit MxM sum.
     Keep M <= 9 -- bundling capacity degrades sharply beyond that (see SPEC section 0).
@@ -28,12 +56,12 @@ def bundled_field(
     wx = fpe(phx, offs)  # (M, d)
     tmp = torch.zeros_like(F)
     for i, a in enumerate(range(-m, m + 1)):
-        tmp = tmp + torch.roll(F, shifts=-a, dims=2) * wx[i].view(1, -1, 1, 1)
+        tmp = tmp + _shift(F, a, 2, pad) * wx[i].view(1, -1, 1, 1)
 
     wy = fpe(phy, offs)
     out = torch.zeros_like(F)
     for i, b in enumerate(range(-m, m + 1)):
-        out = out + torch.roll(tmp, shifts=-b, dims=3) * wy[i].view(1, -1, 1, 1)
+        out = out + _shift(tmp, b, 3, pad) * wy[i].view(1, -1, 1, 1)
     return out
 
 
@@ -42,6 +70,8 @@ def bundled_field_explicit(
     phx: torch.Tensor,
     phy: torch.Tensor,
     M: int = 7,
+    *,
+    pad: str = "wrap",
 ) -> torch.Tensor:
     """Explicit M^2 reference implementation for testing."""
     assert F.is_complex()
@@ -53,9 +83,8 @@ def bundled_field_explicit(
             pv = fpe(phx, torch.tensor(float(a), device=F.device)) * fpe(
                 phy, torch.tensor(float(b), device=F.device)
             )
-            out = out + torch.roll(F, shifts=(-a, -b), dims=(2, 3)) * pv.view(
-                1, -1, 1, 1
-            )
+            shifted = _shift(_shift(F, a, 2, pad), b, 3, pad)
+            out = out + shifted * pv.view(1, -1, 1, 1)
     return out
 
 

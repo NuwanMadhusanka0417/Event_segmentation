@@ -49,10 +49,13 @@ class EVIMODataset(Dataset):
         motion_params: MotionParams | None = None,
         boundary_ignore_px: int = 2,
         exclude_scenes: Iterable[str] = (),
+        only_scenes: Iterable[str] | None = None,
         require_mover: bool = False,
         negative_ratio: float = 0.0,
         interleave: bool = True,
         min_moving_px: int = 100,
+        score_window_ms: float | None = None,
+        use_shards: bool = False,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -66,12 +69,22 @@ class EVIMODataset(Dataset):
         self.motion_params = motion_params or MotionParams(window_s=self.window_s)
         self.boundary_ignore_px = int(boundary_ignore_px)
         self.min_moving_px = int(min_moving_px)
+        self.score_window_s = (float(score_window_ms) / 1000.0) if score_window_ms else None
 
-        self.cached: list[Path] = find_cached_samples(self.root, split)
+        # Pre-built .pt shards bypass EVERY index filter (scene-disjoint split, held-out
+        # validation scenes, require_mover, rigid groups) and freeze the time frames,
+        # so a stray shard folder would silently change what is trained and scored.
+        # They are only used when dataset.use_shards is set.
+        shards = find_cached_samples(self.root, split)
+        if shards and not use_shards:
+            print(f"[data] ignoring {len(shards)} .pt shard(s) in {self.root / split}: they "
+                  f"bypass the split/mover filters (set dataset.use_shards: true to use them)")
+        self.cached: list[Path] = shards if use_shards else []
         self.index: list[tuple[Path, int]] = (
             [] if self.cached else build_sample_index(
                 self.root, split,
                 exclude_scenes=exclude_scenes,
+                only_scenes=only_scenes,
                 require_mover=require_mover and self.label_mode == "motion",
                 negative_ratio=negative_ratio,
                 interleave=interleave,
@@ -115,6 +128,7 @@ class EVIMODataset(Dataset):
                 window_s=self.window_s,
                 decay=self.decay,
                 time_fracs=self.time_frames,
+                score_window_s=self.score_window_s,
             ),
             moving=moving,
             ambiguous=ambiguous,
@@ -160,6 +174,8 @@ class EVIMODataset(Dataset):
             "mask": labels,
             "gt_raw": raw,                 # every tracked object id (table included)
         }
+        if sample.get("score_mask") is not None:   # events near the label time
+            out["score_mask"] = sample["score_mask"]
         if moving is not None:
             # Raw ids of the MOVING objects only, 0 elsewhere. Instance and detection
             # metrics must not count the static table as an object to be found.

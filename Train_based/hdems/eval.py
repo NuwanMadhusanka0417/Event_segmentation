@@ -20,13 +20,14 @@ from hdems.data.labels import LABEL_MODES, num_classes_for, resolve_label_mode
 from hdems.data.motion_labels import IGNORE_LABEL
 from hdems.grouping import GroupingParams, group_objects
 from hdems.grouping import params_from_config as grouping_params
-from hdems.models.motion import ego_residual
 from hdems.visualize import save_event_colour_figure
 from hdems.detection import detection_metrics, masks_to_boxes
 from hdems.instances import binary_iou, connected_components, instance_metrics
-from hdems.models.hdems import HDEMS
+from hdems.models.hdems import ABLATIONS, HDEMS
 from hdems.vsa.velocity import EVENT_COMBINES
-from hdems.seg_features import event_pixel_mask
+from hdems.seg_features import score_pixel_mask
+
+HEADS = ("cnn", "mfcnn", "ridge", "prototype", "motion")
 
 
 def load_config(path: str | Path) -> dict:
@@ -164,9 +165,15 @@ def evaluate_segmentation(
     events_only_baseline: bool = False,
     grouping: GroupingParams | None = None,
     panel_indices: set[int] | None = None,
+    ablation: bool = False,
 ) -> dict[str, float]:
     """``grouping``: split the CNN's moving pixels into OBJECTS by motion model
-    (hdems.grouping) -- one colour per object -- instead of connected components."""
+    (hdems.grouping) -- one colour per object -- instead of connected components.
+
+    ``ablation``: also predict every frame with the motion input removed and with
+    the appearance input removed (HDEMS.ablate) and report how much that changes
+    -- a head whose output barely changes without motion is not segmenting motion.
+    """
     model.eval()
     ious: list[float] = []
     total_loss = 0.0
@@ -176,6 +183,12 @@ def evaluate_segmentation(
     inst_scores: list[dict] = []       # motion mode: instance matching
     oracle_scores: list[dict] = []     # grouping on the GT moving pixels (best case)
     det_scores: list[dict] = []        # object detection: box matching
+    ablation = ablation and not events_only_baseline
+    abl = {w: {"fg": [], "changed": 0, "px": 0} for w in ABLATIONS}
+    # index of the surface that ends at the label time (time_frames entry 1.0)
+    base = loader.dataset.dataset if isinstance(loader.dataset, Subset) else loader.dataset
+    tf = getattr(base, "time_frames", None)
+    label_t = int(np.argmax(tf)) if tf else 0
 
     if save_dir is not None:
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -185,9 +198,11 @@ def evaluate_segmentation(
     for batch in loader:
         surface = batch["surface"].to(device)
         mask = batch["mask"].to(device).long()
-        # Score on EVENT pixels only (pixels without events carry no evidence),
-        # and never on the ignore label (ambiguous speed / mask boundary band).
-        events_t = event_pixel_mask(surface)
+        # Score on EVENT pixels only (pixels without events carry no evidence), only
+        # on events near the label time (older ones are the trail a mover leaves
+        # behind, which the label calls static), and never on the ignore label
+        # (ambiguous speed / mask boundary band).
+        events_t = score_pixel_mask(batch, surface)
         valid = events_t & (mask >= 0) & (mask != IGNORE_LABEL)
         flow = None
         if events_only_baseline:
@@ -218,8 +233,9 @@ def evaluate_segmentation(
             elif batch.get("gt_moving", batch.get("gt_raw")) is not None:
                 gt_inst = batch.get("gt_moving", batch.get("gt_raw"))[0].cpu().numpy().astype(np.int64) // 1000
             if grouping is not None and flow is not None:
-                # objects = the CNN's moving pixels grouped by motion model
-                res, _ = ego_residual(flow, iters=model.ego_iters, valid=events_t)
+                # objects = the CNN's moving pixels grouped by motion model (the same
+                # ego-compensated velocity the head saw)
+                res, _ = model.residual_from_flow(flow, surface)
                 res = res[0].cpu().numpy()
                 objects = group_objects(res, pred_fg & ev, grouping)
                 if gt_inst is not None and ((gt_inst > 0) & ev).any():
@@ -236,19 +252,36 @@ def evaluate_segmentation(
                         masks_to_boxes(pred_inst, min_area=min_instance),
                         masks_to_boxes(gt_inst, min_area=min_instance)))
 
+        if ablation:
+            gt_fg_t = (mask[0] > 0)
+            for what in ABLATIONS:
+                model.ablate = what
+                try:
+                    p2 = model(surface, task="segmentation")["seg_logits"].argmax(dim=1)
+                finally:
+                    model.ablate = None
+                a = abl[what]
+                a["changed"] += int(((p2 != pred) & valid).sum())
+                a["px"] += int(valid.sum())
+                a["fg"].append(binary_iou((p2[0] > 0).cpu().numpy(), gt_fg_t.cpu().numpy(),
+                                          valid=valid[0].cpu().numpy()))
+
         draw = (n in panel_indices) if panel_indices is not None else saved < max_images
         if (save_dir is not None or color_dir is not None) and draw:
+            # background image: the surface that ends at the label time, not the whole
+            # 100 ms stack, which smears every mover into a long trail
+            ref = surface[0, label_t] if surface.dim() == 5 else surface[0]
             if save_dir is not None:
                 # show the prediction where it is scored; elsewhere = background
                 pred_vis = pred.masked_fill(~valid, 0)
                 _save_seg_panel(
-                    surface[0], mask[0], pred_vis[0],
+                    ref, mask[0], pred_vis[0],
                     save_dir / f"eval_{n:05d}.png", num_classes,
                     title=panel_title, box_lines=box_lines,
                 )
             if color_dir is not None:
                 save_event_colour_figure(
-                    surface[0], pred[0], events_t[0],
+                    ref, pred[0], events_t[0],
                     color_dir / f"events_{n:05d}.png",
                     gt_moving=(batch["gt_moving"][0] if "gt_moving" in batch else None),
                     objects=objects, objects_gt_mask=objects_gt_mask, gt_objects=gt_inst,
@@ -288,6 +321,11 @@ def evaluate_segmentation(
         if oracle_scores:
             out["oracle_instance_miou"] = float(np.nanmean([s["instance_miou"] for s in oracle_scores]))
             out["oracle_mean_pred_instances"] = float(np.mean([s["n_pred"] for s in oracle_scores]))
+    if ablation:
+        for what, a in abl.items():
+            fin = [v for v in a["fg"] if v == v]
+            out[f"no_{what}_fg_iou"] = sum(fin) / max(len(fin), 1)
+            out[f"no_{what}_changed"] = a["changed"] / max(a["px"], 1)
     if det_scores:
         k = len(det_scores)
         out["det_precision"] = sum(s["det_precision"] for s in det_scores) / k
@@ -341,7 +379,8 @@ def main() -> None:
                         help="Head checkpoint .pt (any head; alias)")
     parser.add_argument("--prototype-checkpoint", type=str, default=None,
                         help="Head checkpoint .pt (any head; alias)")
-    parser.add_argument("--head", type=str, choices=["cnn", "ridge", "prototype", "motion"], default=None)
+    parser.add_argument("--head", type=str, choices=list(HEADS), default=None,
+                        help="Default: the head stored in the checkpoint, else segmentation.head.")
     parser.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
                         help="Override velocity.axis_combine (else taken from the checkpoint).")
     parser.add_argument("--event-combine", type=str, choices=list(EVENT_COMBINES), default=None,
@@ -377,6 +416,10 @@ def main() -> None:
     parser.add_argument("--skip-latency", action="store_true",
                         help="Skip the latency measurement (35 uncached forward passes) "
                              "-- for quick checks, especially on CPU.")
+    parser.add_argument("--ablation-check", action="store_true",
+                        help="Also predict every frame without the motion input and without "
+                             "the appearance input, and report how much each changes the "
+                             "result. A motion segmenter must collapse without motion.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -414,6 +457,11 @@ def main() -> None:
                 if not args.label_mode and _meta.get("label_mode"):
                     cfg["dataset"] = {**cfg.get("dataset", {}),
                                       "label_mode": _meta["label_mode"]}
+                if not args.head and _meta.get("head") in HEADS:
+                    head = _meta["head"]
+                # head sizes decide the tensor shapes: rebuild what was trained
+                if _meta.get("head_config"):
+                    cfg["segmentation"] = {**cfg.get("segmentation", {}), **_meta["head_config"]}
                 # A trained head is only valid for the front end it was trained on
                 # (kernel, M, alpha, smooth, tau, resolution...). Rebuild exactly
                 # that, even if the YAML has changed since training.
@@ -552,6 +600,7 @@ def main() -> None:
                       and not args.events_only_baseline else None),
             panel_indices=(choose_panels(dataset, args.panels, args.max_images)
                            if (save_dir is not None or args.color_events) else None),
+            ablation=args.ablation_check,
         )
         if model.flow_cache is not None:
             print(model.flow_cache.summary())
@@ -590,6 +639,25 @@ def main() -> None:
             print(f"Box P / R @0.5:  {metrics['det_precision']:.3f} / {metrics['det_recall']:.3f}")
             print(f"Box mIoU:        {metrics['det_miou']:.4f}")
             print(f"TP / pred / gt:  {metrics['det_tp']} / {metrics['det_n_pred']} / {metrics['det_n_gt']}")
+        if "no_motion_fg_iou" in metrics:
+            full = metrics.get("fg_iou", float("nan"))
+            nomo, noap = metrics["no_motion_fg_iou"], metrics["no_appearance_fg_iou"]
+            drop = 1.0 - nomo / full if full > 0 else float("nan")
+            print("--- ABLATION CHECK: does the head segment MOTION? ---")
+            print(f"FG IoU   full {full:.4f} | without motion {nomo:.4f} | "
+                  f"without appearance {noap:.4f}")
+            print(f"Predictions changed:  without motion {metrics['no_motion_changed']:.1%} | "
+                  f"without appearance {metrics['no_appearance_changed']:.1%}")
+            if drop != drop:
+                verdict = "n/a (FG IoU is 0)"
+            elif drop >= 0.5:
+                verdict = f"USES MOTION -- removing it costs {drop:.0%} of the FG IoU"
+            elif drop < 0.1:
+                verdict = (f"IGNORES MOTION -- removing it costs only {drop:.0%} of the FG IoU; "
+                           "the head decides from appearance")
+            else:
+                verdict = f"PARTLY uses motion -- removing it costs {drop:.0%} of the FG IoU"
+            print(f"Verdict: {verdict}")
         print(f"Latency:  {ms:.2f} ms/frame ({device})")
         print(f"Head params: {model.seg_head_param_count():,}  "
               f"(trainable total: {model.num_trainable_params:,})")

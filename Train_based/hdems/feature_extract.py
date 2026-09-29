@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from hdems.models.hdems import HDEMS
-from hdems.seg_features import flatten_valid_features, prepare_seg_features
+from hdems.seg_features import flatten_valid_features, prepare_seg_features, score_pixel_mask
 
 
 @torch.no_grad()
@@ -49,13 +49,18 @@ def extract_paper_flat_batch(
     feature_mean: torch.Tensor | None,
     mean_center: bool,
     event_threshold: float = 1e-6,
+    score_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Flatten paper front-end features (multi-time cost volume) over valid pixels."""
+    """Flatten paper front-end features (multi-time cost volume) over valid pixels.
+
+    ``score_mask``: pixels to fit on (seg_features.score_pixel_mask); default =
+    the event pixels of the reference surface.
+    """
     feats, _ = model.paper_features(surface)                 # (B, 2d+3, H, W)
     if mean_center and feature_mean is not None and feature_mean.numel():
         feats = feats - feature_mean.to(device=feats.device, dtype=feats.dtype).view(1, -1, 1, 1)
-    surf_last = surface[:, -1]                               # (B, 2, H, W) for validity
-    return flatten_valid_features(feats, mask, surf_last, event_threshold=event_threshold)
+    return flatten_valid_features(feats, mask, surface[:, 0], event_threshold=event_threshold,
+                                  score_mask=score_mask)
 
 
 @torch.no_grad()
@@ -74,7 +79,8 @@ def accumulate_paper_feature_mean(
         mask = batch["mask"].to(device)
         feats, _ = model.paper_features(surface)
         x, _ = flatten_valid_features(
-            feats, mask, surface[:, -1], event_threshold=event_threshold,
+            feats, mask, surface[:, 0], event_threshold=event_threshold,
+            score_mask=score_pixel_mask(batch, surface),
         )
         if x.numel() == 0:
             continue

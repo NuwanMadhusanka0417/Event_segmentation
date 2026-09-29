@@ -120,3 +120,61 @@ class HVConvHead(nn.Module):
 
     def forward(self, feats: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.net(feats.float()))
+
+
+class MotionFirstHead(nn.Module):
+    """Motion-first HV head (head ``mfcnn``).
+
+    Real-data ablation of the ``cnn`` head (2026-09-29): zeroing the velocity
+    input changed 1.3-4.6% of its predictions, zeroing the appearance input
+    25%. It had learned what moving objects LOOK like in the training scenes,
+    which does not transfer. Here motion is the main input and appearance a
+    small context the head must learn to do without:
+
+      motion     : 1x1 readout of the velocity code Mv (fixed units)  -> motion_dim ch
+                   + 6 explicit motion channels (``motion_scalars``: residual,
+                   raw flow and camera speed)
+      appearance : 1x1 projection of unit-RMS X (F or Phi)           -> app_dim ch
+                   (8-16), zeroed for a whole sample with probability
+                   ``app_dropout`` while training
+
+    X and Mv are NOT fused (no event_combine): fusing them is what let the
+    appearance term drown the velocity term.
+    """
+
+    def __init__(
+        self,
+        d: int,
+        num_classes: int = 2,
+        *,
+        embedding_dim: int = 32,
+        motion_dim: int = 32,
+        app_dim: int = 8,
+        app_dropout: float = 0.5,
+        scalar_ch: int = 6,
+    ) -> None:
+        super().__init__()
+        self.motion_proj = nn.Conv2d(2 * d, motion_dim, 1)
+        self.app_proj = nn.Conv2d(2 * d, app_dim, 1) if app_dim > 0 else None
+        self.app_dropout = float(app_dropout)
+        hidden = embedding_dim * 4
+        groups = 8 if hidden % 8 == 0 else 1
+        self.net = nn.Sequential(
+            nn.Conv2d(motion_dim + scalar_ch + max(app_dim, 0), hidden, 3, padding=1),
+            nn.GroupNorm(groups, hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, embedding_dim, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.classifier = nn.Conv2d(embedding_dim, num_classes, 1)
+
+    def forward(self, mv: torch.Tensor, x: torch.Tensor, scalars: torch.Tensor) -> torch.Tensor:
+        """mv, x: (B, d, H, W) complex (x already unit-RMS); scalars: (B, 6, H, W)."""
+        parts = [self.motion_proj(torch.cat([mv.real, mv.imag], dim=1).float()), scalars.float()]
+        if self.app_proj is not None:
+            a = self.app_proj(torch.cat([x.real, x.imag], dim=1).float())
+            if self.training and self.app_dropout > 0:
+                keep = (torch.rand(a.shape[0], 1, 1, 1, device=a.device) >= self.app_dropout)
+                a = a * keep.to(a.dtype)
+            parts.append(a)
+        return self.classifier(self.net(torch.cat(parts, dim=1)))

@@ -9,14 +9,20 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
-from hdems.config import apply_resolution_ratio, frontend_settings, resolution_ratio_of
+from hdems.config import (
+    apply_resolution_ratio,
+    frontend_settings,
+    head_settings,
+    resolution_ratio_of,
+)
 from hdems.data.build import build_dataset as _build_dataset
+from hdems.data.build import val_split_of
 from hdems.data.labels import LABEL_MODES, num_classes_for, resolve_label_mode
 from hdems.data.motion_labels import IGNORE_LABEL
 from hdems.losses.flow import epe_loss
 from hdems.losses.seg import dice_loss, seg_loss
 from hdems.models.hdems import HDEMS
-from hdems.seg_features import event_pixel_mask
+from hdems.seg_features import score_pixel_mask
 from hdems.vsa.velocity import EVENT_COMBINES
 
 
@@ -52,9 +58,11 @@ def train_one_epoch(
             logits = out["seg_logits"]
             target = batch["mask"].to(device).long()
             # Train on EVENT pixels only: pixels with no events carry no evidence
-            # and would otherwise flood the loss with trivial background.
+            # and would otherwise flood the loss with trivial background. Only events
+            # near the label time (score_pixel_mask): older ones are the trail a
+            # mover leaves, which the label at ts calls "static".
             # Ignore label 255 = ambiguous object speed or mask boundary band.
-            valid = event_pixel_mask(surface) & (target != IGNORE_LABEL)
+            valid = score_pixel_mask(batch, surface) & (target != IGNORE_LABEL)
             if not valid.any():
                 continue
             loss = seg_loss(logits, target.masked_fill(~valid, IGNORE_LABEL))
@@ -161,29 +169,52 @@ def main() -> None:
     ckpt_dir = Path(train_cfg.get(
         "out_dir", f"checkpoints/{head}_{feature}_{axis}_{event}_{label_mode}_r{ratio}"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_loss = float("inf")
 
     use_dice = bool(train_cfg.get("use_dice", False))
     num_classes = n_classes
 
+    # best.pt is chosen on the VALIDATION split (held-out train scenes), not on the
+    # training loss -- the lowest training loss is just the most overfitted epoch.
+    val_loader = None
+    if task == "segmentation":
+        from hdems.eval import evaluate_segmentation      # local: eval imports the model stack
+        val_ds = build_dataset(cfg, val_split_of(cfg))
+        max_val = int(train_cfg.get("max_val_samples", 150) or 0)
+        if 0 < max_val < len(val_ds):
+            pick = [round(i * (len(val_ds) - 1) / max(max_val - 1, 1)) for i in range(max_val)]
+            val_ds = Subset(val_ds, sorted(set(pick)))
+        print(f"Validation samples ({val_split_of(cfg)}): {len(val_ds)}")
+        if len(val_ds):
+            val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
+    best_score = float("-inf")
+
     for epoch in range(train_cfg.get("epochs", 100)):
         loss = train_one_epoch(model, loader, optimizer, device, task,
                                use_dice=use_dice, num_classes=num_classes)
-        print(f"Epoch {epoch + 1}: loss={loss:.4f}")
+        score, line = -loss, f"Epoch {epoch + 1}: loss={loss:.4f}"
+        if val_loader is not None:
+            m = evaluate_segmentation(model, val_loader, device, num_classes,
+                                      label_mode=label_mode)
+            score = m.get("fg_iou", m["miou"])
+            line += f"  val_{'fgIoU' if 'fg_iou' in m else 'mIoU'}={score:.4f}"
+        print(line)
 
         # Save after every epoch: always refresh last.pt, keep best.pt too.
         ckpt = {"model": model.state_dict(), "epoch": epoch + 1,
-                "loss": loss, "task": task,
+                "loss": loss, "task": task, "head": head,
+                "val_score": score if val_loader is not None else None,
                 "axis_combine": axis, "event_combine": event, "event_feature": feature,
                 "label_mode": label_mode, "num_classes": n_classes,
-                "resolution_ratio": ratio, "frontend": frontend}
+                "resolution_ratio": ratio, "frontend": frontend,
+                "head_config": head_settings(cfg)}
         torch.save(ckpt, ckpt_dir / "last.pt")
-        if loss < best_loss:
-            best_loss = loss
+        if score > best_score:
+            best_score = score
             torch.save(ckpt, ckpt_dir / "best.pt")
 
+    what = "val score" if val_loader is not None else "-train loss"
     print(f"Saved checkpoints to {ckpt_dir.resolve()} "
-          f"(last.pt, best.pt @ loss={best_loss:.4f})")
+          f"(last.pt, best.pt @ {what}={best_score:.4f})")
 
 
 if __name__ == "__main__":

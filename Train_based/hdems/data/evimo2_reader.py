@@ -75,9 +75,11 @@ def events_window_to_surface(
     if i1 <= i0:
         return torch.zeros(2, height, width, dtype=torch.float32)
 
+    # AGE, not the raw timestamp: events_to_time_surface weights decay ** (x - min x),
+    # so raw timestamps gave the OLDEST event weight 1 and the newest the least.
     events = np.stack(
         [
-            t[i0:i1].astype(np.float64),
+            (t_end - t[i0:i1]).astype(np.float64),
             xy[i0:i1, 0].astype(np.float64),
             xy[i0:i1, 1].astype(np.float64),
             p[i0:i1].astype(np.float64),
@@ -142,6 +144,26 @@ def events_multitime_surface(
     return torch.stack(surfaces, dim=0)
 
 
+def recent_event_mask(
+    seq_dir: Path,
+    ts: float,
+    recent_s: float,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """(H, W) bool: pixels with at least one event in ``[ts - recent_s, ts]``."""
+    t = np.load(seq_dir / "dataset_events_t.npy", mmap_mode="r").reshape(-1)
+    i0 = int(np.searchsorted(t, ts - recent_s, side="left"))
+    i1 = int(np.searchsorted(t, ts, side="right"))
+    out = np.zeros(height * width, dtype=bool)
+    if i1 > i0:
+        xy = np.asarray(np.load(seq_dir / "dataset_events_xy.npy", mmap_mode="r")[i0:i1])
+        x, y = xy[:, 0].astype(np.int64), xy[:, 1].astype(np.int64)
+        inb = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+        out[y[inb] * width + x[inb]] = True
+    return torch.from_numpy(out.reshape(height, width))
+
+
 def load_frame_sample(
     seq_dir: Path,
     frame: dict[str, Any],
@@ -151,6 +173,7 @@ def load_frame_sample(
     window_s: float = 0.05,
     decay: float = 0.8,
     time_fracs: list[float] | None = None,
+    score_window_s: float | None = None,
 ) -> dict[str, torch.Tensor]:
     """Load one aligned (surface, mask) training sample from a sequence.
 
@@ -161,6 +184,9 @@ def load_frame_sample(
     If ``time_fracs`` is given, ``surface`` is a multi-time stack
     ``(len(time_fracs), 2, H, W)`` for the paper two-time cost volume; otherwise
     a single ``(2, H, W)`` time surface.
+
+    ``score_window_s``: also return ``score_mask`` (H, W) = pixels with an event in
+    the last score_window_s before the label time (see seg_features.score_pixel_mask).
     """
     masks = np.load(seq_dir / "dataset_mask.npz")
     meta = load_meta(seq_dir)
@@ -193,6 +219,8 @@ def load_frame_sample(
     # Keep the RAW mask (object_id * 1000). Labels are derived at load time from
     # dataset.label_mode, so switching mode never requires a cache rebuild.
     mask = torch.from_numpy(mask_np.astype(np.int64))
+    score = (recent_event_mask(seq_dir, ts, score_window_s, height, width)
+             if score_window_s else None)
 
     if out_height and out_width and (
         surface.shape[-2] != out_height or surface.shape[-1] != out_width
@@ -216,9 +244,15 @@ def load_frame_sample(
             size=(out_height, out_width),
             mode="nearest",
         ).squeeze(0).squeeze(0).long()
+        if score is not None:          # a working pixel counts if any of its sensor pixels does
+            score = F.interpolate(score[None, None].float(), size=(out_height, out_width),
+                                  mode="area" if down else "nearest")[0, 0] > 0
 
     # mask_raw marks shards that store raw ids (older shards hold derived labels).
-    return {"surface": surface.float(), "mask": mask, "mask_raw": True}
+    out = {"surface": surface.float(), "mask": mask, "mask_raw": True}
+    if score is not None:
+        out["score_mask"] = score
+    return out
 
 
 def scene_of(seq_name: str) -> str:
@@ -310,6 +344,7 @@ def build_sample_index(
     min_match: float = 0.5,
     *,
     exclude_scenes: Iterable[str] = (),
+    only_scenes: Iterable[str] | None = None,
     require_mover: bool = False,
     negative_ratio: float = 0.0,
     interleave: bool = True,
@@ -324,20 +359,25 @@ def build_sample_index(
     matching ``mask_<id>`` key are skipped so ``load_frame_sample`` never raises
     a KeyError and ``len(dataset)`` reflects only loadable samples.
 
-    ``exclude_scenes``  drop sequences from these scenes (train/eval leakage).
+    ``exclude_scenes``  drop sequences from these scenes (train/eval leakage and
+                        the held-out validation scenes).
+    ``only_scenes``     keep ONLY these scenes (the held-out validation split).
     ``require_mover``   keep only frames where >=1 object is moving, plus
                         ``negative_ratio`` x that many all-static frames as negatives.
     ``interleave``      round-robin across sequences so a prefix is balanced.
     """
     exclude = {s.lower() for s in exclude_scenes}
+    only = None if only_scenes is None else {s.lower() for s in only_scenes}
     params = motion_params or MotionParams()
     per_seq: list[list[tuple[Path, int]]] = []
     n_pos_all = n_neg_all = 0
 
     for seq_dir in find_sequence_dirs(root, split):
+        if only is not None and scene_of(seq_dir.name) not in only:
+            continue
         if scene_of(seq_dir.name) in exclude:
             print(f"[data] excluding {seq_dir.name}: scene {scene_of(seq_dir.name)} "
-                  f"also appears in the other split (scene-disjoint splits)")
+                  f"is used by another split (scene-disjoint splits)")
             continue
         meta = load_meta(seq_dir)
         with np.load(seq_dir / "dataset_mask.npz") as masks:

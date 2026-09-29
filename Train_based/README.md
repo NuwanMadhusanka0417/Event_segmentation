@@ -69,13 +69,64 @@ python -m hdems.eval --config configs/evimo_seg.yaml --head cnn \
 
 With `dataset.time_frames` set, all heads use the paper front-end.
 
-- **`prototype`** (default) — VSA nearest-centroid; class prototypes are the
+- **`mfcnn`** (default) — motion-first CNN. Inputs: a 1×1 readout of the velocity
+  code `Mv` (fixed units), 6 explicit motion channels (`rx, ry, |r|` in px per
+  12.5 ms, `|r|` divided by the frame's background noise, the raw `|flow|` before ego
+  compensation, and the camera's own speed in this frame), and only 8 channels
+  of appearance (1×1 projection of unit-RMS `X`), which are zeroed for a whole
+  sample with probability 0.5 while training. `X` and `Mv` are not fused, so
+  `event_combine` is not used.
+- **`cnn`** — HV-channels CNN on the fused `X`/`Mv` feature (`event_combine`).
+- **`prototype`** — VSA nearest-centroid; class prototypes are the
   normalized bundle of training features. **Parameter-free**, no backprop.
 - **`ridge`** — closed-form linear readout (least squares). No backprop.
-- **`motion`** — small trained CNN on motion-primary features (`hdems.train`).
-- **`cnn`** — raw single-frame Φ baseline (`hdems.train`).
+- **`motion`** — older motion-primary CNN (residual + magnitude + 32 Φ channels).
 
-`prototype`/`ridge` are **fit** with `scripts/fit_ridge_head.py`.
+All heads are fit/trained with `scripts/fit_ridge_head.py` (what the PBS runs).
+
+### Does the head use motion? (`--ablation-check`)
+
+Measured 2026-09-29 on real eval frames: in the `cnn` head, zeroing the velocity input
+changed only 1.3% (Φ + concat) to 4.6% (F + bundle) of the predictions, while zeroing
+appearance changed 15–25%. It had learned what moving objects LOOK like in the
+training scenes, which does not transfer to new scenes. So every eval can now check it:
+
+```bash
+python -m hdems.eval --checkpoint <ckpt> --ablation-check
+```
+
+prints the FG IoU with and without each input, and a verdict (`USES MOTION` when
+removing motion costs ≥ 50% of the FG IoU, `IGNORES MOTION` below 10%). Accept a
+head only if it uses motion. `run_segmentation.pbs` does this with `ABLATION=yes`.
+
+### Phase-1 fixes (2026-09-29, from the code review + the ablation)
+
+| Setting | New | Old | Why |
+|---|---|---|---|
+| `dataset.time_frames` | `[1.0, 0.75, 0.5, 0.0]` | `[0.0, 0.25, 0.5, 1.0]` | the reference surface now ends at the label time (it ended 50 ms before) |
+| `dataset.score_window_ms` | `12.5` | all events | train/score only on events near the label time, not on the trail |
+| `dataset.val_split` | `holdout` (`val_scenes: [scene9]`) | `eval` | the best epoch was chosen on the test set |
+| `matching.phi_window` / `phi_pad` | `7` / `zero` | `M` (31) / wrap | Φ bundled 961 terms in d=512 and wrapped around the borders |
+| `velocity.vel_norm` | `fixed` (`vel_unit_px 0.5`) | per-frame 95th percentile | the same code must mean the same speed in every frame |
+| `velocity.x_norm` | `rms` | none | X was 7–370× larger than the velocity code |
+| `velocity.ego_fit` | `stack` (option: `reference`) | `stack` | tested, `reference` was no better |
+
+Measured on 48 eval frames with a mover (ratio 2, no training), AUC of moving vs
+static on the scored events:
+
+| | forward (old) | reversed (new) |
+|---|---|---|
+| raw \|flow\| | 0.683 | **0.738** |
+| \|residual\| after ego compensation | 0.704 | 0.700 |
+
+The reversed order gives better flow; the ego fit is now the limit. On still-camera
+frames the ego fit can lock onto a large mover and wreck the residual, while on
+moving-camera frames the raw flow is useless. So `mfcnn` gets both, plus the
+camera's speed, and learns which to trust.
+
+Checkpoints record these settings, and older checkpoints are evaluated with the old
+behaviour automatically (`hdems/config.py: _LEGACY_FRONTEND`). `.pt` shards are now
+ignored unless `dataset.use_shards: true` (they bypass the split and mover filters).
 
 ## Velocity → event combination (selectable)
 
@@ -94,7 +145,8 @@ the command line:
 - `bundle` → `X + Mv`
 - `bindbundle` → `(X̂ ⊙ Mv) + Mv`, where `X̂ = X / RMS(X)` per frame. The rescale is
   needed because `|Mv| = 1` while F is ~5–11× and Φ ~100–350× larger on event pixels,
-  so an unscaled bundle would drown the velocity term.
+  so an unscaled bundle would drown the velocity term. (With `velocity.x_norm: rms`,
+  now the default, every mode gets the unit-RMS `X`.)
 - `concat` → `[X | Mv]`
 
 Feature dim: `4d` for `concat`, `2d` for the others. Old checkpoints without

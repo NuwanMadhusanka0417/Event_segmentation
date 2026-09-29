@@ -7,7 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from hdems.config import apply_resolution_ratio
+from hdems.config import apply_resolution_ratio, frontend_option, resolution_ratio_of
 from hdems.data.time_surface import build_pyramid
 from hdems.flow_cache import FlowCache
 from hdems.models.decoder import FlowDecoder
@@ -16,12 +16,25 @@ from hdems.models.matching import HierarchicalMatcher
 from hdems.models.motion import decode_flow, ego_residual
 from hdems.models.paper_flow import flow_from_cost, multiscale_cost_volume
 from hdems.models.prototype_head import PrototypeHead
-from hdems.models.segmentation import HVConvHead, MotionSegHead, SegmentationHead
+from hdems.models.segmentation import (
+    HVConvHead,
+    MotionFirstHead,
+    MotionSegHead,
+    SegmentationHead,
+)
 from hdems.ridge_head import RidgeHead
 from hdems.seg_features import event_pixel_mask
+from hdems.vsa.field import bundled_field
 from hdems.vsa.fpe import make_base_phases
 from hdems.vsa.temporal import bind_trajectory, make_time_phases
-from hdems.vsa.velocity import combine_event_velocity, encode_velocity
+from hdems.vsa.velocity import (
+    combine_event_velocity,
+    encode_velocity,
+    motion_scalars,
+    unit_rms,
+)
+
+ABLATIONS = ("motion", "appearance")
 
 
 class HDEMS(nn.Module):
@@ -77,6 +90,25 @@ class HDEMS(nn.Module):
         # paper feature dim fed to a per-pixel head: concat -> 4d, else 2d
         combine_dim = 4 * d if self.event_combine == "concat" else 2 * d
 
+        # Front-end options added 2026-09-29 (old checkpoints restore the old values,
+        # see hdems.config._LEGACY_FRONTEND):
+        self.res_ratio = resolution_ratio_of(cfg)
+        # index of the surface that ends at the label time (time_frames entry 1.0)
+        tf = (cfg.get("dataset", {}) or {}).get("time_frames") or [1.0]
+        self.label_t = max(range(len(tf)), key=lambda i: float(tf[i]))
+        # Phi's own window, in working pixels. It used to be the cost-volume M
+        # (31 -> 961 bundled terms in d=512, far past the capacity of the bundle).
+        self.phi_window = int(frontend_option(cfg, "matching", "phi_window"))
+        self.phi_pad = str(frontend_option(cfg, "matching", "phi_pad"))
+        # velocity code in fixed units: vel_unit_px SENSOR px per interval
+        self.vel_norm = str(frontend_option(cfg, "velocity", "vel_norm"))
+        self.vel_unit_px = float(frontend_option(cfg, "velocity", "vel_unit_px"))
+        self.x_norm = str(frontend_option(cfg, "velocity", "x_norm"))       # rms | none
+        self.ego_fit = str(frontend_option(cfg, "velocity", "ego_fit"))     # reference | stack
+        # Evaluation switch (hdems.eval --ablation-check): "motion" zeroes the residual
+        # velocity, "appearance" zeroes the event HV X. None = normal.
+        self.ablate: str | None = None
+
         if self.head_type == "ridge":
             self.seg_head = RidgeHead(
                 num_classes=num_classes,
@@ -92,6 +124,15 @@ class HDEMS(nn.Module):
             )
         elif self.head_type == "prototype":
             self.seg_head = PrototypeHead(num_classes)
+        elif self.head_type == "mfcnn":  # motion-first: Mv + motion channels, small appearance
+            self.seg_head = MotionFirstHead(
+                d,
+                num_classes,
+                embedding_dim=seg.get("embedding_dim", 32),
+                motion_dim=int(seg.get("mf_motion_dim", 32)),
+                app_dim=int(seg.get("mf_app_dim", 8)),
+                app_dropout=float(seg.get("mf_app_dropout", 0.5)),
+            )
         else:  # "cnn" — HV-as-channels CNN on the paper feature tensor
             self.seg_head = HVConvHead(
                 in_ch=combine_dim,
@@ -129,14 +170,66 @@ class HDEMS(nn.Module):
     def event_hv(self, f0: torch.Tensor) -> torch.Tensor:
         """Event hypervector fused with velocity (velocity.event_feature).
 
-        phi -> bundled 7x7 neighbourhood of F0, each neighbour bound to its offset code
+        phi -> bundled phi_window x phi_window neighbourhood of F0, each neighbour
+               bound to its offset code (phi_window 0 = the cost-volume M, old)
         f   -> the VFA descriptor F0 itself (paper Eq.4, F = T * K)
         """
         if self.event_feature == "phi":
-            return self.matcher([f0])[0]
+            return bundled_field(f0, self.matcher.phx, self.matcher.phy,
+                                 M=self.phi_window or self.matcher.M, pad=self.phi_pad)
         if self.event_feature == "f":
             return f0
         raise ValueError(f"event_feature must be phi|f, got {self.event_feature!r}")
+
+    def ego_mask(self, surfaces: torch.Tensor) -> torch.Tensor:
+        """Pixels the ego-motion model is fitted on -> (B, H, W) bool.
+
+        stack     : events of any surface (default)
+        reference : events of the reference surface only (index 0), where the flow is
+                    measured from. Measured 2026-09-30: no better than stack (AUC 0.696
+                    vs 0.700 on 48 eval frames) -- the Eq.12 pooling spreads the flow
+                    beyond the reference events anyway.
+        """
+        if self.ego_fit == "reference":
+            return event_pixel_mask(surfaces[:, :1])
+        return event_pixel_mask(surfaces)
+
+    def residual_from_flow(self, flow: torch.Tensor, surfaces: torch.Tensor):
+        """Ego-compensated (residual) velocity, working px per interval."""
+        return ego_residual(flow, iters=self.ego_iters, valid=self.ego_mask(surfaces))
+
+    def motion_inputs(self, surfaces: torch.Tensor):
+        """Shared front end of every multi-time head -> (flow, residual, X).
+
+        X is the event HV of the reference surface (Phi or F), unit-RMS when
+        velocity.x_norm = rms. ``self.ablate`` zeroes one of the two inputs.
+        """
+        flow = self.compute_flow(surfaces)
+        residual, _ = self.residual_from_flow(flow, surfaces)
+        # Only the reference surface is needed for X, so a cache hit skips the other
+        # three encodes as well as the cost volume.
+        x = self.event_hv(self.encoder(surfaces[:, 0]))
+        if self.x_norm == "rms":
+            # raw F is ~5-11x and Phi ~100-370x larger than the |.| = 1 velocity code
+            x = unit_rms(x)
+        if self.ablate == "motion":
+            residual = torch.zeros_like(residual)    # velocity code = FPE(0) everywhere
+        elif self.ablate == "appearance":
+            x = torch.zeros_like(x)
+        elif self.ablate is not None:
+            raise ValueError(f"ablate must be one of {ABLATIONS} or None, got {self.ablate!r}")
+        return flow, residual, x
+
+    def velocity_hv(self, residual: torch.Tensor) -> torch.Tensor:
+        """Residual velocity (B, 2, H, W), working px -> Mv (B, d, H, W).
+
+        Converted to SENSOR px first, so vel_unit_px means the same at every
+        resolution ratio.
+        """
+        r = residual * self.res_ratio
+        return encode_velocity(r[:, 0], r[:, 1], self.phi_vx, self.phi_vy,
+                               vel_bw=self.vel_bw, axis_combine=self.axis_combine,
+                               norm=self.vel_norm, unit=self.vel_unit_px)
 
     @torch.no_grad()
     def _flow_uncached(self, surfaces: torch.Tensor) -> torch.Tensor:
@@ -174,18 +267,9 @@ class HDEMS(nn.Module):
                   HV Mv (event_combine): (B, 2d, H, W), or (B, 4d, H, W) for concat
           flow  = decoded optical flow (B, 2, H, W)
         """
-        flow = self.compute_flow(surfaces)
-        # Fit the global model on EVENT pixels only -- empty pixels have flow ~0 and
-        # would drag the fit to zero, leaving the "residual" equal to the raw flow.
-        residual, _mag = ego_residual(flow, iters=self.ego_iters,
-                                      valid=event_pixel_mask(surfaces))
-        # Only the reference surface is needed for X, so a cache hit skips the other
-        # three encodes as well as the cost volume.
-        x = self.event_hv(self.encoder(surfaces[:, 0]))
+        flow, residual, x = self.motion_inputs(surfaces)
         # residual velocity -> hypervector (axis_combine), fused with X (event_combine)
-        mv = encode_velocity(residual[:, 0], residual[:, 1], self.phi_vx, self.phi_vy,
-                             vel_bw=self.vel_bw, axis_combine=self.axis_combine)
-        feats = combine_event_velocity(x, mv, self.event_combine)
+        feats = combine_event_velocity(x, self.velocity_hv(residual), self.event_combine)
         return feats, flow
 
     def forward(
@@ -200,15 +284,26 @@ class HDEMS(nn.Module):
 
         outputs: dict[str, torch.Tensor] = {}
 
+        # ---- motion-first head: Mv + explicit motion channels + small appearance
+        if task == "segmentation" and self.head_type == "mfcnn":
+            if not multitime:
+                raise ValueError("head mfcnn needs the multi-time stack (dataset.time_frames)")
+            flow, residual, x = self.motion_inputs(surface)
+            raw = torch.zeros_like(flow) if self.ablate == "motion" else flow
+            scalars = motion_scalars(residual * self.res_ratio,       # sensor px
+                                     event_pixel_mask(surface[:, :1]),
+                                     raw * self.res_ratio, unit=self.vel_unit_px)
+            outputs["flow"] = flow
+            outputs["seg_logits"] = self.seg_head(self.velocity_hv(residual), x, scalars)
+            return outputs
+
         # ---- paper two-time / multi-scale motion path -----------------------
         if task == "segmentation" and self.head_type == "motion" and multitime:
-            flow = self.compute_flow(surface)                        # cached when enabled
-            residual, mag = ego_residual(flow, iters=self.ego_iters,
-                                         valid=event_pixel_mask(surface))
+            flow, residual, phi = self.motion_inputs(surface)        # cached when enabled
+            mag = residual.pow(2).sum(1, keepdim=True).clamp_min(1e-12).sqrt()
             motion = torch.cat([residual, mag], dim=1)
-            phi = self.event_hv(self.encoder(surface[:, 0]))         # HV context (Phi or F)
             outputs["flow"] = flow
-            outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface[:, -1])
+            outputs["seg_logits"] = self.seg_head(phi, motion=motion, surface=surface[:, 0])
             return outputs
 
         # ---- paper front-end with a per-pixel readout (ridge/prototype/cnn) --
@@ -221,9 +316,9 @@ class HDEMS(nn.Module):
                 outputs["seg_logits"] = self.seg_head.logits_from_features(feats)
             return outputs
 
-        # ---- single-time paths (fall back to the last frame if a stack) -----
+        # ---- single-time paths (fall back to the label-time frame if a stack) -
         if multitime:
-            surface = surface[:, -1]
+            surface = surface[:, self.label_t]
         f = self.encoder(surface)
         phi = self.matcher([f])[0]
 

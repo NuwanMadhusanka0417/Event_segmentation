@@ -43,6 +43,23 @@ def event_pixel_mask(surface: torch.Tensor, *, threshold: float = 1e-6) -> torch
     return surface.abs().reshape(b, -1, h, w).sum(dim=1) > threshold
 
 
+def score_pixel_mask(batch: dict, surface: torch.Tensor) -> torch.Tensor:
+    """Pixels that are trained on and scored -> (B, H, W) bool.
+
+    The dataset provides ``score_mask`` = pixels with an event in the last
+    dataset.score_window_ms before the label time. The label is the object mask AT
+    that time, so older events -- the trail an object leaves behind it -- would be
+    labelled "static" although a moving object caused them (the review measured 39%
+    of the trail pixels labelled static). Falls back to every event pixel of the
+    stack when the dataset gives no mask (score_window_ms 0, or cached shards).
+    """
+    m = batch.get("score_mask") if isinstance(batch, dict) else None
+    if m is not None:
+        m = m.to(surface.device).bool()
+        return m.unsqueeze(0) if m.dim() == 2 else m       # a single sample (H, W)
+    return event_pixel_mask(surface)
+
+
 def motion_mag_angle(surface: torch.Tensor) -> torch.Tensor:
     if surface.dim() == 3:
         surface = surface.unsqueeze(0)
@@ -86,16 +103,20 @@ def flatten_valid_features(
     surface: torch.Tensor,
     *,
     event_threshold: float = 1e-6,
+    score_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """``score_mask`` (B, H, W): pixels to use (see ``score_pixel_mask``); default =
+    every event pixel of ``surface``."""
     if surface.dim() == 3:
         surface = surface.unsqueeze(0)
     if mask.dim() == 2:
         mask = mask.unsqueeze(0)
     b, d, h, w = features.shape
+    events = (score_mask.to(mask.device).bool() if score_mask is not None
+              else event_pixel_mask(surface, threshold=event_threshold))
     # Drop ignore-label pixels (ambiguous object speed, mask boundary band) as well
     # as pixels without events -- a 255 label would otherwise be fitted as a class.
-    valid = (event_valid_mask(surface, threshold=event_threshold)
-             & (mask >= 0) & (mask != IGNORE_LABEL))
+    valid = events & (mask >= 0) & (mask != IGNORE_LABEL)
     x_flat = features.permute(0, 2, 3, 1).reshape(b * h * w, d)
     y_flat = mask.reshape(b * h * w)
     v = valid.reshape(b * h * w)

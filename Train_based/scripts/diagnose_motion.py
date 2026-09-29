@@ -35,9 +35,8 @@ from hdems.data.motion_labels import IGNORE_LABEL               # noqa: E402
 from hdems.eval import load_config                              # noqa: E402
 from hdems.instances import binary_iou                          # noqa: E402
 from hdems.models.hdems import HDEMS                            # noqa: E402
-from hdems.models.motion import ego_residual                    # noqa: E402
 from hdems.models.paper_flow import flow_from_cost, multiscale_cost_volume  # noqa: E402
-from hdems.seg_features import event_pixel_mask                 # noqa: E402
+from hdems.seg_features import score_pixel_mask                 # noqa: E402
 
 
 def auc_above(a: np.ndarray, b: np.ndarray, sample: int = 600) -> float:
@@ -119,8 +118,9 @@ def main() -> None:
             cost = multiscale_cost_volume(fields, model.matcher.M, model.match_scales)
             flow = flow_from_cost(cost, model.matcher.M, alpha=model.flow_alpha,
                                   vel_scale=model.vel_scale, smooth=model.flow_smooth)
-            events_t = event_pixel_mask(surface)
-            residual, _ = ego_residual(flow, iters=model.ego_iters, valid=events_t)
+            # scored pixels = events near the label time (as in training / eval)
+            events_t = score_pixel_mask(sample, surface)
+            residual, _ = model.residual_from_flow(flow, surface)
 
         events = events_t[0].cpu().numpy()
         flow_mag = flow.norm(dim=1)[0].cpu().numpy()

@@ -17,18 +17,24 @@ set -eo pipefail   # stop immediately if fit fails, so eval never runs on a stal
 # ---------------------------------------------------------------------------
 # PARAMETERS  (edit these; everything below is derived from them)
 # ---------------------------------------------------------------------------
-EV_FEATURE=phi         # phi | f                (event HV: Phi neighbourhood field, or descriptor F0)
+HEAD=mfcnn             # mfcnn | cnn | prototype | ridge | motion
+                       #   mfcnn = motion-first: velocity code Mv + 6 motion channels, and only
+                       #           8 appearance channels (dropped at random while training)
+                       #   cnn   = HV-channels CNN on the fused X/Mv feature (EV_COMBINE)
+EV_FEATURE=f           # phi | f                (event HV: Phi neighbourhood field, or descriptor F0)
 AX_COMBINE=bind        # bind | bundle          (combine Vx,Vy)
 EV_COMBINE=concat      # bind | bundle | bindbundle | concat   (combine event HV X with velocity Mv)
-                       #   bindbundle = (X^ o Mv) + Mv
-HEAD=cnn               # cnn | prototype | ridge | motion
+                       #   bindbundle = (X^ o Mv) + Mv.   NOT used by HEAD=mfcnn
 LABEL_MODE=motion      # motion = moving vs background (Option A)
                        # objects = per-object id        (Option B)
 DETECT=yes             # yes | no  -> also report object detection (boxes from instances)
+ABLATION=yes           # yes | no  -> eval also runs without motion / without appearance and
+                       #   prints a verdict: a motion segmenter must collapse without motion
 RES_RATIO=1            # 1 = full 480x640 | 2 = half 240x320 | 4 = quarter 120x160
                        #   kernel N, search M and Eq.12 pooling scale with it (~ratio^4 cheaper)
-SAMPLES=300            # max train frames   (2,495 usable after the motion-label fix)
-VAL_SAMPLES=150        # val frames used to pick the best epoch / alpha
+SAMPLES=300            # max train frames   (~1,990 frames with a mover once scene9 is held out)
+VAL_SAMPLES=150        # val frames used to pick the best epoch / alpha -- from the HELD-OUT
+                       #   train scene (dataset.val_scenes: scene9), never the eval set
 TEST_SAMPLES=50        # max eval panels saved
 PANELS=movers          # which eval frames get figures (scores always use ALL frames):
                        #   movers = only frames with a visible moving object (see object colours)
@@ -48,7 +54,9 @@ source "${VENV}"
 cd "${CODE_DIR}"
 
 # Derived names -------------------------------------------------------------
-RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_COMBINE}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}"
+EV_TAG="${EV_COMBINE}"
+if [ "${HEAD}" = "mfcnn" ]; then EV_TAG="split"; fi   # mfcnn does not fuse X and Mv
+RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_TAG}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}"
 CKPT="checkpoints/${RUN_NAME}.pt"
 RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${RESULTS_DIR}"
@@ -73,9 +81,10 @@ printf '  %-16s %s\n' \
   HEAD         "${HEAD}" \
   EV_FEATURE   "${EV_FEATURE}" \
   AX_COMBINE   "${AX_COMBINE}" \
-  EV_COMBINE   "${EV_COMBINE}" \
+  EV_COMBINE   "${EV_COMBINE}$( [ "${HEAD}" = "mfcnn" ] && echo '  (not used by mfcnn)')" \
   LABEL_MODE   "${LABEL_MODE}" \
   DETECT       "${DETECT}" \
+  ABLATION     "${ABLATION}  (eval without motion / appearance)" \
   RES_RATIO    "${RES_RATIO}  (1 full, 2 half, 4 quarter)" \
   SAMPLES      "${SAMPLES}  (train frames)" \
   VAL_SAMPLES  "${VAL_SAMPLES}  (val frames)" \
@@ -138,10 +147,14 @@ python scripts/fit_ridge_head.py --config "${CONFIG}" \
 # --detect adds box-level detection metrics (instances -> boxes) on top of segmentation
 DETECT_FLAG=""
 if [ "${DETECT}" = "yes" ]; then DETECT_FLAG="--detect"; fi
+# --ablation-check re-predicts every frame without motion and without appearance
+# (the head is cheap and the flow comes from the cache, so it adds little time)
+ABLATION_FLAG=""
+if [ "${ABLATION}" = "yes" ]; then ABLATION_FLAG="--ablation-check"; fi
 
 echo ">>> [$(date +%T)] evaluating -> ${RESULTS_DIR}/eval_images"
 python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
-  --checkpoint "${CKPT}" ${DETECT_FLAG} \
+  --checkpoint "${CKPT}" ${DETECT_FLAG} ${ABLATION_FLAG} \
   --device cuda --save-images "${RESULTS_DIR}/eval_images" \
   --color-events "${RESULTS_DIR}/event_colours" \
   --panels "${PANELS}" --max-images "${TEST_SAMPLES}"
