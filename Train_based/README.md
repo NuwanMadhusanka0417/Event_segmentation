@@ -404,6 +404,47 @@ motion grouping, one colour each** | the same grouping on the ground-truth movin
 pixels (best case) | ground-truth objects. Everything is drawn **only at event
 pixels** — the rest is untrained guesswork.
 
+## Training-free back end: VSA grouping (`MODE=vsa_group`)
+
+No CNN, no ego-motion fit, no RANSAC, nothing trained (`hdems/vsa_grouping.py`). Every
+event pixel of the reference surface becomes one hypervector binding where it is to
+how it moves, on the RAW flow and with fixed scales:
+
+    H(p) = P(x, y) ⊙ V(u, v)      Re<H_i, H_j>/d ≈ exp(-Δpos²/2σs²) · exp(-Δvel²/2σv²)
+
+1. **kernel k-means** in hypervector space (assign ↔ re-bundle). A bundled prototype
+   stores a position → velocity lookup, so one cluster can hold a smoothly varying
+   motion field. Clusters whose velocities form two clearly separate groups are then
+   **split**: k-means can settle on a mixed object + background cluster, which would
+   otherwise bridge the object into the background during merging.
+2. **merge by motion continuity**: neighbouring clusters are one surface when local
+   affine motion fits on both sides of their border agree at the same point.
+   Whole-prototype similarity cannot do this (two halves of a large background share
+   almost no nearby pixels), and plain means across a border fail on rotation.
+3. **background** = the cluster most similar to the previous frame's background
+   prototype (kept per sequence; `seq_id` / `frame_index` are in every sample), else
+   the border rule. Clusters that move like the background near them join it.
+4. majority-filter the labels; objects 1..K by size.
+
+```bash
+python scripts/tune_vsa_grouping.py --split holdout --resolution-ratio 2 --device cuda
+python -m hdems.eval --vsa-group --resolution-ratio 2 --detect --color-events out/vsa --panels movers
+python -m hdems.eval --threshold-baseline --resolution-ratio 2      # no-CNN baseline
+```
+
+Tuning runs on the held-out validation scene only and writes
+`configs/vsa_grouping_tuned.yaml`, which eval merges automatically. All back ends
+also report **hull IoU** (the model-fitting papers' dense convex-hull protocol,
+approximated) and the decision time per frame. `run_segmentation.pbs`: `MODE=train |
+vsa_group | threshold`, `TUNE=yes`.
+
+**Measured so far (validation scene, ratio 2, before tuning):** the continuity merge
+does not separate cleanly on real flow. The Eq. 12 pooling (71 px) blurs an object's
+motion into the background, so with no border gap object/background borders merge
+almost as often as background/background ones (48% vs 64% at 0.5 px). A 36 px gap
+stops object borders merging (1.3% at 1.0 px) but leaves the background in 20-46
+pieces. See `docs/vsa_grouping_results.md`.
+
 ## Notes
 
 - EVIMO2 masks cover every tracked surface, including the static table — see

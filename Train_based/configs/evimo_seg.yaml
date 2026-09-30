@@ -101,6 +101,34 @@ grouping:                # ONE COLOUR PER MOVING OBJECT (eval + event-colour fig
   #                        window), else it is background the CNN marked by mistake
   ransac_iters: 300
 
+vsa_grouping:            # TRAINING-FREE back end (hdems/vsa_grouping.py; eval --vsa-group):
+  #                        every event pixel -> H = P(x,y) ⊙ V(u,v) on the RAW flow, kernel
+  #                        k-means in HV space, merge clusters whose motion is continuous
+  #                        across their border, background = cluster most like the previous
+  #                        frame's background. No ego fit, no CNN, no RANSAC.
+  #                        Pixel / velocity values are FULL-resolution (divided by the ratio).
+  sigma_s_px: 30.0       # position kernel width
+  sigma_v_px: 0.5        # velocity kernel width (px per 12.5 ms interval)
+  k_init: 24             # initial prototypes (over-segment, then merge)
+  iters: 10              # assign / re-bundle iterations
+  max_pixels: 60000      # k-means runs on at most this many event pixels; all are assigned
+  adjacency_px: 6        # clusters closer than this are neighbours
+  merge_band_px: 8       # continuity test: window reach on each side of a shared border
+  merge_gap_px: 0        # skipped zone next to the border (Eq.12 pooling blurs the flow there)
+  merge_vel_px: 0.5      # merge if the two sides' local motion fits differ by less than this
+  min_object_px: 160     # smaller clusters are not objects
+  min_motion_px: 0.25    # an object must move this much relative to the background near it
+  background: temporal   # temporal (previous frame's background prototype) | border | extent
+  bg_min_sim: 0.3        # temporal prior accepted only above this similarity
+  bg_fallback: border    # used for the first frame of a sequence: border | extent
+  smooth_labels_px: 5    # majority filter window in WORKING px (0 = off)
+  flow_smooth_px: null   # Eq.12 pooling for THIS path only (null = matching.smooth)
+  use_confidence: false  # weight pixels by the Σ P² match confidence (a weak cue, measured)
+  seed: 0
+  baseline_threshold_px: 0.5   # --threshold-baseline: |ego residual| above this = moving
+  #                              scripts/tune_vsa_grouping.py tunes all of these on the
+  #                              held-out validation scene and writes vsa_grouping_tuned.yaml
+
 train:
   task: segmentation
   batch_size: 1

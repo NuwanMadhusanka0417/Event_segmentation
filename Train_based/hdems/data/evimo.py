@@ -149,7 +149,7 @@ class EVIMODataset(Dataset):
         moving, ambiguous = frame_motion(seq_dir, frame_idx, self.motion_params, meta)
         # moving objects that move TOGETHER are one object (independent motion)
         rigid = rigid_groups(meta, frame_idx, moving) if moving else {}
-        return self._apply_labels(
+        sample = self._apply_labels(
             load_frame_sample(
                 seq_dir,
                 frame,
@@ -164,6 +164,11 @@ class EVIMODataset(Dataset):
             ambiguous=ambiguous,
             rigid=rigid,
         )
+        # which recording and which frame: lets per-sequence state (the VSA grouping's
+        # background prior) follow time, although the index interleaves sequences
+        sample["seq_id"] = seq_dir.name
+        sample["frame_index"] = int(frame_idx)
+        return sample
 
     def _apply_labels(
         self,

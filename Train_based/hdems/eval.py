@@ -11,7 +11,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
-from hdems.config import apply_resolution_ratio, restore_frontend
+from hdems.config import apply_resolution_ratio, resolution_ratio_of, restore_frontend
 from hdems.data.build import build_dataset as _build_dataset
 from hdems.losses.flow import epe_loss
 from hdems.losses.seg import seg_loss
@@ -22,12 +22,15 @@ from hdems.grouping import GroupingParams, group_objects
 from hdems.grouping import params_from_config as grouping_params
 from hdems.visualize import save_event_colour_figure
 from hdems.detection import detection_metrics, masks_to_boxes
-from hdems.instances import binary_iou, connected_components, instance_metrics
+from hdems.instances import binary_iou, connected_components, hull_iou, instance_metrics
 from hdems.models.hdems import ABLATIONS, HDEMS
 from hdems.vsa.velocity import EVENT_COMBINES
-from hdems.seg_features import score_pixel_mask
+from hdems.vsa_grouping import BackgroundPrior, VSAGroupingParams, vsa_group_objects
+from hdems.vsa_grouping import params_from_config as vsa_grouping_params
+from hdems.seg_features import event_pixel_mask, score_pixel_mask
 
 HEADS = ("cnn", "mfcnn", "mfunet", "ridge", "prototype", "motion")
+BACK_ENDS = ("head", "vsa_group", "threshold")
 
 
 def load_config(path: str | Path) -> dict:
@@ -166,6 +169,9 @@ def evaluate_segmentation(
     grouping: GroupingParams | None = None,
     panel_indices: set[int] | None = None,
     ablation: bool = False,
+    back_end: str = "head",
+    vsa_params: VSAGroupingParams | None = None,
+    threshold: float | None = None,
 ) -> dict[str, float]:
     """``grouping``: split the CNN's moving pixels into OBJECTS by motion model
     (hdems.grouping) -- one colour per object -- instead of connected components.
@@ -173,7 +179,16 @@ def evaluate_segmentation(
     ``ablation``: also predict every frame with the motion input removed and with
     the appearance input removed (HDEMS.ablate) and report how much that changes
     -- a head whose output barely changes without motion is not segmenting motion.
+
+    ``back_end`` -- what decides moving vs static and which object:
+      head       the trained head (+ ``grouping``), the default
+      vsa_group  training-free: hdems.vsa_grouping on the raw flow (no CNN, no ego
+                 fit, no RANSAC); needs ``vsa_params``
+      threshold  no-CNN baseline: |ego residual| > ``threshold`` (working px), then
+                 ``grouping`` for the objects
     """
+    if back_end not in BACK_ENDS:
+        raise ValueError(f"back_end must be one of {BACK_ENDS}, got {back_end!r}")
     model.eval()
     ious: list[float] = []
     total_loss = 0.0
@@ -183,8 +198,15 @@ def evaluate_segmentation(
     inst_scores: list[dict] = []       # motion mode: instance matching
     oracle_scores: list[dict] = []     # grouping on the GT moving pixels (best case)
     det_scores: list[dict] = []        # object detection: box matching
-    ablation = ablation and not events_only_baseline
+    hull_scores: list[float] = []      # papers' metric: convex-hull IoU, frames with objects
+    backend_ms: list[float] = []       # decision time per frame, flow excluded (cached)
+    ablation = ablation and not events_only_baseline and back_end == "head"
     abl = {w: {"fg": [], "changed": 0, "px": 0} for w in ABLATIONS}
+    prior = BackgroundPrior() if back_end == "vsa_group" else None
+    pred_title, obj_title = {
+        "vsa_group": ("VSA grouping: moving (red)", "OBJECTS: VSA grouping"),
+        "threshold": ("|residual| threshold: moving (red)", "OBJECTS: threshold + RANSAC grouping"),
+    }.get(back_end, (None, None))
     # index of the surface that ends at the label time (time_frames entry 1.0)
     base = loader.dataset.dataset if isinstance(loader.dataset, Subset) else loader.dataset
     tf = getattr(base, "time_frames", None)
@@ -205,16 +227,34 @@ def evaluate_segmentation(
         events_t = score_pixel_mask(batch, surface)
         valid = events_t & (mask >= 0) & (mask != IGNORE_LABEL)
         flow = None
+        vsa_objects = None
+        t0 = time.perf_counter()
         if events_only_baseline:
             # Control: call EVERY event pixel "moving". It never looks at the model,
             # so the front end is skipped entirely (no loss is reported).
             pred = events_t.long()
+        elif back_end == "vsa_group":
+            flow, conf = model.compute_motion(surface)
+            t0 = time.perf_counter()                         # time the back end only
+            seq = batch["seq_id"][0] if "seq_id" in batch else None
+            fi = int(batch["frame_index"][0]) if "frame_index" in batch else None
+            vsa_objects, _ = vsa_group_objects(
+                flow[0], event_pixel_mask(surface[:, :1])[0], model, vsa_params,
+                conf=conf[0, 0], prior=prior, seq_id=seq, frame_index=fi)
+            pred = torch.from_numpy(vsa_objects > 0).long().unsqueeze(0).to(device)
+        elif back_end == "threshold":
+            flow = model.compute_flow(surface)
+            t0 = time.perf_counter()
+            res, _ = model.residual_from_flow(flow, surface)
+            pred = ((res.norm(dim=1) > threshold) & event_pixel_mask(surface[:, :1])).long()
         else:
             out_m = model(surface, task="segmentation")
             logits, flow = out_m["seg_logits"], out_m.get("flow")
             if valid.any():
                 total_loss += seg_loss(logits, mask.masked_fill(~valid, IGNORE_LABEL)).item()
             pred = logits.argmax(dim=1)
+        if not events_only_baseline:
+            backend_ms.append((time.perf_counter() - t0) * 1000.0)
         ious.append(mean_iou(pred[0], mask[0], num_classes, valid=valid[0]))
 
         objects = objects_gt_mask = gt_inst = None
@@ -233,20 +273,25 @@ def evaluate_segmentation(
             elif batch.get("gt_moving", batch.get("gt_raw")) is not None:
                 gt_inst = batch.get("gt_moving", batch.get("gt_raw"))[0].cpu().numpy().astype(np.int64) // 1000
             if grouping is not None and flow is not None:
-                # objects = the CNN's moving pixels grouped by motion model (the same
-                # ego-compensated velocity the head saw)
+                # objects = the moving pixels grouped by motion model (the same
+                # ego-compensated velocity the head saw); vsa_group has its own objects
                 res, _ = model.residual_from_flow(flow, surface)
                 res = res[0].cpu().numpy()
-                objects = group_objects(res, pred_fg & ev, grouping)
+                objects = (vsa_objects if vsa_objects is not None
+                           else group_objects(res, pred_fg & ev, grouping))
                 if gt_inst is not None and ((gt_inst > 0) & ev).any():
                     objects_gt_mask = group_objects(res, (gt_inst > 0) & ev, grouping)
                     oracle_scores.append(instance_metrics(objects_gt_mask, gt_inst, valid=v))
                 pred_inst = objects
+            elif vsa_objects is not None:
+                pred_inst = objects = vsa_objects
             else:
                 pred_inst = connected_components(np.logical_and(pred_fg, v),
                                                  min_size=min_instance)
             if gt_inst is not None:
                 inst_scores.append(instance_metrics(pred_inst, gt_inst, valid=v))
+                if (gt_inst > 0).any():
+                    hull_scores.append(hull_iou(pred_inst, gt_inst))
                 if detect:                       # boxes = extent of each instance
                     det_scores.append(detection_metrics(
                         masks_to_boxes(pred_inst, min_area=min_instance),
@@ -287,6 +332,7 @@ def evaluate_segmentation(
                     objects=objects, objects_gt_mask=objects_gt_mask, gt_objects=gt_inst,
                     gt_slow=(batch["gt_slow"][0] if "gt_slow" in batch else None),
                     min_instance=min_instance,
+                    pred_title=pred_title, objects_title=obj_title,
                 )
             saved += 1
         n += 1
@@ -321,6 +367,10 @@ def evaluate_segmentation(
         if oracle_scores:
             out["oracle_instance_miou"] = float(np.nanmean([s["instance_miou"] for s in oracle_scores]))
             out["oracle_mean_pred_instances"] = float(np.mean([s["n_pred"] for s in oracle_scores]))
+        if hull_scores:
+            out["hull_iou"] = float(np.nanmean(hull_scores))
+    if backend_ms:
+        out["backend_ms"] = float(np.mean(backend_ms))
     if ablation:
         for what, a in abl.items():
             fin = [v for v in a["fg"] if v == v]
@@ -420,9 +470,42 @@ def main() -> None:
                         help="Also predict every frame without the motion input and without "
                              "the appearance input, and report how much each changes the "
                              "result. A motion segmenter must collapse without motion.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--vsa-group", action="store_true",
+                      help="TRAINING-FREE back end: cluster event pixels in hypervector space "
+                           "(hdems/vsa_grouping.py). No CNN, no checkpoint, no ego fit.")
+    mode.add_argument("--threshold-baseline", action="store_true",
+                      help="No-CNN BASELINE: |ego residual| > vsa_grouping.baseline_threshold_px "
+                           "= moving, then RANSAC grouping. No checkpoint.")
+    parser.add_argument("--vsa-params", type=str, default=None,
+                        help="YAML with tuned vsa_grouping values (scripts/tune_vsa_grouping.py). "
+                             "Default: configs/vsa_grouping_tuned.yaml if it exists.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    back_end = "vsa_group" if args.vsa_group else "threshold" if args.threshold_baseline else "head"
+    if back_end != "head":
+        # tuned values (validation split only) override the YAML defaults
+        tuned = Path(args.vsa_params) if args.vsa_params else Path(args.config).with_name(
+            "vsa_grouping_tuned.yaml")
+        if tuned.exists():
+            cfg["vsa_grouping"] = {**(cfg.get("vsa_grouping") or {}),
+                                   **(load_config(tuned).get("vsa_grouping") or {})}
+            print(f"[eval] tuned vsa_grouping values from {tuned}")
+        elif args.vsa_params:
+            raise SystemExit(f"--vsa-params {tuned} not found")
+        smooth = (cfg.get("vsa_grouping") or {}).get("flow_smooth_px")
+        if back_end == "vsa_group" and smooth:
+            # Eq.12 pooling for THIS path only (full-res; the ratio divides it below).
+            # The flow cache keys on it, so a separate cache directory is used.
+            cfg["matching"] = {**cfg.get("matching", {}), "smooth": int(smooth)}
+            print(f"[eval] vsa_grouping.flow_smooth_px: matching.smooth -> {smooth} (full res)")
+        mode_flag = "--vsa-group" if back_end == "vsa_group" else "--threshold-baseline"
+        for flag, bad in (("--checkpoint", args.checkpoint), ("--ablation-check", args.ablation_check)):
+            if bad:
+                print(f"[eval] {flag} is ignored with {mode_flag}")
+        args.checkpoint = args.ridge_checkpoint = args.prototype_checkpoint = None
+        args.ablation_check = False
     if args.label_mode:
         cfg["dataset"] = {**cfg.get("dataset", {}), "label_mode": args.label_mode}
     if args.axis_combine or args.event_combine or args.event_feature:   # CLI overrides config
@@ -513,7 +596,7 @@ def main() -> None:
                 ckpt = torch.load(cpath, map_location=device, weights_only=True)
                 state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
                 model.load_state_dict(state, strict=False)
-            elif task == "segmentation":
+            elif task == "segmentation" and back_end == "head":
                 raise SystemExit(f"a checkpoint is required for head={head_name!r} "
                                  "(an untrained head would give meaningless results)")
         return model
@@ -572,7 +655,19 @@ def main() -> None:
                   f"{ridge_ms:12.2f} {ridge.seg_head_param_count():12,}")
             return
 
-        model = build_model(head)
+        # the no-CNN back ends only use the front end (flow): the head is never called
+        model = build_model(head if back_end == "head" else "cnn")
+        vsa_params = vsa_grouping_params(cfg) if back_end == "vsa_group" else None
+        thr = None
+        if back_end == "threshold":
+            thr_full = float((cfg.get("vsa_grouping") or {}).get("baseline_threshold_px", 0.5))
+            thr = thr_full / resolution_ratio_of(cfg)
+            print(f"[eval] threshold baseline: |residual| > {thr_full} px (full res) = moving")
+        if vsa_params is not None:
+            print(f"[eval] VSA grouping (working units): {vsa_params}")
+            if model.label_t != 0:
+                print("[eval] WARNING: the reference surface does not end at the label time "
+                      "(dataset.time_frames should be [1.0, 0.75, 0.5, 0.0])")
         rk = {}
         if head == "ridge" and (args.ridge_checkpoint or seg_cfg.get("ridge_weights")):
             rpath = args.ridge_checkpoint or seg_cfg.get("ridge_weights")
@@ -601,25 +696,40 @@ def main() -> None:
             panel_indices=(choose_panels(dataset, args.panels, args.max_images)
                            if (save_dir is not None or args.color_events) else None),
             ablation=args.ablation_check,
+            back_end=back_end, vsa_params=vsa_params, threshold=thr,
         )
         if model.flow_cache is not None:
             print(model.flow_cache.summary())
-        # The control never runs the model, so its latency would be meaningless.
-        ms = float("nan") if (args.events_only_baseline or args.skip_latency) else measure_seg_latency(
+        # The control never runs the model, and the no-CNN back ends never call the head,
+        # so a head latency would be meaningless for them.
+        skip = args.events_only_baseline or args.skip_latency or back_end != "head"
+        ms = float("nan") if skip else measure_seg_latency(
             model, dataset[0]["surface"].unsqueeze(0), device)
-        title = "EVENTS-ONLY BASELINE (control)" if args.events_only_baseline else f"Head: {head}"
-        print(f"{title}  label_mode: {label_mode}  event_feature: {model.event_feature}  "
-              f"axis_combine: {model.axis_combine}  event_combine: {model.event_combine}")
+        if args.events_only_baseline:
+            title = "EVENTS-ONLY BASELINE (control)"
+        elif back_end == "vsa_group":
+            title = "VSA GROUPING (training-free: no CNN, no ego fit, no RANSAC)"
+        elif back_end == "threshold":
+            title = "THRESHOLD BASELINE (no CNN: |ego residual| > threshold, RANSAC grouping)"
+        else:
+            title = f"Head: {head}"
+        print(f"{title}  label_mode: {label_mode}")
+        if back_end == "head" and not args.events_only_baseline:
+            print(f"event_feature: {model.event_feature}  axis_combine: {model.axis_combine}  "
+                  f"event_combine: {model.event_combine}")
         if label_mode in ("motion", "tracked"):
             # Headline: foreground IoU. mIoU averages in the easy static class and
             # stays near 0.5 even for a model that predicts "static" everywhere.
             print(f"FG IoU (moving vs rest) [HEADLINE]: {metrics.get('fg_iou', float('nan')):.4f}")
-        if not args.events_only_baseline:
+            if "hull_iou" in metrics:
+                print(f"Hull IoU (papers' dense-mask protocol, approx.): {metrics['hull_iou']:.4f}")
+        if not args.events_only_baseline and back_end == "head":
             print(f"Seg loss: {metrics['loss']:.4f}")
         print(f"mIoU:     {metrics['miou']:.4f}   (secondary — see FG IoU)")
         if label_mode in ("motion", "tracked"):
             if "instance_miou" in metrics:
-                src = "motion grouping" if not args.events_only_baseline else "connected pieces"
+                src = ("connected pieces" if args.events_only_baseline
+                       else "VSA grouping" if back_end == "vsa_group" else "motion grouping")
                 print(f"--- OBJECTS ({src}), over {metrics.get('frames_with_objects', 0)} frames "
                       f"that contain a moving object ---")
                 print(f"Object mIoU (matched):        {metrics['instance_miou']:.4f}")
@@ -658,9 +768,15 @@ def main() -> None:
             else:
                 verdict = f"PARTLY uses motion -- removing it costs {drop:.0%} of the FG IoU"
             print(f"Verdict: {verdict}")
-        print(f"Latency:  {ms:.2f} ms/frame ({device})")
-        print(f"Head params: {model.seg_head_param_count():,}  "
-              f"(trainable total: {model.num_trainable_params:,})")
+        if "backend_ms" in metrics:
+            print(f"Decision time: {metrics['backend_ms']:.1f} ms/frame after the flow "
+                  f"({device}; flow from the cache when available)")
+        if back_end == "head":
+            print(f"Latency:  {ms:.2f} ms/frame ({device})")
+            print(f"Head params: {model.seg_head_param_count():,}  "
+                  f"(trainable total: {model.num_trainable_params:,})")
+        else:
+            print("Trained parameters: 0")
     except FileNotFoundError as e:
         print(f"Dataset not ready: {e}")
 

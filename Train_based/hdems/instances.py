@@ -108,6 +108,46 @@ def instance_metrics(
     }
 
 
+def _hull_mask(mask: np.ndarray) -> np.ndarray:
+    """Filled convex hull of a mask's pixels (the mask itself if it is degenerate)."""
+    ys, xs = np.nonzero(mask)
+    if ys.size < 3:
+        return mask.copy()
+    from matplotlib.path import Path
+    from scipy.spatial import ConvexHull
+    pts = np.stack([xs, ys], 1).astype(np.float64)
+    try:
+        hull = ConvexHull(pts)
+    except Exception:                                 # collinear pixels (QhullError)
+        return mask.copy()
+    y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+    gy, gx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+    inside = Path(pts[hull.vertices]).contains_points(np.stack([gx.ravel(), gy.ravel()], 1))
+    out = mask.copy()
+    out[y0:y1 + 1, x0:x1 + 1] |= inside.reshape(gy.shape)
+    return out
+
+
+def hull_iou(pred_inst: np.ndarray, gt_inst: np.ndarray, *, min_px: int = 3) -> float:
+    """Foreground IoU of DENSE object masks, as the model-fitting papers score it
+    (EMSGC, cascaded two-level fitting): every object -- predicted or ground truth --
+    is filled to its convex hull, and the union of predicted hulls is compared with
+    the union of GT hulls over the whole image. An approximation of their protocol;
+    sparse per-event IoU (binary_iou) and this number are not interchangeable.
+    NaN when neither side has an object.
+    """
+    def union_of_hulls(inst):
+        out = np.zeros(inst.shape, dtype=bool)
+        for i in np.unique(inst):
+            m = inst == i
+            if i > 0 and m.sum() >= min_px:
+                out |= _hull_mask(m)
+        return out
+    p, g = union_of_hulls(pred_inst), union_of_hulls(gt_inst)
+    union = int((p | g).sum())
+    return float("nan") if union == 0 else int((p & g).sum()) / union
+
+
 def binary_iou(pred_fg: np.ndarray, gt_fg: np.ndarray,
                valid: np.ndarray | None = None) -> float:
     """Foreground (moving-object) IoU — the headline number for Option A."""

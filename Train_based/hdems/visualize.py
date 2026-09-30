@@ -82,6 +82,8 @@ def save_event_colour_figure(
     gt_objects=None,
     gt_slow=None,
     min_instance: int = 50,
+    pred_title: str | None = None,
+    objects_title: str | None = None,
 ) -> np.ndarray:
     """Write the events / moving / objects / ground-truth figure; returns the object map.
 
@@ -89,6 +91,8 @@ def save_event_colour_figure(
     objects_gt_mask  the same grouping on the GROUND-TRUTH moving pixels -- the best
                      the grouping can do; the gap to ``objects`` is the CNN's share
     gt_objects       ground-truth independently moving objects (rigid parts merged)
+    pred_title / objects_title  panel titles when the decision is not the CNN's
+                     (e.g. the training-free VSA grouping)
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -101,11 +105,11 @@ def save_event_colour_figure(
         obj_title = f"connected pieces ({_count(instances)})"
     else:
         instances = _as_numpy(objects).astype(np.int64)
-        obj_title = f"OBJECTS: CNN + motion grouping ({_count(instances)})"
+        obj_title = f"{objects_title or 'OBJECTS: CNN + motion grouping'} ({_count(instances)})"
 
     panels = [
         (event_image(surface), "events", dict(cmap="gray")),
-        (colour_binary(moving, events), "CNN: moving (red)", {}),
+        (colour_binary(moving, events), pred_title or "CNN: moving (red)", {}),
         (colour_instances(instances, events), obj_title, {}),
     ]
     if objects_gt_mask is not None:
