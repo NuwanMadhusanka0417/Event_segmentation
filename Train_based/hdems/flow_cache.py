@@ -18,9 +18,9 @@ Keys (content-addressed, so it can never serve stale flow)
   surface key   = hash of the multi-time surface tensor itself (so window,
                   decay, time_frames and resolution are covered implicitly).
 
-Change any of those and the lookup misses and recomputes. Flow is stored as fp16
-(2 x H x W, ~1.2 MB per frame at 480x640) and ALWAYS returned via the same fp16
-round trip, so a cache hit and a cache miss give bit-identical flow.
+Change any of those and the lookup misses and recomputes. Flow + match confidence
+are stored as fp16 (3 x H x W, ~1.8 MB per frame at 480x640) and ALWAYS returned via
+the same fp16 round trip, so a cache hit and a cache miss give bit-identical flow.
 """
 
 from __future__ import annotations
@@ -35,7 +35,8 @@ from typing import Any
 import torch
 
 # Bump when the flow computation itself changes (cost volume / estimator code).
-FLOW_CACHE_VERSION = 2      # 2: zero-padded cost volume (was circular torch.roll)
+FLOW_CACHE_VERSION = 3      # 2: zero-padded cost volume (was circular torch.roll)
+#                             3: stores [u, v, match confidence] (was [u, v])
 
 
 def _sha1_tensor(t: torch.Tensor) -> str:

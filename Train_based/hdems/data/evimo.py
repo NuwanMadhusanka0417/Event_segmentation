@@ -19,6 +19,26 @@ from hdems.data.labels import to_labels
 from hdems.data.motion_labels import MotionParams, frame_motion, rigid_groups
 
 
+FLIPS = ((), (-1,), (-2,), (-2, -1))      # none | horizontal | vertical | 180-degree rotation
+
+
+def flip_sample(sample: dict[str, Any], dims: tuple[int, ...]) -> dict[str, Any]:
+    """Flip every image-shaped tensor of a sample (surfaces, labels, masks, GT maps).
+
+    The INPUT surfaces are flipped, not the computed flow: the front end then measures
+    the flow of the mirrored scene, so the velocity is mirrored with the image by
+    construction (a horizontal flip negates vx). Flipping the flow afterwards would
+    not work for the appearance input -- the VSA descriptor of a mirrored surface is
+    not the mirrored descriptor, because the random kernel D is not symmetric.
+    """
+    if not dims:
+        return sample
+    hw = tuple(sample["mask"].shape[-2:])
+    return {k: (torch.flip(v, dims) if isinstance(v, torch.Tensor) and v.dim() >= 2
+                and tuple(v.shape[-2:]) == hw else v)
+            for k, v in sample.items()}
+
+
 class EVIMODataset(Dataset):
     """EVIMO2 segmentation dataset.
 
@@ -56,6 +76,7 @@ class EVIMODataset(Dataset):
         min_moving_px: int = 100,
         score_window_ms: float | None = None,
         use_shards: bool = False,
+        augment: bool = False,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -70,6 +91,9 @@ class EVIMODataset(Dataset):
         self.boundary_ignore_px = int(boundary_ignore_px)
         self.min_moving_px = int(min_moving_px)
         self.score_window_s = (float(score_window_ms) / 1000.0) if score_window_ms else None
+        # random flip / 180-degree rotation per sample (training only): 3 training
+        # scenes are little data, and mirrored motion is still valid motion
+        self.augment = bool(augment)
 
         # Pre-built .pt shards bypass EVERY index filter (scene-disjoint split, held-out
         # validation scenes, require_mover, rigid groups) and freeze the time frames,
@@ -98,6 +122,12 @@ class EVIMODataset(Dataset):
         return len(self.cached) if self.cached else len(self.index)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        sample = self._load(idx)
+        if self.augment:
+            sample = flip_sample(sample, FLIPS[int(torch.randint(len(FLIPS), (1,)))])
+        return sample
+
+    def _load(self, idx: int) -> dict[str, Any]:
         if not self.cached and not self.index:
             raise FileNotFoundError(
                 f"No EVIMO2 samples under {self.root / self.split}. "

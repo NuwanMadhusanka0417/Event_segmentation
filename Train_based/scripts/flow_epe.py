@@ -83,7 +83,7 @@ def evaluate_split(model: HDEMS, cfg: dict, split: str, n_frames: int, device) -
         H, W = s.shape[-2:]
         g = g_full[:, ::r, ::r][:, :H, :W] / r                    # to working resolution
         with torch.no_grad():
-            flow = model._flow_uncached(s)[0].cpu().numpy()
+            flow = model._flow_uncached(s)[0, :2].cpu().numpy()     # [u, v] (drop confidence)
         # events of the REFERENCE surface: the flow is measured from it (and the GT
         # flow is taken at its time); pixels with only older events have no flow
         ev = event_pixel_mask(s[:, :1])[0].cpu().numpy()

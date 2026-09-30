@@ -111,6 +111,11 @@ train:
   num_workers: 8
   use_dice: true          # add Dice to CE (background/foreground imbalance)
   max_val_samples: 150    # hdems.train only (the PBS passes --max-val-samples)
+  augment_flip: true      # each training sample randomly as-is / mirrored left-right /
+  #                        upside-down / rotated 180 deg. The event surfaces are flipped
+  #                        BEFORE the front end, so the flow is re-measured and the
+  #                        velocity mirrors with the image. The flow cache stores up to 4
+  #                        versions per frame (first epochs slower, ~4x cache disk).
   # max_samples: 100      # optional: train on first N frames (or CLI --max-samples)
 
 eval:
@@ -137,8 +142,9 @@ velocity:
   #                        (not used by head mfcnn: X and Mv go into separate branches)
 
 segmentation:
-  head: mfcnn            # mfcnn (motion-first CNN, trained) | cnn (HV-channels CNN on the fused
-  #                        X/Mv feature) | prototype | ridge | motion
+  head: mfunet           # mfunet (motion-first U-Net: wide view + event density + flow
+  #                        confidence) | mfcnn (motion-first, 5x5 view) | cnn (HV-channels CNN
+  #                        on the fused X/Mv feature) | prototype | ridge | motion
   #                      all -> scripts/fit_ridge_head.py (run_segmentation.pbs)
   num_classes: 32        # used by label_mode=objects/remap; motion forces 2
   embedding_dim: 32
@@ -146,6 +152,8 @@ segmentation:
   mf_app_dim: 8          # mfcnn: appearance channels (1x1 projection of unit-RMS X); 0 = none
   mf_app_dropout: 0.5    # mfcnn: while training, drop ALL appearance channels of a sample with
   #                        this probability, so the head must also work from motion alone
+  #                        (mfunet: the event-density channel is dropped with them)
+  mf_widths: [32, 64, 96, 128]   # mfunet: channels at 1, 1/2, 1/4, 1/8 resolution (~1M params)
   ctx_dim: 32            # motion head: compressed HV context channels
   flow_beta: 1.0         # motion head: soft-argmax temperature for Phi->velocity
   ego_iters: 3           # motion head: IRLS passes for global-motion fit

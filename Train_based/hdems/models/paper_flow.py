@@ -119,11 +119,21 @@ def flow_from_cost(
     alpha: float = 0.3,
     vel_scale: float = 1.0,
     smooth: int = 1,
-) -> torch.Tensor:
+    *,
+    return_confidence: bool = False,
+):
     """Probability-volume optical-flow estimator (Eq. 12-14), parameter-free.
 
     C : (B, M, M, H, W)   final cost volume
     -> flow (B, 2, H, W) as [u_x, u_y], expected displacement over the MxM grid.
+
+    ``return_confidence``: also return (B, 1, H, W) = sum of P^2, how concentrated the
+    Eq.12 probability volume is: 1 = one displacement, 1/K = K equally likely ones
+    (e.g. along an edge), 0 = a flat cost volume. Measured against GT flow on 12
+    EVIMO2 frames (2026-09-30), it is only a WEAK error predictor (Spearman +0.27
+    with -EPE; the best of four cost-volume measures -- max-mean was +0.08, and it
+    was higher on empty pixels than on event pixels, because the cosine normalises
+    away the descriptor strength). Where the events are is given separately.
     """
     Bn, _, _, H, W = C.shape
     Cf = C.reshape(Bn, M * M, H, W)
@@ -140,4 +150,7 @@ def flow_from_cost(
     gx = offs.view(1, M).expand(M, M).reshape(M * M)          # second axis (x)
     uy = (prob * gy.view(1, -1, 1, 1)).sum(1)
     ux = (prob * gx.view(1, -1, 1, 1)).sum(1)
-    return torch.stack([ux, uy], dim=1)
+    flow = torch.stack([ux, uy], dim=1)
+    if return_confidence:
+        return flow, prob.pow(2).sum(1, keepdim=True)
+    return flow

@@ -55,7 +55,8 @@ from hdems.models.prototype_head import PrototypeHead, fit_prototypes, save_prot
 from hdems.seg_features import score_pixel_mask
 from hdems.vsa.velocity import EVENT_COMBINES
 
-TRAINABLE_HEADS = ("cnn", "mfcnn", "motion")
+TRAINABLE_HEADS = ("cnn", "mfcnn", "mfunet", "motion")
+MOTION_FIRST = ("mfcnn", "mfunet")       # X and Mv in separate branches: no event_combine
 
 
 def _cap_dataset(ds, max_samples: int | None):
@@ -145,10 +146,14 @@ def main() -> None:
                          "checkpoints/[head]_[feature]_[axis]_[event]_[label_mode]_[N].pt")
     ap.add_argument("--head", type=str, choices=["ridge", "prototype", *TRAINABLE_HEADS],
                     default=None,
-                    help="ridge/prototype: closed-form fit; cnn/mfcnn/motion: backprop "
+                    help="ridge/prototype: closed-form fit; cnn/mfcnn/mfunet/motion: backprop "
                          "training. mfcnn = motion-first head (velocity code + motion "
-                         "channels, small appearance context; ignores --event-combine). "
+                         "channels, small appearance context; ignores --event-combine); "
+                         "mfunet = the same + event density + flow confidence, U-Net. "
                          "Overrides segmentation.head.")
+    ap.add_argument("--augment", choices=["yes", "no"], default=None,
+                    help="Random flips / 180-degree rotation of the training samples "
+                         "(overrides train.augment_flip).")
     ap.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
                     help="Vx,Vy combine (overrides velocity.axis_combine).")
     ap.add_argument("--event-combine", type=str, choices=list(EVENT_COMBINES), default=None,
@@ -210,12 +215,16 @@ def main() -> None:
     print(f"[fit] label_mode={label_mode}  num_classes={num_classes}")
     head_type = (args.head or seg_cfg.get("head", "ridge")).lower()
     if head_type not in ("ridge", "prototype", *TRAINABLE_HEADS):
-        raise SystemExit(f"unknown head {head_type!r} (ridge|prototype|cnn|mfcnn|motion)")
+        raise SystemExit(f"unknown head {head_type!r} (ridge|prototype|cnn|mfcnn|mfunet|motion)")
     trainable = head_type in TRAINABLE_HEADS
-    # mfcnn keeps X and Mv in separate branches: event_combine is not used
-    event_tag = "split" if head_type == "mfcnn" else event
-    if head_type == "mfcnn":
-        print(f"[fit] mfcnn: motion-first head, velocity.event_combine ({event}) is not used")
+    # the motion-first heads keep X and Mv in separate branches: event_combine is not used
+    event_tag = "split" if head_type in MOTION_FIRST else event
+    if head_type in MOTION_FIRST:
+        print(f"[fit] {head_type}: motion-first head, velocity.event_combine ({event}) is not used")
+    if args.augment:
+        cfg["train"] = {**cfg.get("train", {}), "augment_flip": args.augment == "yes"}
+    print(f"[fit] training augmentation (flips / 180-degree rotation): "
+          f"{'on' if cfg.get('train', {}).get('augment_flip', False) else 'off'}")
     def opt(section: str, key: str):
         return frontend_option(cfg, section, key)
     print(f"[fit] velocity code: {opt('velocity', 'vel_norm')} units "
@@ -232,8 +241,9 @@ def main() -> None:
             raise SystemExit("prototype head requires dataset.time_frames (paper mode)")
         mean_center = False   # cosine-centroid: normalization handles scale
     if paper:
-        what = ("velocity code + motion channels, small appearance context"
-                if head_type == "mfcnn" else f"{feature} (X) velocity code")
+        what = {"mfcnn": "velocity code + motion channels, small appearance context",
+                "mfunet": "velocity code + motion + evidence channels, small appearance "
+                          "context, U-Net"}.get(head_type, f"{feature} (X) velocity code")
         print(f"[fit] PAPER mode, head={head_type}: features = {what}")
     imbalance = ridge_cfg.get("imbalance", "balanced")
     alphas = ridge_cfg.get("alphas", [1e-3, 1e-1, 1.0, 10.0, 100.0])
@@ -336,6 +346,7 @@ def main() -> None:
         torch.save({"model": best_state, "task": "segmentation", "head": head_type,
                     "epoch": best_epoch, "val_miou": best_score if len(val_ds) else None,
                     "val_split": val_split,
+                    "augment_flip": bool(cfg.get("train", {}).get("augment_flip", False)),
                     "num_samples": len(train_ds), "num_classes": num_classes,
                     "axis_combine": axis, "event_combine": event,
                     "event_feature": feature, "label_mode": label_mode,

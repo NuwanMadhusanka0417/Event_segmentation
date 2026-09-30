@@ -76,6 +76,18 @@ With `dataset.time_frames` set, all heads use the paper front-end.
   of appearance (1×1 projection of unit-RMS `X`), which are zeroed for a whole
   sample with probability 0.5 while training. `X` and `Mv` are not fused, so
   `event_combine` is not used.
+- **`mfunet`** — the same inputs as `mfcnn` plus two evidence channels, in a small
+  U-Net (1, ½, ¼, ⅛ resolution, ~1M parameters) that sees 109 working px around each
+  pixel (measured) instead of 5×5. A moving object is recognised by its motion *differing from
+  its surroundings*, and objects are 50–200 px wide, so the head must see both.
+  - event density: log of the decayed event count of the label-time surface — where
+    the evidence is (dropped together with appearance while training);
+  - flow confidence: how concentrated the Eq. 12 probability volume is (Σ P²,
+    `flow_from_cost(..., return_confidence=True)`, cached with the flow). Measured
+    against GT flow it is only a weak predictor of flow error (Spearman +0.27, the
+    best of four cost-volume measures), so the head may learn to ignore it.
+  No absolute pixel coordinates: they would let the head learn where objects usually
+  are in the training scenes.
 - **`cnn`** — HV-channels CNN on the fused `X`/`Mv` feature (`event_combine`).
 - **`prototype`** — VSA nearest-centroid; class prototypes are the
   normalized bundle of training features. **Parameter-free**, no backprop.
@@ -83,6 +95,13 @@ With `dataset.time_frames` set, all heads use the paper front-end.
 - **`motion`** — older motion-primary CNN (residual + magnitude + 32 Φ channels).
 
 All heads are fit/trained with `scripts/fit_ridge_head.py` (what the PBS runs).
+
+**Augmentation** (`train.augment_flip`, `--augment yes|no`, PBS `AUGMENT`): each
+training sample is randomly kept, mirrored left-right, upside-down or rotated 180°.
+The event surfaces are flipped *before* the front end, so the flow is re-measured on
+the mirrored scene and the velocity mirrors with the image (a left-right flip negates
+vx). The flow cache then holds up to 4 versions of a frame. Validation and eval are
+never augmented.
 
 ### Does the head use motion? (`--ablation-check`)
 

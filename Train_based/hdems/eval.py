@@ -27,7 +27,7 @@ from hdems.models.hdems import ABLATIONS, HDEMS
 from hdems.vsa.velocity import EVENT_COMBINES
 from hdems.seg_features import score_pixel_mask
 
-HEADS = ("cnn", "mfcnn", "ridge", "prototype", "motion")
+HEADS = ("cnn", "mfcnn", "mfunet", "ridge", "prototype", "motion")
 
 
 def load_config(path: str | Path) -> dict:

@@ -92,4 +92,6 @@ def build_dataset(cfg: dict[str, Any], split: str | None = None):
         # train and score only on events this close to the label time (0 = all events)
         score_window_ms=ds_cfg.get("score_window_ms"),
         use_shards=bool(ds_cfg.get("use_shards", False)),
+        # random flips / 180-degree rotation, TRAINING split only
+        augment=is_train and bool((cfg.get("train", {}) or {}).get("augment_flip", False)),
     )
