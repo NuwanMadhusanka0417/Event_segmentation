@@ -103,6 +103,31 @@ the mirrored scene and the velocity mirrors with the image (a left-right flip ne
 vx). The flow cache then holds up to 4 versions of a frame. Validation and eval are
 never augmented.
 
+### Per-pixel hypervector: real FPE (`real_fpe:`)
+
+The motion-first heads (`mfcnn`, `mfunet`) read one REAL hypervector per pixel
+(`hdems/vsa/real_fpe.py`, `HDEMS.pixel_hv`), built with the 2-D FPE of the
+experiment: two independent Hermitian bases per quantity, uniform ω in (−π, π), and
+
+    code(x, y) = IFFT( exp(i·β·(x·ω_x + y·ω_y)) )        real because ω is Hermitian
+
+- position P(x, y) = Xˣ ⊛ Yʸ, x/y in sensor px, **β = 0.0025**: broad, object-scale
+  (similarity 0.89 at 100 px, 0.61 at 200 px, ~0 near 400 px);
+- velocity with u = clamp(v, ±15) + 15 ∈ [0, 30] (−15 → 0, +15 → 30), **β = 0.05**, its
+  own x / y bases, combined by `velocity.axis_combine` (`--axis-combine`, PBS `AX_COMBINE`):
+  `bind` V = Vₓ ⊛ V_y (joint 2-D code) | `bundle` V = (Vₓ + V_y)/√2;
+- position with velocity, `real_fpe.input` (`--hv-input`, PBS `HV_INPUT`):
+  `pv_bind` P ⊛ V | `pv_bundle` (P + V)/√2 | `pv_concat` [P | V] (1000 channels) |
+  `v` V only (no absolute position). Built as Fourier spectra (bind = product,
+  bundle = sum) and made real by one inverse FFT;
+- d = 500 (249 independent frequencies); norm √d; 500 input channels to the head.
+
+With β = 0.05 velocity codes are smooth over several px (v = 0 vs 1 px: 0.996, vs 5 px:
+0.89), so fine moving/static differences come from the 6 explicit motion channels.
+Old checkpoints (no `real_fpe` record) rebuild the complex velocity code automatically.
+The flow front end (VFA encoder) is unchanged: β = 0.0025 inside its 21 px kernel
+would give every offset the same code (0.995) and break the flow.
+
 ### Does the head use motion? (`--ablation-check`)
 
 Measured 2026-09-29 on real eval frames: in the `cnn` head, zeroing the velocity input

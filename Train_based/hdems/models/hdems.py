@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -27,6 +28,7 @@ from hdems.ridge_head import RidgeHead
 from hdems.seg_features import event_pixel_mask
 from hdems.vsa.field import bundled_field
 from hdems.vsa.fpe import make_base_phases
+from hdems.vsa.real_fpe import RealFPE2D, to_real
 from hdems.vsa.temporal import bind_trajectory, make_time_phases
 from hdems.vsa.velocity import (
     MOTION_SCALARS,
@@ -37,6 +39,8 @@ from hdems.vsa.velocity import (
 )
 
 ABLATIONS = ("motion", "appearance")
+# real_fpe.input: how the position code P joins the velocity code V per pixel
+HV_INPUTS = ("pv_bind", "pv_bundle", "pv_concat", "v")
 MOTION_FIRST_HEADS = ("mfcnn", "mfunet")
 EVIDENCE_CHANNELS = 2          # mfunet: event density + flow confidence
 
@@ -113,6 +117,30 @@ class HDEMS(nn.Module):
         # velocity, "appearance" zeroes the event HV X. None = normal.
         self.ablate: str | None = None
 
+        # Per-pixel hypervector of the motion-first heads in the REAL FPE form
+        # (real_fpe section, hdems/vsa/real_fpe.py): position P(x,y) = X^x ⊛ Y^y with
+        # beta_pos, velocity V = Vx^ux ⊛ Vy^uy with beta_vel and u = v + range in
+        # [0, 2*range], each with its own independent x / y bases. Off = the complex
+        # velocity code below (old checkpoints rebuild that automatically).
+        self.real_fpe = bool(frontend_option(cfg, "real_fpe", "enabled"))
+        mv_ch = 2 * d                                    # complex code -> [real | imag]
+        if self.real_fpe:
+            d_hv = int(frontend_option(cfg, "real_fpe", "d"))
+            dist = str(frontend_option(cfg, "real_fpe", "omega"))
+            seed = int(frontend_option(cfg, "real_fpe", "seed"))
+            self.hv_pos = RealFPE2D(d_hv, float(frontend_option(cfg, "real_fpe", "beta_pos")),
+                                    seed=seed, dist=dist)
+            self.hv_vel = RealFPE2D(d_hv, float(frontend_option(cfg, "real_fpe", "beta_vel")),
+                                    seed=seed + 10, dist=dist)
+            self.vel_range = float(frontend_option(cfg, "real_fpe", "vel_range_px"))
+            hv_input = str(frontend_option(cfg, "real_fpe", "input"))
+            self.hv_input = {"pv": "pv_bind"}.get(hv_input, hv_input)    # "pv" = old name
+            if self.hv_input not in HV_INPUTS:
+                raise ValueError(f"real_fpe.input must be one of {HV_INPUTS}, got {hv_input!r}")
+            if self.axis_combine not in ("bind", "bundle"):
+                raise ValueError(f"velocity.axis_combine must be bind|bundle, got {self.axis_combine!r}")
+            mv_ch = 2 * d_hv if self.hv_input == "pv_concat" else d_hv
+
         if self.head_type == "ridge":
             self.seg_head = RidgeHead(
                 num_classes=num_classes,
@@ -137,6 +165,7 @@ class HDEMS(nn.Module):
                 app_dim=int(seg.get("mf_app_dim", 8)),
                 app_dropout=float(seg.get("mf_app_dropout", 0.5)),
                 scalar_ch=MOTION_SCALARS,
+                mv_ch=mv_ch,
             )
         elif self.head_type == "mfunet":  # the same inputs + evidence channels, U-Net view
             self.seg_head = MotionUNetHead(
@@ -147,6 +176,7 @@ class HDEMS(nn.Module):
                 app_dropout=float(seg.get("mf_app_dropout", 0.5)),
                 scalar_ch=MOTION_SCALARS + EVIDENCE_CHANNELS,
                 app_scalars=(MOTION_SCALARS,),      # event density goes with appearance
+                mv_ch=mv_ch,
                 widths=tuple(int(w) for w in seg.get("mf_widths", (32, 64, 96, 128))),
             )
         else:  # "cnn" — HV-as-channels CNN on the paper feature tensor
@@ -266,6 +296,50 @@ class HDEMS(nn.Module):
                                vel_bw=self.vel_bw, axis_combine=self.axis_combine,
                                norm=self.vel_norm, unit=self.vel_unit_px)
 
+    def pixel_hv(self, residual: torch.Tensor) -> torch.Tensor:
+        """Hypervector per pixel for the motion-first heads.
+
+        real_fpe on  -> REAL (B, d_hv, H, W), or (B, 2*d_hv, H, W) for pv_concat:
+            u = clamp(residual in SENSOR px, -range, +range) + range   in [0, 2*range]
+                (u = 0 <-> -range, u = 2*range <-> +range)
+            velocity.axis_combine (x / y velocity, each with its own basis, beta_vel):
+                bind   V = Vx^ux ⊛ Vy^uy           joint 2-D code
+                bundle V = (Vx^ux + Vy^uy) / √2     each axis on its own
+            P(x,y) = X^x ⊛ Y^y                     beta_pos, SENSOR px
+            real_fpe.input (position with velocity):
+                pv_bind    P ⊛ V            velocity tied to where it occurs
+                pv_bundle  (P + V) / √2     side by side in one vector
+                pv_concat  [P | V]          2*d_hv channels, the head combines them
+                v          V                no absolute position
+            Everything is built as Fourier spectra (binding = product, bundling = sum,
+            both Hermitian) and turned real by one inverse FFT per vector.
+        real_fpe off -> the complex velocity code (velocity_hv).
+        """
+        if not self.real_fpe:
+            return self.velocity_hv(residual)
+        u = (residual * self.res_ratio).clamp(-self.vel_range, self.vel_range) + self.vel_range
+        ux, uy = u[:, 0], u[:, 1]
+        if self.axis_combine == "bind":
+            spec_v = torch.exp(1j * self.hv_vel.phase(ux, uy, dim=1))                 # (B, d, H, W)
+        else:
+            zero = torch.zeros_like(ux)
+            spec_v = (torch.exp(1j * self.hv_vel.phase(ux, zero, dim=1))
+                      + torch.exp(1j * self.hv_vel.phase(zero, uy, dim=1))) / math.sqrt(2)
+        if self.hv_input == "v":
+            return to_real(spec_v, dim=1)
+        H, W = residual.shape[-2:]
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=residual.device, dtype=residual.dtype) * self.res_ratio,
+            torch.arange(W, device=residual.device, dtype=residual.dtype) * self.res_ratio,
+            indexing="ij")
+        spec_p = torch.exp(1j * self.hv_pos.phase(xx, yy, dim=0)).unsqueeze(0)       # (1, d, H, W)
+        if self.hv_input == "pv_bind":
+            return to_real(spec_p * spec_v, dim=1)
+        if self.hv_input == "pv_bundle":
+            return to_real((spec_p + spec_v) / math.sqrt(2), dim=1)
+        return torch.cat([to_real(spec_p, dim=1).expand(spec_v.shape[0], -1, -1, -1),   # pv_concat
+                          to_real(spec_v, dim=1)], dim=1)
+
     @torch.no_grad()
     def _flow_uncached(self, surfaces: torch.Tensor) -> torch.Tensor:
         """Paper Eq.10-14: multi-time fields -> multi-scale cost volume -> flow.
@@ -345,7 +419,7 @@ class HDEMS(nn.Module):
             if self.head_type == "mfunet":
                 scalars = torch.cat([scalars, self.evidence_channels(surface, conf)], dim=1)
             outputs["flow"] = flow
-            outputs["seg_logits"] = self.seg_head(self.velocity_hv(residual), x, scalars)
+            outputs["seg_logits"] = self.seg_head(self.pixel_hv(residual), x, scalars)
             return outputs
 
         # ---- paper two-time / multi-scale motion path -----------------------

@@ -35,6 +35,7 @@ _FRONTEND_KEYS = {
     "time_surface": ("tau_ms", "decay"),
     "dataset": ("height", "width", "window_ms", "time_frames", "resolution_ratio"),
     "velocity": ("vel_norm", "vel_unit_px", "vel_bw", "x_norm", "ego_fit"),
+    "real_fpe": ("enabled", "d", "beta_pos", "beta_vel", "vel_range_px", "omega", "input", "seed"),
 }
 
 # Front-end options added after checkpoints were already trained (2026-09-29). A
@@ -46,6 +47,7 @@ _LEGACY_FRONTEND = {
     ("velocity", "vel_norm"): "frame",   # velocity rescaled by the frame's 95th percentile
     ("velocity", "x_norm"): "none",      # event HV X fed at its raw magnitude
     ("velocity", "ego_fit"): "stack",    # ego model fitted on the events of all surfaces
+    ("real_fpe", "enabled"): False,      # complex velocity code (added 2026-10-06)
 }
 
 # Current defaults of those options (used when the YAML leaves one out). Checkpoints
@@ -57,6 +59,14 @@ FRONTEND_DEFAULTS = {
     ("velocity", "vel_unit_px"): 0.5,
     ("velocity", "x_norm"): "rms",
     ("velocity", "ego_fit"): "stack",    # "reference" measured slightly worse (0.696 vs 0.700)
+    ("real_fpe", "enabled"): True,
+    ("real_fpe", "d"): 500,
+    ("real_fpe", "beta_pos"): 0.0025,
+    ("real_fpe", "beta_vel"): 0.05,
+    ("real_fpe", "vel_range_px"): 15.0,
+    ("real_fpe", "omega"): "uniform",
+    ("real_fpe", "input"): "pv_bind",
+    ("real_fpe", "seed"): 100,
 }
 
 

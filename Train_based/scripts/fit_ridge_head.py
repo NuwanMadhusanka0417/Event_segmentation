@@ -42,7 +42,7 @@ from hdems.feature_extract import (
     extract_paper_flat_batch,
 )
 from hdems.metrics import mean_iou
-from hdems.models.hdems import HDEMS
+from hdems.models.hdems import HDEMS, HV_INPUTS
 from hdems.ridge_fit import (
     RidgeFitResult,
     fit_ridge_sklearn,
@@ -154,6 +154,11 @@ def main() -> None:
     ap.add_argument("--augment", choices=["yes", "no"], default=None,
                     help="Random flips / 180-degree rotation of the training samples "
                          "(overrides train.augment_flip).")
+    ap.add_argument("--hv-input", choices=list(HV_INPUTS), default=None,
+                    help="mfcnn/mfunet, real FPE: how the position code P joins the velocity "
+                         "code V per pixel -- pv_bind (P ⊛ V) | pv_bundle (P + V) | pv_concat "
+                         "([P | V]) | v (no position). Overrides real_fpe.input. The x / y "
+                         "velocity combine is --axis-combine.")
     ap.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
                     help="Vx,Vy combine (overrides velocity.axis_combine).")
     ap.add_argument("--event-combine", type=str, choices=list(EVENT_COMBINES), default=None,
@@ -198,6 +203,8 @@ def main() -> None:
         if args.event_feature:
             vel["event_feature"] = args.event_feature
         cfg["velocity"] = vel
+    if args.hv_input:                     # before frontend_settings: the checkpoint records it
+        cfg["real_fpe"] = {**(cfg.get("real_fpe") or {}), "input": args.hv_input}
     # Resolution ratio: scales image size, kernel N, search M and Eq.12 pooling.
     cfg = apply_resolution_ratio(cfg, args.resolution_ratio, verbose=True)
     ratio = resolution_ratio_of(cfg)
@@ -223,6 +230,9 @@ def main() -> None:
         print(f"[fit] {head_type}: motion-first head, velocity.event_combine ({event}) is not used")
     if args.augment:
         cfg["train"] = {**cfg.get("train", {}), "augment_flip": args.augment == "yes"}
+    if head_type in MOTION_FIRST and frontend_option(cfg, "real_fpe", "enabled"):
+        event_tag = {"pv": "pv_bind"}.get(str(frontend_option(cfg, "real_fpe", "input")),
+                                          str(frontend_option(cfg, "real_fpe", "input")))
     print(f"[fit] training augmentation (flips / 180-degree rotation): "
           f"{'on' if cfg.get('train', {}).get('augment_flip', False) else 'off'}")
     def opt(section: str, key: str):
@@ -231,6 +241,16 @@ def main() -> None:
           f"({opt('velocity', 'vel_unit_px')} px/interval)  X norm: {opt('velocity', 'x_norm')}  "
           f"ego fit on: {opt('velocity', 'ego_fit')} events  "
           f"Phi window: {opt('matching', 'phi_window')} ({opt('matching', 'phi_pad')} pad)")
+    if head_type in MOTION_FIRST:
+        if opt("real_fpe", "enabled"):
+            print(f"[fit] pixel hypervector: REAL FPE d={opt('real_fpe', 'd')} "
+                  f"({opt('real_fpe', 'omega')} omega), position+velocity {event_tag}, "
+                  f"x/y velocity {axis} | "
+                  f"position beta {opt('real_fpe', 'beta_pos')} | velocity beta "
+                  f"{opt('real_fpe', 'beta_vel')}, u = v + {opt('real_fpe', 'vel_range_px')} "
+                  f"in [0, {2 * float(opt('real_fpe', 'vel_range_px')):g}]")
+        else:
+            print("[fit] pixel hypervector: complex velocity code (real_fpe.enabled: false)")
     mean_center = bool(seg_cfg.get("ridge_mean_center", True))
     motion_features = bool(seg_cfg.get("ridge_motion_features", True))
     # Paper mode: multi-time surfaces -> fit on the two-time cost-volume features

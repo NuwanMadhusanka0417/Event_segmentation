@@ -141,6 +141,26 @@ velocity:
   #                        bind (X o Mv) | bundle (X + Mv) | bindbundle ((X^ o Mv) + Mv) | concat
   #                        (not used by head mfcnn: X and Mv go into separate branches)
 
+real_fpe:                # per-pixel hypervector of the motion-first heads (mfcnn / mfunet) in
+  #                        the REAL FPE form (hdems/vsa/real_fpe.py): code = IFFT(exp(i*beta*
+  #                        (x*omega_x + y*omega_y))), omega Hermitian-symmetric -> real vector
+  enabled: true          # false = the complex velocity code above (old checkpoints: automatic)
+  d: 500                 # hypervector dimension (real; 249 independent frequencies)
+  beta_pos: 0.0025       # position P(x,y), x/y in SENSOR px: broad, object-scale similarity
+  #                        (0.89 at 100 px, 0.61 at 200 px, ~0 near 400 px)
+  beta_vel: 0.05         # velocity V: u = v + vel_range_px in [0, 30] (0 <-> -15, 30 <-> +15)
+  #                        similarity of v=0 to v=1 px 0.996, 5 px 0.89, 10 px 0.61, 15 px 0.25
+  #                        -- fine moving/static differences come from the 6 motion channels
+  vel_range_px: 15.0     # velocities are clamped to +-15 sensor px per 12.5 ms interval
+  omega: uniform         # uniform (-pi, pi) as in the 2-D FPE experiment | gaussian
+  input: pv_bind         # how position P joins velocity V per pixel (--hv-input, PBS HV_INPUT):
+  #                        pv_bind   P ⊛ V        velocity tied to where it occurs
+  #                        pv_bundle (P + V)/√2   side by side in one 500-d vector
+  #                        pv_concat [P | V]      1000 channels, the head combines them
+  #                        v         V only       no absolute position
+  #                        x / y velocity: velocity.axis_combine (bind = Vx ⊛ Vy | bundle)
+  seed: 100              # position bases seed / seed+1, velocity bases seed+10 / seed+11
+
 segmentation:
   head: mfunet           # mfunet (motion-first U-Net: wide view + event density + flow
   #                        confidence) | mfcnn (motion-first, 5x5 view) | cnn (HV-channels CNN

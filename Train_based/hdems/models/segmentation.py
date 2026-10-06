@@ -128,9 +128,11 @@ class _MotionFirstInputs(nn.Module):
     small appearance projection that is dropped for whole samples while training."""
 
     def __init__(self, d: int, motion_dim: int, app_dim: int, app_dropout: float,
-                 app_scalars: tuple[int, ...] = ()) -> None:
+                 app_scalars: tuple[int, ...] = (), mv_ch: int | None = None) -> None:
         super().__init__()
-        self.motion_proj = nn.Conv2d(2 * d, motion_dim, 1)
+        # mv_ch: channels of the per-pixel hypervector -- 2d for the complex code
+        # ([real | imag]), d_hv for the real FPE code (HDEMS.pixel_hv)
+        self.motion_proj = nn.Conv2d(mv_ch or 2 * d, motion_dim, 1)
         self.app_proj = nn.Conv2d(2 * d, app_dim, 1) if app_dim > 0 else None
         self.app_dropout = float(app_dropout)
         # scalar channels that are appearance-like (e.g. event density): dropped with X
@@ -146,7 +148,8 @@ class _MotionFirstInputs(nn.Module):
                 gate = torch.ones_like(scalars[:1, :, :1, :1])
                 gate[:, list(self.app_scalars)] = 0
                 scalars = scalars * (gate + (1 - gate) * keep)
-        parts = [self.motion_proj(torch.cat([mv.real, mv.imag], dim=1).float()), scalars]
+        mv = torch.cat([mv.real, mv.imag], dim=1) if mv.is_complex() else mv
+        parts = [self.motion_proj(mv.float()), scalars]
         if self.app_proj is not None:
             a = self.app_proj(torch.cat([x.real, x.imag], dim=1).float())
             parts.append(a if keep is None else a * keep)
@@ -183,8 +186,9 @@ class MotionFirstHead(_MotionFirstInputs):
         app_dim: int = 8,
         app_dropout: float = 0.5,
         scalar_ch: int = 6,
+        mv_ch: int | None = None,
     ) -> None:
-        super().__init__(d, motion_dim, app_dim, app_dropout)
+        super().__init__(d, motion_dim, app_dim, app_dropout, mv_ch=mv_ch)
         hidden = embedding_dim * 4
         groups = 8 if hidden % 8 == 0 else 1
         self.net = nn.Sequential(
@@ -197,7 +201,8 @@ class MotionFirstHead(_MotionFirstInputs):
         self.classifier = nn.Conv2d(embedding_dim, num_classes, 1)
 
     def forward(self, mv: torch.Tensor, x: torch.Tensor, scalars: torch.Tensor) -> torch.Tensor:
-        """mv, x: (B, d, H, W) complex (x already unit-RMS); scalars: (B, 6, H, W)."""
+        """mv: per-pixel hypervector, real (B, d_hv, H, W) or complex (B, d, H, W);
+        x: (B, d, H, W) complex, unit-RMS; scalars: (B, 6, H, W)."""
         return self.classifier(self.net(self._inputs(mv, x, scalars)))
 
 
@@ -220,8 +225,10 @@ class MotionUNetHead(_MotionFirstInputs):
     1/8 resolution (measured convolutional receptive field 109 working px; the
     GroupNorm statistics add whole-image context on top) and the decoder brings the
     decision back to full resolution through skip connections, so boundaries stay
-    sharp. No absolute pixel coordinates are given: they would let the head learn
-    WHERE objects usually are in the training scenes.
+    sharp. Position enters only through the per-pixel hypervector when
+    real_fpe.input = pv: P(x, y) with beta_pos = 0.0025 is a BROAD, object-scale code
+    (similarity 0.89 at 100 px). It lets the head relate a velocity to where it is in
+    the image, but it is also absolute position -- real_fpe.input = v leaves it out.
 
     ``app_scalars``: indices of scalar channels that are appearance-like (event
     density); they are dropped together with the appearance projection.
@@ -238,8 +245,9 @@ class MotionUNetHead(_MotionFirstInputs):
         scalar_ch: int = 8,
         app_scalars: tuple[int, ...] = (6,),
         widths: tuple[int, ...] = (32, 64, 96, 128),
+        mv_ch: int | None = None,
     ) -> None:
-        super().__init__(d, motion_dim, app_dim, app_dropout, app_scalars)
+        super().__init__(d, motion_dim, app_dim, app_dropout, app_scalars, mv_ch=mv_ch)
         cin = motion_dim + scalar_ch + max(app_dim, 0)
         self.down = nn.ModuleList()
         for w in widths:
@@ -251,7 +259,8 @@ class MotionUNetHead(_MotionFirstInputs):
         self.classifier = nn.Conv2d(widths[0], num_classes, 1)
 
     def forward(self, mv: torch.Tensor, x: torch.Tensor, scalars: torch.Tensor) -> torch.Tensor:
-        """mv, x: (B, d, H, W) complex (x already unit-RMS); scalars: (B, 8, H, W)."""
+        """mv: per-pixel hypervector, real (B, d_hv, H, W) or complex (B, d, H, W);
+        x: (B, d, H, W) complex, unit-RMS; scalars: (B, 8, H, W)."""
         h = self._inputs(mv, x, scalars)
         skips = []
         for i, block in enumerate(self.down):

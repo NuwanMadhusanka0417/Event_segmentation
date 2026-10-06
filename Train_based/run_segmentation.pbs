@@ -25,9 +25,16 @@ HEAD=mfunet            # mfunet | mfcnn | cnn | prototype | ridge | motion
                        #            sees 5x5 px. Run both to compare.
                        #   cnn    = HV-channels CNN on the fused X/Mv feature (EV_COMBINE)
 EV_FEATURE=f           # phi | f                (event HV: Phi neighbourhood field, or descriptor F0)
-AX_COMBINE=bind        # bind | bundle          (combine Vx,Vy)
+AX_COMBINE=bind        # bind | bundle          (combine Vx,Vy velocity hypervectors)
+                       #   bind   = Vx ⊛ Vy        joint 2-D code (speed / direction readable)
+                       #   bundle = (Vx + Vy)/√2   each axis on its own
+HV_INPUT=pv_bind       # mfcnn / mfunet (real FPE): how the pixel POSITION code P joins velocity V
+                       #   pv_bind   = P ⊛ V        velocity tied to where it occurs
+                       #   pv_bundle = (P + V)/√2   side by side in one 500-d vector
+                       #   pv_concat = [P | V]      1000 channels, the U-Net combines them
+                       #   v         = V only       no absolute position
 EV_COMBINE=concat      # bind | bundle | bindbundle | concat   (combine event HV X with velocity Mv)
-                       #   bindbundle = (X^ o Mv) + Mv.   NOT used by HEAD=mfcnn
+                       #   bindbundle = (X^ o Mv) + Mv.   NOT used by HEAD=mfcnn / mfunet
 LABEL_MODE=motion      # motion = moving vs background (Option A)
                        # objects = per-object id        (Option B)
 DETECT=yes             # yes | no  -> also report object detection (boxes from instances)
@@ -60,7 +67,8 @@ cd "${CODE_DIR}"
 
 # Derived names -------------------------------------------------------------
 EV_TAG="${EV_COMBINE}"
-case "${HEAD}" in mfcnn|mfunet) EV_TAG="split" ;; esac   # motion-first heads do not fuse X and Mv
+# motion-first heads do not fuse X and Mv; their name records the position+velocity input
+case "${HEAD}" in mfcnn|mfunet) EV_TAG="${HV_INPUT}" ;; esac
 AUG_TAG=""
 if [ "${AUGMENT}" = "no" ]; then AUG_TAG="_noaug"; fi
 RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_TAG}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}${AUG_TAG}"
@@ -87,8 +95,9 @@ echo "--- run parameters (this script) ------------------------------"
 printf '  %-16s %s\n' \
   HEAD         "${HEAD}" \
   EV_FEATURE   "${EV_FEATURE}" \
-  AX_COMBINE   "${AX_COMBINE}" \
-  EV_COMBINE   "${EV_COMBINE}$( [ "${EV_TAG}" = "split" ] && echo "  (not used by ${HEAD})")" \
+  AX_COMBINE   "${AX_COMBINE}  (x / y velocity)" \
+  HV_INPUT     "${HV_INPUT}  (position + velocity; mfcnn / mfunet only)" \
+  EV_COMBINE   "${EV_COMBINE}$( [ "${EV_TAG}" = "${HV_INPUT}" ] && echo "  (not used by ${HEAD})")" \
   LABEL_MODE   "${LABEL_MODE}" \
   DETECT       "${DETECT}" \
   ABLATION     "${ABLATION}  (eval without motion / appearance)" \
@@ -115,15 +124,15 @@ if git -C "${CODE_DIR}" rev-parse --short HEAD >/dev/null 2>&1; then
 fi
 echo
 echo "--- config file: ${CONFIG}  (* = overridden by this script) ----"
-python - "${CONFIG}" "${HEAD}" "${AX_COMBINE}" "${EV_COMBINE}" "${LABEL_MODE}" "${EV_FEATURE}" "${RES_RATIO}" "${AUGMENT}" <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
+python - "${CONFIG}" "${HEAD}" "${AX_COMBINE}" "${EV_COMBINE}" "${LABEL_MODE}" "${EV_FEATURE}" "${RES_RATIO}" "${AUGMENT}" "${HV_INPUT}" <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
 import sys, yaml
-path, head, ax, ev, lm, feat, rr, aug = sys.argv[1:9]
+path, head, ax, ev, lm, feat, rr, aug, hv = sys.argv[1:10]
 cfg = yaml.safe_load(open(path, encoding="utf-8")) or {}
 # CLI flags passed by this script win over the YAML -- show the value actually used
 override = {"segmentation.head": head, "velocity.axis_combine": ax,
             "velocity.event_combine": ev, "dataset.label_mode": lm,
             "velocity.event_feature": feat, "dataset.resolution_ratio": rr,
-            "train.augment_flip": str(aug == "yes")}
+            "train.augment_flip": str(aug == "yes"), "real_fpe.input": hv}
 def walk(node, prefix=""):
     for k, v in node.items():
         key = f"{prefix}{k}"
@@ -148,7 +157,7 @@ python scripts/fit_ridge_head.py --config "${CONFIG}" \
   --head "${HEAD}" --event-feature "${EV_FEATURE}" \
   --axis-combine "${AX_COMBINE}" --event-combine "${EV_COMBINE}" \
   --label-mode "${LABEL_MODE}" --resolution-ratio "${RES_RATIO}" --out "${CKPT}" \
-  --augment "${AUGMENT}" \
+  --augment "${AUGMENT}" --hv-input "${HV_INPUT}" \
   --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"
 
 # ---------------------------------------------------------------------------
