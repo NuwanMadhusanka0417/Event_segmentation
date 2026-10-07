@@ -153,6 +153,7 @@ class EVIMODataset(Dataset):
             load_frame_sample(
                 seq_dir,
                 frame,
+                frame_index=frame_idx,
                 out_height=self.height,
                 out_width=self.width,
                 window_s=self.window_s,

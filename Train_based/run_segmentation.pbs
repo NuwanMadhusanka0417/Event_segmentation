@@ -52,6 +52,10 @@ PANELS=movers          # which eval frames get figures (scores always use ALL fr
                        #   movers = only frames with a visible moving object (see object colours)
                        #   spread = evenly over the whole eval set (moving + static frames)
                        #   first  = first N frames (old; mostly the static start of each recording)
+BENCHMARK=hua2025      # hua2025 | none  -> also score with the published protocol of
+                       #   Hua, Yuan & Fermueller 2025 (IoU over events, 5 sequences)
+BENCH_GT=moving        # moving | moving_slow | tracked   (which objects count as moving)
+BENCH_PRED=fg          # fg | objects   (head's moving pixels, or only what grouping keeps)
 
 CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
 CONFIG=configs/evimo_seg.yaml
@@ -107,6 +111,7 @@ printf '  %-16s %s\n' \
   VAL_SAMPLES  "${VAL_SAMPLES}  (val frames)" \
   TEST_SAMPLES "${TEST_SAMPLES}  (eval panels)" \
   PANELS       "${PANELS}  (which frames get figures)" \
+  BENCHMARK    "${BENCHMARK}  (gt=${BENCH_GT}, pred=${BENCH_PRED})" \
   CONFIG       "${CONFIG}"
 echo
 echo "--- PBS resources ---------------------------------------------"
@@ -183,6 +188,17 @@ python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
 echo ">>> [$(date +%T)] events-only baseline (control)"
 python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
   --checkpoint "${CKPT}" --events-only-baseline --device cuda
+
+# PUBLISHED PROTOCOL: Hua, Yuan & Fermueller 2025 -- IoU over events, full resolution,
+# 5 EVIMO2 sequences, printed next to their table. Flows come from the cache of step 2.
+if [ "${BENCHMARK}" != "none" ]; then
+  echo ">>> [$(date +%T)] benchmark ${BENCHMARK} (gt=${BENCH_GT}, pred=${BENCH_PRED})"
+  python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
+    --checkpoint "${CKPT}" --device cuda \
+    --benchmark "${BENCHMARK}" --benchmark-gt "${BENCH_GT}" --benchmark-pred "${BENCH_PRED}" \
+    --benchmark-out "${RESULTS_DIR}/benchmark_${BENCHMARK}.json" \
+    | tee "${RESULTS_DIR}/benchmark_${BENCHMARK}.txt"
+fi
 
 # ---------------------------------------------------------------------------
 # 3. COLLECT  (keep a copy of the checkpoint + this log next to the results)

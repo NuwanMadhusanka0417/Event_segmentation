@@ -21,6 +21,7 @@ from typing import Any
 
 import numpy as np
 
+from hdems.data.evimo2_reader import gt_key
 from hdems.data.motion_labels import _pose
 
 
@@ -34,8 +35,7 @@ def gt_flow_between(
     """Full-resolution displacement p1 - p0 from GT frame j0 to j1 -> (2, H, W)."""
     frames = meta["frames"]
     f0, f1 = frames[j0], frames[j1]
-    dkey = f"depth_{int(f0['id']):010d}"
-    mkey = f"mask_{int(f0['id']):010d}"
+    dkey, mkey = gt_key("depth", j0), gt_key("mask", j0)    # keyed by POSITION, not id
     if dkey not in depth_npz.files or mkey not in masks_npz.files:
         return None
     mm = meta["meta"]

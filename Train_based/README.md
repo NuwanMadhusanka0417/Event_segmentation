@@ -429,6 +429,36 @@ motion grouping, one colour each** | the same grouping on the ground-truth movin
 pixels (best case) | ground-truth objects. Everything is drawn **only at event
 pixels** — the rest is untrained guesswork.
 
+## Comparing with a published method (`--benchmark`)
+
+```bash
+python -m hdems.eval --config configs/evimo_seg.yaml --checkpoint checkpoints/<run>.pt \
+  --benchmark hua2025 --benchmark-out results/<run>/benchmark_hua2025.json
+```
+
+Scores the model with the **paper's** protocol and prints our per-sequence numbers
+next to its table (`hdems/protocols.py`). `hua2025` = Hua, Yuan & Fermüller 2025
+(arXiv:2507.14500) on the EVIMO2 IMO sequences 13-00, 13-05, 14-03, 14-04, 14-05:
+
+| | our eval | `hua2025` |
+|---|---|---|
+| unit | pixels at working resolution | **events** at full sensor resolution (each event counts once) |
+| frames | every eval frame | only frames with a moving object |
+| averaging | pooled over frames | per-frame IoU, mean per sequence, then mean of the 5 |
+| ignore | boundary band + slow objects | nothing |
+
+The paper does not state its event window or which objects count as moving, so
+both are options (`benchmark:` in the config, or `--benchmark-window-ms`,
+`--benchmark-gt moving|moving_slow|tracked`). `--benchmark-pred objects` scores only
+the pixels the motion grouping keeps. `--max-samples N` caps the frames **per
+sequence** (smoke test, not comparable). `run_segmentation.pbs` runs it after the
+eval (`BENCHMARK=hua2025`).
+
+**GT masks are keyed by frame position** (`gt_key`), not by `frame["id"]`. Before
+2026-10-07 the id lookup paired scene10_dyn_train_00/02/03 with the *next* frame's
+mask (16.7 ms late) and dropped scene13_dyn_test_05 and scene9_dyn_train_02.
+Checkpoints trained before that saw those labels — retrain before reporting.
+
 ## Notes
 
 - EVIMO2 masks cover every tracked surface, including the static table — see

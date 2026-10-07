@@ -32,6 +32,19 @@ def find_cached_samples(root: Path, split: str) -> list[Path]:
     return sorted(split_dir.glob("*.pt"))
 
 
+def gt_key(kind: str, frame_index: int) -> str:
+    """npz key of a GT array: ``mask_0000000012`` / ``depth_0000000012``.
+
+    The number is the frame's POSITION in meta["frames"], not its ``id``. Verified on
+    every sequence (2026-10-07): matching by position finds all masks everywhere, e.g.
+    scene10_dyn_train_00 has frame ids 1..572 but mask keys 0..571, and
+    scene13_dyn_test_05 has ids 134..280 but keys 0..146. The old id-based lookup paired
+    the scene10 train_00/02/03 frames with the NEXT frame's mask (16.7 ms late) and
+    dropped scene13_dyn_test_05 and scene9_dyn_train_02 entirely.
+    """
+    return f"{kind}_{int(frame_index):010d}"
+
+
 def load_meta(seq_dir: Path) -> dict[str, Any]:
     info = np.load(seq_dir / "dataset_info.npz", allow_pickle=True)
     meta = info["meta"].item()
@@ -174,6 +187,7 @@ def load_frame_sample(
     decay: float = 0.8,
     time_fracs: list[float] | None = None,
     score_window_s: float | None = None,
+    frame_index: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Load one aligned (surface, mask) training sample from a sequence.
 
@@ -187,13 +201,17 @@ def load_frame_sample(
 
     ``score_window_s``: also return ``score_mask`` (H, W) = pixels with an event in
     the last score_window_s before the label time (see seg_features.score_pixel_mask).
+
+    ``frame_index``: position of ``frame`` in meta["frames"] -- the masks are keyed by
+    it (see ``gt_key``). Looked up from the metadata when not given.
     """
     masks = np.load(seq_dir / "dataset_mask.npz")
     meta = load_meta(seq_dir)
 
-    frame_id = int(frame["id"])
+    if frame_index is None:
+        frame_index = next(i for i, f in enumerate(meta["frames"]) if f is frame or f == frame)
     ts = float(frame["ts"])
-    mask_key = f"mask_{frame_id:010d}"
+    mask_key = gt_key("mask", frame_index)
     if mask_key not in masks.files:
         raise KeyError(f"{mask_key} not found in {seq_dir / 'dataset_mask.npz'}")
 
@@ -294,7 +312,7 @@ def _visible_moving_frames(
             moving = sm.moving.get(fi, frozenset())
             if not moving:
                 continue
-            key = f"mask_{int(frames[fi]['id']):010d}"
+            key = gt_key("mask", fi)
             if key not in masks.files:
                 continue
             obj = masks[key] // 1000
@@ -356,8 +374,8 @@ def build_sample_index(
 
     ``meta["frames"]`` lists every camera frame, but ``dataset_mask.npz`` only
     stores masks for frames with segmentation ground truth. Frames without a
-    matching ``mask_<id>`` key are skipped so ``load_frame_sample`` never raises
-    a KeyError and ``len(dataset)`` reflects only loadable samples.
+    matching ``mask_<position>`` key (``gt_key``) are skipped so ``load_frame_sample``
+    never raises a KeyError and ``len(dataset)`` reflects only loadable samples.
 
     ``exclude_scenes``  drop sequences from these scenes (train/eval leakage and
                         the held-out validation scenes).
@@ -383,15 +401,13 @@ def build_sample_index(
         with np.load(seq_dir / "dataset_mask.npz") as masks:
             present = set(masks.files)
         frames = meta["frames"]
-        hits = [fi for fi, fr in enumerate(frames)
-                if f"mask_{int(fr['id']):010d}" in present]
-        # Some EVIMO exports number masks from 0 while the frame ids start from an
-        # offset. Then a handful of ids collide by coincidence and would pair a
-        # surface with the WRONG mask, so drop the whole sequence.
+        hits = [fi for fi in range(len(frames)) if gt_key("mask", fi) in present]
+        # Masks are keyed by frame POSITION (gt_key), so every export matches; a low
+        # ratio would now mean a genuinely incomplete sequence.
         ratio = len(hits) / max(len(frames), 1)
         if ratio < min_match:
             print(f"[data] skipping {seq_dir.name}: only {len(hits)}/{len(frames)} "
-                  f"frames match a mask ({ratio:.0%}) — inconsistent mask indexing")
+                  f"frames have a mask ({ratio:.0%})")
             continue
 
         # Drop frames whose surfaces would be empty: the multi-time stack reaches

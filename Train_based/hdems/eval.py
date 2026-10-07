@@ -11,6 +11,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
+from hdems import protocols as bm
 from hdems.config import apply_resolution_ratio, restore_frontend
 from hdems.data.build import build_dataset as _build_dataset
 from hdems.losses.flow import epe_loss
@@ -359,6 +360,38 @@ def measure_seg_latency(model: HDEMS, surface: torch.Tensor, device: torch.devic
     return (time.perf_counter() - t0) / repeats * 1000.0
 
 
+def run_published_benchmark(args, cfg: dict, model: HDEMS, dataset, eval_split: str,
+                            device: torch.device) -> None:
+    """--benchmark: score every frame of the paper's sequences with the paper's metric.
+
+    --max-samples caps the frames PER SEQUENCE (evenly spaced) for smoke tests.
+    """
+    bench = bm.BENCHMARKS[args.benchmark]
+    s = bm.settings(cfg, gt=args.benchmark_gt, pred=args.benchmark_pred,
+                    windows_ms=args.benchmark_window_ms)
+    base = dataset.dataset if isinstance(dataset, Subset) else dataset
+    if eval_split != bench.split:
+        base = build_dataset(cfg, split=bench.split)
+    scores, stats = bm.run_benchmark(
+        model, base, bench, device,
+        windows_ms=s["event_windows_ms"], gt_mode=s["gt"], pred_source=s["pred"],
+        grouping=grouping_params(cfg) if s["pred"] == "objects" else None,
+        min_gt_events=s["min_gt_events"],
+        max_per_sequence=args.max_samples,
+    )
+    print(bm.format_report(bench, scores, stats, gt_mode=s["gt"], pred_source=s["pred"]))
+    if args.max_samples:
+        print(f"(smoke test: at most {args.max_samples} frames per sequence -- not comparable)")
+    if args.benchmark_out:
+        bm.save_json(Path(args.benchmark_out), bench, scores, stats,
+                     {**s, "head": model.seg_head.__class__.__name__,
+                      "checkpoint": args.checkpoint or args.ridge_checkpoint or args.prototype_checkpoint,
+                      "max_per_sequence": args.max_samples})
+        print(f"Per-frame scores -> {Path(args.benchmark_out).resolve()}")
+    if model.flow_cache is not None:
+        print(model.flow_cache.summary())
+
+
 def _apply_head_config(cfg: dict, head: str | None) -> dict:
     cfg = dict(cfg)
     seg = dict(cfg.get("segmentation", {}))
@@ -420,6 +453,20 @@ def main() -> None:
                         help="Also predict every frame without the motion input and without "
                              "the appearance input, and report how much each changes the "
                              "result. A motion segmenter must collapse without motion.")
+    parser.add_argument("--benchmark", choices=list(bm.BENCHMARKS), default=None,
+                        help="Score with a PUBLISHED protocol instead of ours and print the "
+                             "paper's table next to our numbers (hdems/protocols.py). "
+                             "hua2025 = IoU over events, full resolution, 5 EVIMO2 sequences.")
+    parser.add_argument("--benchmark-gt", choices=list(bm.GT_MODES), default=None,
+                        help="Which objects count as moving (default: config benchmark.gt).")
+    parser.add_argument("--benchmark-pred", choices=list(bm.PRED_SOURCES), default=None,
+                        help="fg = the head's moving pixels | objects = only pixels the motion "
+                             "grouping keeps (default: config benchmark.pred).")
+    parser.add_argument("--benchmark-window-ms", type=float, nargs="+", default=None,
+                        help="Event window(s) per frame, ms before the label time "
+                             "(default: config benchmark.event_windows_ms).")
+    parser.add_argument("--benchmark-out", type=str, default=None,
+                        help="Write the per-frame benchmark scores to this .json file.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -573,6 +620,9 @@ def main() -> None:
             return
 
         model = build_model(head)
+        if args.benchmark:
+            run_published_benchmark(args, cfg, model, dataset, eval_split, device)
+            return
         rk = {}
         if head == "ridge" and (args.ridge_checkpoint or seg_cfg.get("ridge_weights")):
             rpath = args.ridge_checkpoint or seg_cfg.get("ridge_weights")

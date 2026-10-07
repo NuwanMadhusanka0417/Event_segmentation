@@ -72,7 +72,7 @@ def main() -> None:
             frame = meta_cache[seq_dir]["frames"][fi]
 
             sample = load_frame_sample(
-                seq_dir, frame,
+                seq_dir, frame, frame_index=fi,
                 out_height=height, out_width=width,
                 window_s=window_s, decay=decay,
                 time_fracs=time_fracs,

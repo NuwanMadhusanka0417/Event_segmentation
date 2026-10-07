@@ -123,6 +123,20 @@ eval:
   split: eval
   # max_samples: 20       # optional: eval on first N frames (or CLI --max-samples)
 
+benchmark:               # PUBLISHED protocols: python -m hdems.eval ... --benchmark hua2025
+  #                        hua2025 = Hua, Yuan & Fermueller 2025 (arXiv:2507.14500): IoU over
+  #                        EVENTS at full sensor resolution, frames with a moving object only,
+  #                        per-frame IoU averaged per sequence (13-00 13-05 14-03 14-04 14-05),
+  #                        no ignore band. The paper does not state the two settings below.
+  event_windows_ms: [12.5, 50.0]   # events scored per frame = the last w ms before the label
+  #                        time; one table per value
+  gt: moving             # moving      = pose speed >= motion_label.move_px (our label)
+  #                        moving_slow = also the slow objects our training ignores
+  #                        tracked     = every masked object (includes the static table)
+  pred: fg               # fg = the head's moving pixels | objects = after motion grouping
+  #                        (drops groups that do not move relative to the camera)
+  min_gt_events: 1       # a frame "contains a moving object" with >= this many GT-moving events
+
 velocity:
   vel_norm: fixed        # velocity code units: fixed = vel_unit_px per FPE unit, same in every
   #                        frame | frame = rescaled by the frame's 95th percentile (old: on a
