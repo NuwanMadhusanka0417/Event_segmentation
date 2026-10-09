@@ -10,7 +10,8 @@
 #PBS -l wd
 #PBS -j oe
 # ^ -l wd  : start in the directory you ran qsub from
-#   -j oe  : merge stdout+stderr into one log (lands as hdems_seg.o<jobid> in that dir)
+#   -j oe  : merge stdout+stderr into one log (lands as hdems_seg_group.o<jobid> in that dir
+#            when the job ends; a copy is written live into the run's results folder)
 
 set -eo pipefail   # stop immediately if fit fails, so eval never runs on a stale/missing checkpoint
 
@@ -80,6 +81,18 @@ CKPT="checkpoints/${RUN_NAME}.pt"
 RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${RESULTS_DIR}"
 
+# Job log in the results folder too: from here on, everything (run configuration,
+# training, eval, control, benchmark, errors) goes to the PBS log AND to
+# ${RESULTS_DIR}/<job name>.o<job number> -- the same name as the PBS copy. PBS only
+# delivers its copy when the job ends; this one fills up while the job runs (tail -f).
+JOB_NUM="${PBS_JOBID%%.*}"
+LOG_FILE="${RESULTS_DIR}/${PBS_JOBNAME:-hdems_seg_group}.o${JOB_NUM:-local}"
+export PYTHONUNBUFFERED=1          # python output reaches the log at once and in order
+exec > >(tee -a "${LOG_FILE}") 2>&1
+LOG_TEE_PID=$!
+# On exit -- also when a step fails -- let tee write the last lines before PBS ends the job.
+trap 'exec >&- 2>&-; wait "${LOG_TEE_PID}" 2>/dev/null || true' EXIT
+
 # ---------------------------------------------------------------------------
 # RUN CONFIGURATION  (printed first, so every log explains its own results)
 # Also saved to ${RESULTS_DIR}/run_config.txt next to the eval images.
@@ -94,6 +107,7 @@ echo " Host       : $(hostname)"
 echo " Run name   : ${RUN_NAME}"
 echo " Checkpoint : ${CODE_DIR}/${CKPT}"
 echo " Results    : ${CODE_DIR}/${RESULTS_DIR}"
+echo " Log        : ${CODE_DIR}/${LOG_FILE}"
 echo
 echo "--- run parameters (this script) ------------------------------"
 printf '  %-16s %s\n' \
@@ -201,7 +215,7 @@ if [ "${BENCHMARK}" != "none" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. COLLECT  (keep a copy of the checkpoint + this log next to the results)
+# 3. COLLECT  (keep a copy of the checkpoint next to the results; the log is already there)
 # ---------------------------------------------------------------------------
 cp "${CKPT}" "${RESULTS_DIR}/" 2>/dev/null || true
 echo "=== Job ${PBS_JOBID} (${RUN_NAME}) finished $(date)  --  elapsed $((SECONDS/3600))h $((SECONDS%3600/60))m ==="
@@ -210,5 +224,6 @@ echo "=== Job ${PBS_JOBID} (${RUN_NAME}) finished $(date)  --  elapsed $((SECOND
 
 #qsub run_segmentation.pbs        # submit; prints a job id like 12345678.gadi-pbs
 #qstat -u nk8155                  # check status: Q=queued, R=running, done=gone from list
-#tail -f hdems_seg.o12345678      # watch the log live while it runs
+#tail -f results/<run>_<date>/hdems_seg_group.o12345678   # watch the log live while it runs
+#                                  (the PBS copy in the qsub folder only appears at the end)
 #qdel 12345678                    # ONLY if you want to cancel early
