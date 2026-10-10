@@ -22,6 +22,27 @@ _SOBEL_X = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]).
 _SOBEL_Y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]).view(1, 1, 3, 3)
 
 
+def rot_flow_of(batch: dict, device: torch.device | str | None = None) -> torch.Tensor | None:
+    """The batch's camera-rotation flow (sample["rot_flow"], hdems.imu) or None."""
+    r = batch.get("rot_flow") if isinstance(batch, dict) else None
+    if r is None:
+        return None
+    r = r if r.dim() == 4 else r.unsqueeze(0)
+    return r.to(device) if device is not None else r
+
+
+def predict_labels(logits: torch.Tensor, threshold: float | None = None) -> torch.Tensor:
+    """(B, C, H, W) logits -> (B, H, W) labels.
+
+    Two classes and a ``threshold``: moving where P(moving) > threshold (the decision
+    threshold tuned on validation, stored in the checkpoint). Otherwise argmax, which
+    for two classes is the threshold 0.5.
+    """
+    if threshold is None or logits.shape[1] != 2:
+        return logits.argmax(dim=1)
+    return (logits.softmax(dim=1)[:, 1] > float(threshold)).long()
+
+
 def event_valid_mask(surface: torch.Tensor, *, threshold: float = 1e-6) -> torch.Tensor:
     if surface.dim() == 3:
         surface = surface.unsqueeze(0)

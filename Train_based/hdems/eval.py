@@ -21,12 +21,13 @@ from hdems.data.labels import LABEL_MODES, num_classes_for, resolve_label_mode
 from hdems.data.motion_labels import IGNORE_LABEL
 from hdems.grouping import GroupingParams, group_objects
 from hdems.grouping import params_from_config as grouping_params
+from hdems.imu import ROT_SOURCES
 from hdems.visualize import save_event_colour_figure
 from hdems.detection import detection_metrics, masks_to_boxes
 from hdems.instances import binary_iou, connected_components, instance_metrics
 from hdems.models.hdems import ABLATIONS, HDEMS
 from hdems.vsa.velocity import EVENT_COMBINES
-from hdems.seg_features import score_pixel_mask
+from hdems.seg_features import predict_labels, rot_flow_of, score_pixel_mask
 
 HEADS = ("cnn", "mfcnn", "mfunet", "ridge", "prototype", "motion")
 
@@ -196,9 +197,11 @@ def evaluate_segmentation(
     if color_dir is not None:
         color_dir.mkdir(parents=True, exist_ok=True)
 
+    thr = getattr(model, "decision_threshold", None)
     for batch in loader:
         surface = batch["surface"].to(device)
         mask = batch["mask"].to(device).long()
+        rot = rot_flow_of(batch, device)
         # Score on EVENT pixels only (pixels without events carry no evidence), only
         # on events near the label time (older ones are the trail a mover leaves
         # behind, which the label calls static), and never on the ignore label
@@ -211,11 +214,11 @@ def evaluate_segmentation(
             # so the front end is skipped entirely (no loss is reported).
             pred = events_t.long()
         else:
-            out_m = model(surface, task="segmentation")
+            out_m = model(surface, task="segmentation", rot_flow=rot)
             logits, flow = out_m["seg_logits"], out_m.get("flow")
             if valid.any():
                 total_loss += seg_loss(logits, mask.masked_fill(~valid, IGNORE_LABEL)).item()
-            pred = logits.argmax(dim=1)
+            pred = predict_labels(logits, thr)
         ious.append(mean_iou(pred[0], mask[0], num_classes, valid=valid[0]))
 
         objects = objects_gt_mask = gt_inst = None
@@ -236,7 +239,9 @@ def evaluate_segmentation(
             if grouping is not None and flow is not None:
                 # objects = the CNN's moving pixels grouped by motion model (the same
                 # ego-compensated velocity the head saw)
-                res, _ = model.residual_from_flow(flow, surface)
+                res = out_m.get("residual")
+                if res is None:
+                    res, _ = model.residual_from_flow(flow, surface, rot)
                 res = res[0].cpu().numpy()
                 objects = group_objects(res, pred_fg & ev, grouping)
                 if gt_inst is not None and ((gt_inst > 0) & ev).any():
@@ -258,7 +263,7 @@ def evaluate_segmentation(
             for what in ABLATIONS:
                 model.ablate = what
                 try:
-                    p2 = model(surface, task="segmentation")["seg_logits"].argmax(dim=1)
+                    p2 = predict_labels(model(surface, task="segmentation", rot_flow=rot)["seg_logits"], thr)
                 finally:
                     model.ablate = None
                 a = abl[what]
@@ -467,6 +472,12 @@ def main() -> None:
                              "(default: config benchmark.event_windows_ms).")
     parser.add_argument("--benchmark-out", type=str, default=None,
                         help="Write the per-frame benchmark scores to this .json file.")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Decision threshold on P(moving) (default: the one tuned on "
+                             "validation and stored in the checkpoint, else argmax).")
+    parser.add_argument("--rot-source", choices=list(ROT_SOURCES), default=None,
+                        help="Override motion.rot_source of the checkpoint, e.g. 'vicon' = "
+                             "ground-truth rotation (an ORACLE upper bound, not a result).")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -517,6 +528,9 @@ def main() -> None:
                     print("[eval] front end restored from checkpoint")
         except Exception as e:
             print(f"[eval] could not read checkpoint metadata ({e}); using the YAML")
+    if args.rot_source:                 # e.g. the Vicon oracle on an IMU-trained head
+        cfg["motion"] = {**(cfg.get("motion") or {}), "rot_source": args.rot_source}
+        print(f"[eval] camera rotation source overridden: {args.rot_source}")
     # --resolution-ratio overrides; otherwise the checkpoint's (via frontend) or YAML's.
     cfg = apply_resolution_ratio(cfg, args.resolution_ratio, verbose=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -560,6 +574,12 @@ def main() -> None:
                 ckpt = torch.load(cpath, map_location=device, weights_only=True)
                 state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
                 model.load_state_dict(state, strict=False)
+                # decision threshold tuned on validation (fit_ridge_head); None = argmax
+                stored = ckpt.get("decision_threshold") if isinstance(ckpt, dict) else None
+                model.decision_threshold = args.threshold if args.threshold is not None else stored
+                if model.decision_threshold is not None:
+                    print(f"[eval] decision threshold P(moving) > {model.decision_threshold:.2f}"
+                          f" ({'--threshold' if args.threshold is not None else 'from the checkpoint'})")
             elif task == "segmentation":
                 raise SystemExit(f"a checkpoint is required for head={head_name!r} "
                                  "(an untrained head would give meaningless results)")

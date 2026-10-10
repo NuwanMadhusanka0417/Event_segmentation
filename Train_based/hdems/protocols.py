@@ -41,7 +41,7 @@ import torch.nn.functional as F
 from hdems.data.evimo2_reader import gt_key, load_meta
 from hdems.data.motion_labels import MotionParams, sequence_motion
 from hdems.grouping import GroupingParams, group_objects
-from hdems.seg_features import score_pixel_mask
+from hdems.seg_features import predict_labels, rot_flow_of, score_pixel_mask
 
 GT_MODES = ("moving", "moving_slow", "tracked")
 PRED_SOURCES = ("fg", "objects")   # fg = the head's moving pixels | objects = after grouping
@@ -188,6 +188,103 @@ def _spread_cap(items: list[int], cap: int | None) -> list[int]:
     return [items[i] for i in pos]
 
 
+class GTFrames:
+    """GT-moving pixels and the events of each window for frames of an EVIMODataset,
+    at full sensor resolution (masks, metadata and event files opened once)."""
+
+    def __init__(self, dataset: Any, windows_ms: Iterable[float], gt_mode: str = "moving",
+                 min_gt_events: int = 1) -> None:
+        self.dataset = dataset
+        self.windows = [float(w) for w in windows_ms]
+        self.gt_mode = gt_mode
+        self.min_gt_events = int(min_gt_events)
+        self.params: MotionParams = dataset.motion_params
+        self.metas: dict[Path, dict] = {}
+        self.masks: dict[Path, Any] = {}
+        self.streams: dict[Path, EventStream] = {}
+
+    def __call__(self, k: int):
+        """-> (gt (H, W) bool, {window: (x, y)}, frame index, ts), or the reason it is
+        skipped: "no_gt_pixels" / "no_gt_events"."""
+        seq_dir, fi = self.dataset.index[k]
+        seq_dir = Path(seq_dir)
+        if seq_dir not in self.metas:
+            self.metas[seq_dir] = load_meta(seq_dir)
+            self.masks[seq_dir] = np.load(seq_dir / "dataset_mask.npz")
+            self.streams[seq_dir] = EventStream(seq_dir)
+        meta = self.metas[seq_dir]
+        obj = self.masks[seq_dir][gt_key("mask", fi)] // 1000
+        sm = sequence_motion(seq_dir, self.params, meta)
+        gt = gt_moving_pixels(obj, sm.moving.get(fi, ()),
+                              slow_objects(seq_dir, fi, self.params, meta), self.gt_mode)
+        if not gt.any():
+            return "no_gt_pixels"
+        H, W = obj.shape
+        ts = float(meta["frames"][fi]["ts"])
+        evs = {w: self.streams[seq_dir].window(ts - w / 1000.0, ts, H, W) for w in self.windows}
+        if max(int(gt[y, x].sum()) for x, y in evs.values()) < self.min_gt_events:
+            return "no_gt_events"
+        return gt, evs, int(fi), ts
+
+    def close(self) -> None:
+        for m in self.masks.values():
+            m.close()
+        self.masks.clear()
+        self.metas.clear()
+
+
+def moving_probability(model: Any, sample: dict, device: torch.device) -> torch.Tensor:
+    """(H, W) P(moving) at working resolution for one dataset sample."""
+    surface = sample["surface"].unsqueeze(0).to(device)
+    out = model(surface, task="segmentation", rot_flow=rot_flow_of(sample, device))
+    return out["seg_logits"].softmax(dim=1)[0, 1]
+
+
+@torch.no_grad()
+def validate_event_iou(
+    model: Any,
+    dataset: Any,
+    device: torch.device,
+    *,
+    thresholds: Iterable[float] = (0.5,),
+    window_ms: float = 12.5,
+    gt_mode: str = "moving",
+    max_frames: int | None = None,
+) -> tuple[dict[float, float], int]:
+    """The benchmark's metric on any EVIMO split, for MODEL SELECTION (validation).
+
+    Mean per-frame IoU over events (full sensor resolution), frames that contain a
+    moving object only -- what the published comparison measures, instead of the
+    per-frame pixel IoU over all frames (where a static frame with one false pixel
+    scores 0 and dominates the mean). One forward per frame serves every threshold.
+    ``dataset`` may be a Subset of an EVIMODataset. -> ({threshold: mean IoU}, frames).
+    """
+    base = dataset.dataset if hasattr(dataset, "indices") else dataset
+    pool = list(dataset.indices) if hasattr(dataset, "indices") else list(range(len(base)))
+    thresholds = [float(t) for t in thresholds]
+    gtf = GTFrames(base, [window_ms], gt_mode)
+    model.eval()
+    ious: dict[float, list[float]] = {t: [] for t in thresholds}
+    try:
+        keep = [k for k in pool if not isinstance(gtf(k), str)]
+        for k in _spread_cap(keep, max_frames):
+            gt, evs, _fi, _ts = gtf(k)
+            H, W = gt.shape
+            prob = moving_probability(model, base[k], device)
+            prob_full = F.interpolate(prob[None, None].float(), size=(H, W), mode="nearest")[0, 0]
+            x, y = evs[float(window_ms)]
+            p_ev = prob_full.cpu().numpy()[y, x]
+            g_ev = gt[y, x]
+            for t in thresholds:
+                p = p_ev > t
+                union = int((p | g_ev).sum())
+                ious[t].append(int((p & g_ev).sum()) / union if union else float("nan"))
+    finally:
+        gtf.close()
+    n = len(next(iter(ious.values()))) if ious else 0
+    return {t: float(np.nanmean(v)) if v else float("nan") for t, v in ious.items()}, n
+
+
 @torch.no_grad()
 def run_benchmark(
     model: Any,
@@ -213,34 +310,9 @@ def run_benchmark(
     windows = [float(w) for w in windows_ms]
     if pred_source == "objects" and grouping is None:
         raise ValueError("pred='objects' needs grouping parameters")
-    params: MotionParams = dataset.motion_params
     model.eval()
-
-    metas: dict[Path, dict] = {}
-    masks: dict[Path, Any] = {}
-    streams: dict[Path, EventStream] = {}
-
-    def frame_gt(k: int):
-        """GT-moving pixels + each window's events of dataset frame k (None = no mover)."""
-        seq_dir, fi = dataset.index[k]
-        seq_dir = Path(seq_dir)
-        if seq_dir not in metas:
-            metas[seq_dir] = load_meta(seq_dir)
-            masks[seq_dir] = np.load(seq_dir / "dataset_mask.npz")
-            streams[seq_dir] = EventStream(seq_dir)
-        meta = metas[seq_dir]
-        obj = masks[seq_dir][gt_key("mask", fi)] // 1000
-        sm = sequence_motion(seq_dir, params, meta)
-        gt = gt_moving_pixels(obj, sm.moving.get(fi, ()),
-                              slow_objects(seq_dir, fi, params, meta), gt_mode)
-        if not gt.any():
-            return "no_gt_pixels"
-        H, W = obj.shape
-        ts = float(meta["frames"][fi]["ts"])
-        evs = {w: streams[seq_dir].window(ts - w / 1000.0, ts, H, W) for w in windows}
-        if max(int(gt[y, x].sum()) for x, y in evs.values()) < min_gt_events:
-            return "no_gt_events"
-        return gt, evs, int(fi), ts
+    thr = getattr(model, "decision_threshold", None)
+    frame_gt = GTFrames(dataset, windows, gt_mode, min_gt_events)
 
     all_frames: dict[str, list[int]] = {}
     for k, (seq_dir, _fi) in enumerate(dataset.index):
@@ -272,12 +344,15 @@ def run_benchmark(
             H, W = gt.shape
             sample = dataset[k]
             surface = sample["surface"].unsqueeze(0).to(device)
-            out = model(surface, task="segmentation")
-            pred_t = out["seg_logits"].argmax(dim=1)[0] > 0
+            rot = rot_flow_of(sample, device)
+            out = model(surface, task="segmentation", rot_flow=rot)
+            pred_t = predict_labels(out["seg_logits"], thr)[0] > 0
             if pred_source == "objects":
                 if out.get("flow") is None:
                     raise ValueError("pred='objects' needs a head that returns the flow")
-                res, _ = model.residual_from_flow(out["flow"], surface)
+                res = out.get("residual")
+                if res is None:
+                    res, _ = model.residual_from_flow(out["flow"], surface, rot)
                 ev = score_pixel_mask(sample, surface)[0]
                 objects = group_objects(res[0].cpu().numpy(),
                                         (pred_t & ev).cpu().numpy(), grouping)
@@ -296,8 +371,7 @@ def run_benchmark(
             if log_every and (n + 1) % log_every == 0:
                 print(f"[benchmark] {n + 1}/{len(order)} frames")
     finally:
-        for m in masks.values():
-            m.close()
+        frame_gt.close()
     return scores, stats
 
 

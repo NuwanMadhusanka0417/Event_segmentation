@@ -34,9 +34,16 @@ def flip_sample(sample: dict[str, Any], dims: tuple[int, ...]) -> dict[str, Any]
     if not dims:
         return sample
     hw = tuple(sample["mask"].shape[-2:])
-    return {k: (torch.flip(v, dims) if isinstance(v, torch.Tensor) and v.dim() >= 2
-                and tuple(v.shape[-2:]) == hw else v)
-            for k, v in sample.items()}
+    out = {k: (torch.flip(v, dims) if isinstance(v, torch.Tensor) and v.dim() >= 2
+               and tuple(v.shape[-2:]) == hw else v)
+           for k, v in sample.items()}
+    if "rot_flow" in out:
+        # a displacement FIELD: mirroring the image also mirrors the vectors
+        # (a horizontal flip negates u, a vertical flip negates v), exactly as the
+        # flow re-measured on the flipped surfaces does
+        sign = torch.tensor([-1.0 if -1 in dims else 1.0, -1.0 if -2 in dims else 1.0])
+        out["rot_flow"] = out["rot_flow"] * sign.view(2, 1, 1)
+    return out
 
 
 class EVIMODataset(Dataset):
@@ -77,6 +84,8 @@ class EVIMODataset(Dataset):
         score_window_ms: float | None = None,
         use_shards: bool = False,
         augment: bool = False,
+        rotation: Any = None,
+        res_ratio: int = 1,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -94,6 +103,13 @@ class EVIMODataset(Dataset):
         # random flip / 180-degree rotation per sample (training only): 3 training
         # scenes are little data, and mirrored motion is still valid motion
         self.augment = bool(augment)
+        # Camera rotation (hdems.imu.RotationSource): each sample gets ``rot_flow``, the
+        # image motion the rotation causes over ONE flow interval, in working pixels --
+        # the same units and direction as the front end's flow (targets lie earlier).
+        self.rotation = rotation if rotation is not None and rotation.source != "none" else None
+        self.res_ratio = int(res_ratio)
+        tf = sorted((float(f) for f in (self.time_frames or [])), reverse=True)
+        self.interval_s = (tf[0] - tf[1]) * self.window_s if len(tf) > 1 else None
 
         # Pre-built .pt shards bypass EVERY index filter (scene-disjoint split, held-out
         # validation scenes, require_mover, rigid groups) and freeze the time frames,
@@ -149,7 +165,7 @@ class EVIMODataset(Dataset):
         moving, ambiguous = frame_motion(seq_dir, frame_idx, self.motion_params, meta)
         # moving objects that move TOGETHER are one object (independent motion)
         rigid = rigid_groups(meta, frame_idx, moving) if moving else {}
-        return self._apply_labels(
+        out = self._apply_labels(
             load_frame_sample(
                 seq_dir,
                 frame,
@@ -165,6 +181,20 @@ class EVIMODataset(Dataset):
             ambiguous=ambiguous,
             rigid=rigid,
         )
+        if self.rotation is not None and self.interval_s:
+            out["rot_flow"] = self._rot_flow(seq_dir, meta, float(frame["ts"]))
+        return out
+
+    def _rot_flow(self, seq_dir: Path, meta: dict[str, Any], ts: float) -> torch.Tensor:
+        """(2, H, W) rotational flow over one interval; zeros where there is no rate."""
+        from hdems.imu import rotation_flow
+        w = self.rotation.omega(seq_dir.name, meta, ts)
+        if w is None:
+            return torch.zeros(2, self.height, self.width)
+        mm = meta["meta"]
+        return torch.from_numpy(rotation_flow(
+            w, float(mm["fx"]), float(mm["fy"]), float(mm["cx"]), float(mm["cy"]),
+            self.interval_s, self.height, self.width, self.res_ratio))
 
     def _apply_labels(
         self,

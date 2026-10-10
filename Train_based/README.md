@@ -429,6 +429,41 @@ motion grouping, one colour each** | the same grouping on the ground-truth movin
 pixels (best case) | ground-truth objects. Everything is drawn **only at event
 pixels** — the rest is untrained guesswork.
 
+## Camera rotation from the IMU, and the motion pipeline (`motion:`)
+
+The benchmark breakdown of the r2_2000 model (491 test frames) found camera motion
+to be the main loss: event IoU 62.7% with a still camera, 18% when it rotates faster
+than 60 deg/s. Large movers captured the affine ego fit, and slow (< 2 px / 50 ms)
+or small movers were not seen at all. The `motion:` section addresses each:
+
+| option | what it does |
+|---|---|
+| `rot_source: imu` | the gyroscope rate (Prophesee IMU on the rig, `dataset_info.npz` meta["imu"]) is turned into the image motion it causes over one flow interval (`hdems/imu.py`, `sample["rot_flow"]`) and removed from the flow before the ego fit. `vicon` = ground-truth rotation: an oracle / upper bound only. `none` = events only |
+| `ego_model: quadratic` | 6 coefficients per axis (rotation and a translating camera over a plane give quadratic flow), one robust weight per pixel for both axes, Tukey weights |
+| `ego_prior_px` | with the rotation removed, the fit starts at "nothing moves", so a large mover cannot capture it |
+| `fine_flow` | a second Eq.12 estimate from the same cost volume, lighter pooling (15 px) and a lower threshold (0.6) |
+| `vsa_consistency` | cos(F0(x), F_k(x + background displacement)) for the surfaces 12.5 / 25 / 50 ms earlier: the VSA descriptor tests at sub-pixel precision whether a pixel is where the static scene would be |
+| `extra_inputs` | the derotated flow vector and the rotation speed as head inputs |
+
+**Calibration.** The Samsung camera has no IMU; the Prophesee gyroscopes are on the
+same rig, so one fixed rotation (plus a time offset) maps them into the Samsung frame.
+`scripts/calibrate_imu.py` estimates it on the TRAINING sequences only (Procrustes
+against the motion-capture rate) -> `configs/imu_calib.json`. Measured: left IMU,
+offset +22 ms, per-axis correlation 0.978 / 0.998 / 0.994.
+
+**Checked on real data (no training).** On 48 test frames the IMU rotational flow
+matches the measured flow on static pixels (correlation 0.84). AUC(moving vs
+static, recent-event pixels): old affine 0.818 -> IMU + quadratic + anchored 0.846
+(Vicon: 0.847, so the gyro is as good as ground truth here).
+
+Old checkpoints rebuild the old pipeline (config `_LEGACY_FRONTEND`). Training now
+picks the epoch with the benchmark metric on the held-out scene (`train.val_metric:
+event_iou`) and tunes the P(moving) threshold there (`decision_threshold` in the
+checkpoint, used by eval and the benchmark; `--threshold` overrides).
+
+PBS: `ROT_SOURCE`, `EGO_MODEL`, `FINE_FLOW`, `VSA_CONS`, `EXTRA_INPUTS`, and
+`ORACLE=yes` for an extra benchmark run with the Vicon rotation (upper bound).
+
 ## Comparing with a published method (`--benchmark`)
 
 ```bash

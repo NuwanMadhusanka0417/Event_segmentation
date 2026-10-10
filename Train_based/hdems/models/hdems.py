@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from hdems.config import apply_resolution_ratio, frontend_option, resolution_ratio_of
 from hdems.data.time_surface import build_pyramid
@@ -14,7 +15,7 @@ from hdems.flow_cache import FlowCache
 from hdems.models.decoder import FlowDecoder
 from hdems.models.encoder import VSAEncoder
 from hdems.models.matching import HierarchicalMatcher
-from hdems.models.motion import decode_flow, ego_residual
+from hdems.models.motion import decode_flow, ego_residual, ego_residual_joint
 from hdems.models.paper_flow import flow_from_cost, multiscale_cost_volume
 from hdems.models.prototype_head import PrototypeHead
 from hdems.models.segmentation import (
@@ -34,6 +35,8 @@ from hdems.vsa.velocity import (
     MOTION_SCALARS,
     combine_event_velocity,
     encode_velocity,
+    extra_channel_count,
+    extra_motion_channels,
     motion_scalars,
     unit_rms,
 )
@@ -141,6 +144,32 @@ class HDEMS(nn.Module):
                 raise ValueError(f"velocity.axis_combine must be bind|bundle, got {self.axis_combine!r}")
             mv_ch = 2 * d_hv if self.hv_input == "pv_concat" else d_hv
 
+        # Motion pipeline (motion section, 2026-10-11; old checkpoints restore the old
+        # behaviour through config._LEGACY_FRONTEND):
+        #   rot_source       camera rotation removed BEFORE the ego fit (rot_flow input)
+        #   ego_model        affine (old) | quadratic, ego_prior_px anchors the fit at
+        #                    "nothing moves" once the rotation is gone (sensor px/interval)
+        #   fine_flow        second Eq.12 estimate from the SAME cost volume, lightly
+        #                    pooled: slow and small movers that sc=71 / alpha 0.85 erase
+        #   extra_inputs     derotated flow vector + rotation speed for the head
+        #   vsa_consistency  cos(F0(x), F_k(x + background displacement)) per earlier
+        #                    surface: the VSA descriptor itself tests "is this pixel
+        #                    where the static scene would be?" at sub-pixel precision
+        self.rot_source = str(frontend_option(cfg, "motion", "rot_source"))
+        self.ego_model = str(frontend_option(cfg, "motion", "ego_model"))
+        self.ego_prior_px = float(frontend_option(cfg, "motion", "ego_prior_px"))
+        self.fine_flow = bool(frontend_option(cfg, "motion", "fine_flow"))
+        self.fine_alpha = float(frontend_option(cfg, "motion", "fine_alpha"))
+        self.fine_smooth = int(frontend_option(cfg, "motion", "fine_smooth"))
+        self.extra_inputs = bool(frontend_option(cfg, "motion", "extra_inputs"))
+        self.vsa_consistency = bool(frontend_option(cfg, "motion", "vsa_consistency"))
+        tf_all = [float(f) for f in tf]
+        step = (tf_all[0] - tf_all[1]) if len(tf_all) > 1 else 1.0
+        # earlier surfaces, in flow intervals before the reference (1, 2, 4)
+        self.target_spans = [(tf_all[0] - f) / step for f in tf_all[1:]] if len(tf_all) > 1 else []
+        self.n_motion_ch = MOTION_SCALARS + extra_channel_count(
+            self.extra_inputs, self.fine_flow, len(self.target_spans) if self.vsa_consistency else 0)
+
         if self.head_type == "ridge":
             self.seg_head = RidgeHead(
                 num_classes=num_classes,
@@ -164,7 +193,7 @@ class HDEMS(nn.Module):
                 motion_dim=int(seg.get("mf_motion_dim", 32)),
                 app_dim=int(seg.get("mf_app_dim", 8)),
                 app_dropout=float(seg.get("mf_app_dropout", 0.5)),
-                scalar_ch=MOTION_SCALARS,
+                scalar_ch=self.n_motion_ch,
                 mv_ch=mv_ch,
             )
         elif self.head_type == "mfunet":  # the same inputs + evidence channels, U-Net view
@@ -174,8 +203,8 @@ class HDEMS(nn.Module):
                 motion_dim=int(seg.get("mf_motion_dim", 32)),
                 app_dim=int(seg.get("mf_app_dim", 8)),
                 app_dropout=float(seg.get("mf_app_dropout", 0.5)),
-                scalar_ch=MOTION_SCALARS + EVIDENCE_CHANNELS,
-                app_scalars=(MOTION_SCALARS,),      # event density goes with appearance
+                scalar_ch=self.n_motion_ch + EVIDENCE_CHANNELS,
+                app_scalars=(self.n_motion_ch,),    # event density goes with appearance
                 mv_ch=mv_ch,
                 widths=tuple(int(w) for w in seg.get("mf_widths", (32, 64, 96, 128))),
             )
@@ -240,31 +269,131 @@ class HDEMS(nn.Module):
             return event_pixel_mask(surfaces[:, :1])
         return event_pixel_mask(surfaces)
 
-    def residual_from_flow(self, flow: torch.Tensor, surfaces: torch.Tensor):
-        """Ego-compensated (residual) velocity, working px per interval."""
-        return ego_residual(flow, iters=self.ego_iters, valid=self.ego_mask(surfaces))
+    def _rot(self, rot_flow: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor | None:
+        """The rotational flow this model uses (None when motion.rot_source = none)."""
+        if rot_flow is None or self.rot_source == "none":
+            return None
+        rot_flow = rot_flow.to(device=like.device, dtype=like.dtype)
+        return rot_flow.unsqueeze(0) if rot_flow.dim() == 3 else rot_flow
 
-    def motion_inputs(self, surfaces: torch.Tensor):
-        """Shared front end of every multi-time head -> (flow, confidence, residual, X).
+    def background_fit(self, flow: torch.Tensor, surfaces: torch.Tensor,
+                       rot_flow: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Flow -> (residual, background displacement), working px per interval.
 
-        X is the event HV of the reference surface (Phi or F), unit-RMS when
-        velocity.x_norm = rms. ``self.ablate`` zeroes one of the two inputs.
+        The camera rotation (``rot_flow``, from the IMU) is removed first; the ego
+        model (motion.ego_model) is fitted to what is left. background = rotation +
+        fitted model, i.e. where a STATIC point would have moved.
         """
-        flow, conf = self.compute_motion(surfaces)
-        residual, _ = self.residual_from_flow(flow, surfaces)
+        rot = self._rot(rot_flow, flow)
+        f = flow if rot is None else flow - rot
+        valid = self.ego_mask(surfaces)
+        if self.ego_model == "affine" and not (self.ego_prior_px and rot is not None):
+            residual, _ = ego_residual(f, iters=self.ego_iters, valid=valid)     # original
+        else:
+            # "start from nothing moves" only makes sense once the rotation is removed
+            prior = self.ego_prior_px / self.res_ratio if (self.ego_prior_px and rot is not None) else None
+            residual, _ = ego_residual_joint(f, iters=max(self.ego_iters, 4), valid=valid,
+                                             model=self.ego_model, prior_px=prior)
+        return residual, flow - residual
+
+    def residual_from_flow(self, flow: torch.Tensor, surfaces: torch.Tensor,
+                           rot_flow: torch.Tensor | None = None):
+        """Ego-compensated (residual) velocity, working px per interval -> (residual, |residual|)."""
+        residual, _ = self.background_fit(flow, surfaces, rot_flow)
+        return residual, residual.pow(2).sum(1, keepdim=True).clamp_min(1e-12).sqrt()
+
+    def consistency_maps(self, surfaces: torch.Tensor, f0: torch.Tensor,
+                         background: torch.Tensor) -> torch.Tensor:
+        """VSA ego-consistency -> (B, K, H, W), one map per earlier surface k.
+
+            c_k(x) = cos( F0(x), F_k(x + n_k * background(x)) )
+
+        F_k is sampled at the sub-pixel position a STATIC point would occupy n_k flow
+        intervals earlier (n_k = 1, 2, 4), so a static pixel matches (c ~ 1) and a
+        moving one does not. It uses the descriptor at full working resolution: no
+        MxM grid, no Eq.12 pooling, no thresholding -- what erases slow and small
+        movers in the flow -- and the 50 ms surface makes slow motion 4x larger.
+        """
+        B, _, H, W = f0.shape
+        yy, xx = torch.meshgrid(torch.arange(H, device=f0.device, dtype=torch.float32),
+                                torch.arange(W, device=f0.device, dtype=torch.float32), indexing="ij")
+        a = f0 / (f0.abs().pow(2).sum(1, keepdim=True).sqrt() + 1e-6)
+        out = []
+        for k, n in enumerate(self.target_spans, start=1):
+            fk = self.encoder(surfaces[:, k])
+            d = background.float() * n
+            gx = (xx + d[:, 0]) / max(W - 1, 1) * 2.0 - 1.0
+            gy = (yy + d[:, 1]) / max(H - 1, 1) * 2.0 - 1.0
+            grid = torch.stack([gx, gy], dim=-1)
+            fw = torch.complex(
+                F.grid_sample(fk.real, grid, mode="bilinear", padding_mode="zeros", align_corners=True),
+                F.grid_sample(fk.imag, grid, mode="bilinear", padding_mode="zeros", align_corners=True))
+            num = (a.conj() * fw).real.sum(1)
+            out.append(num / (fw.abs().pow(2).sum(1).sqrt() + 1e-6))
+        return torch.stack(out, dim=1).float()
+
+    def motion_features(self, surfaces: torch.Tensor,
+                        rot_flow: torch.Tensor | None = None) -> dict[str, torch.Tensor | None]:
+        """Shared front end of every multi-time head.
+
+        -> flow, conf, residual, x (event HV, unit-RMS when velocity.x_norm = rms),
+           background, rot, fine_residual, consistency (the last three may be None).
+        ``self.ablate`` zeroes the motion or the appearance inputs.
+        """
+        raw = self.compute_motion_all(surfaces)
+        flow, conf = raw[:, :2], raw[:, 2:3]
+        rot = self._rot(rot_flow, flow)
+        residual, background = self.background_fit(flow, surfaces, rot)
+        fine_res = raw[:, 3:5] - background if (self.fine_flow and raw.shape[1] >= 5) else None
         # Only the reference surface is needed for X, so a cache hit skips the other
-        # three encodes as well as the cost volume.
-        x = self.event_hv(self.encoder(surfaces[:, 0]))
+        # three encodes as well as the cost volume (unless vsa_consistency needs them).
+        f0 = self.encoder(surfaces[:, 0])
+        cons = (self.consistency_maps(surfaces, f0, background)
+                if self.vsa_consistency and self.target_spans else None)
+        x = self.event_hv(f0)
         if self.x_norm == "rms":
             # raw F is ~5-11x and Phi ~100-370x larger than the |.| = 1 velocity code
             x = unit_rms(x)
+        # what the head sees of the motion; "flow" itself stays the measured flow
+        flow_in = flow
         if self.ablate == "motion":
             residual = torch.zeros_like(residual)    # velocity code = FPE(0) everywhere
+            flow_in = torch.zeros_like(flow)
+            rot = None if rot is None else torch.zeros_like(rot)
+            fine_res = None if fine_res is None else torch.zeros_like(fine_res)
+            cons = None if cons is None else torch.zeros_like(cons)
         elif self.ablate == "appearance":
             x = torch.zeros_like(x)
         elif self.ablate is not None:
             raise ValueError(f"ablate must be one of {ABLATIONS} or None, got {self.ablate!r}")
-        return flow, conf, residual, x
+        return {"flow": flow, "flow_in": flow_in, "conf": conf, "residual": residual, "x": x,
+                "background": background, "rot": rot, "fine_residual": fine_res,
+                "consistency": cons}
+
+    def motion_inputs(self, surfaces: torch.Tensor, rot_flow: torch.Tensor | None = None):
+        """(flow, confidence, residual, X) -- see ``motion_features``."""
+        m = self.motion_features(surfaces, rot_flow)
+        return m["flow"], m["conf"], m["residual"], m["x"]
+
+    def motion_channels(self, m: dict[str, torch.Tensor | None], surfaces: torch.Tensor) -> torch.Tensor:
+        """Scalar motion channels of the motion-first heads, SENSOR px -> (B, n_motion_ch, H, W)."""
+        r = self.res_ratio
+        flow = m["flow_in"]
+        ch = motion_scalars(m["residual"] * r, event_pixel_mask(surfaces[:, :1]), flow * r,
+                            unit=self.vel_unit_px)
+        if self.n_motion_ch == MOTION_SCALARS:
+            return ch
+        zero = torch.zeros_like(flow)
+        rot = m["rot"] if m["rot"] is not None else zero
+        fine = m["fine_residual"] if m["fine_residual"] is not None else zero
+        extra = extra_motion_channels(
+            derotated=(flow - rot) * r if self.extra_inputs else None,
+            rotation=rot * r if self.extra_inputs else None,
+            fine_residual=fine * r if self.fine_flow else None,
+            consistency=m["consistency"] if self.vsa_consistency else None,
+            n_consistency=len(self.target_spans) if self.vsa_consistency else 0,
+            unit=self.vel_unit_px)
+        return torch.cat([ch, extra], dim=1)
 
     def evidence_channels(self, surfaces: torch.Tensor, conf: torch.Tensor) -> torch.Tensor:
         """Head mfunet: where the evidence is, and how much to trust the flow -> (B, 2, H, W).
@@ -344,27 +473,39 @@ class HDEMS(nn.Module):
     def _flow_uncached(self, surfaces: torch.Tensor) -> torch.Tensor:
         """Paper Eq.10-14: multi-time fields -> multi-scale cost volume -> flow.
 
-        Returns (B, 3, H, W) = [u_x, u_y, match confidence].
+        Returns (B, 3, H, W) = [u_x, u_y, match confidence], plus [u_x, u_y] of the
+        fine estimate (B, 5, H, W) when motion.fine_flow is on: the same cost volume
+        through Eq.12 again with lighter pooling (fine_smooth) and a lower threshold
+        (fine_alpha), so slow and small movers are not averaged / snapped away.
         """
         fields = self.encode_times(surfaces)
         cost = multiscale_cost_volume(fields, self.matcher.M, self.match_scales)
         flow, conf = flow_from_cost(cost, self.matcher.M, alpha=self.flow_alpha,
                                     vel_scale=self.vel_scale, smooth=self.flow_smooth,
                                     return_confidence=True)
-        return torch.cat([flow, conf], dim=1)
+        parts = [flow, conf]
+        if self.fine_flow:
+            parts.append(flow_from_cost(cost, self.matcher.M, alpha=self.fine_alpha,
+                                        vel_scale=self.vel_scale, smooth=self.fine_smooth))
+        return torch.cat(parts, dim=1)
 
     @torch.no_grad()
     def compute_motion(self, surfaces: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """(B, T, 2, H, W) -> flow (B, 2, H, W) and match confidence (B, 1, H, W),
-        from the flow cache when attached.
+        from the flow cache when attached (see ``compute_motion_all``)."""
+        out = self.compute_motion_all(surfaces)
+        return out[:, :2], out[:, 2:3]
+
+    @torch.no_grad()
+    def compute_motion_all(self, surfaces: torch.Tensor) -> torch.Tensor:
+        """Everything ``_flow_uncached`` returns, from the flow cache when attached.
 
         Only the samples that miss are sent through the cost volume. Cached and
         fresh flow both pass through the same fp16 round trip, so the features are
         bit-identical whether or not a sample was cached.
         """
         if self.flow_cache is None:
-            out = self._flow_uncached(surfaces)
-            return out[:, :2], out[:, 2:3]
+            return self._flow_uncached(surfaces)
         self.flow_cache.bind(self)
         flows: list[torch.Tensor | None] = [self.flow_cache.load(s) for s in surfaces]
         miss = [b for b, f in enumerate(flows) if f is None]
@@ -373,14 +514,13 @@ class HDEMS(nn.Module):
             for j, b in enumerate(miss):
                 self.flow_cache.save(surfaces[b], fresh[j])
                 flows[b] = fresh[j].to(torch.float16)
-        out = torch.stack([f.to(device=surfaces.device, dtype=torch.float32) for f in flows])
-        return out[:, :2], out[:, 2:3]
+        return torch.stack([f.to(device=surfaces.device, dtype=torch.float32) for f in flows])
 
     def compute_flow(self, surfaces: torch.Tensor) -> torch.Tensor:
         """(B, T, 2, H, W) -> flow (B, 2, H, W) (see ``compute_motion``)."""
         return self.compute_motion(surfaces)[0]
 
-    def paper_features(self, surfaces: torch.Tensor):
+    def paper_features(self, surfaces: torch.Tensor, rot_flow: torch.Tensor | None = None):
         """Paper front-end features for a linear (Ridge) readout.
 
         (B, T, 2, H, W) -> (feats, flow):
@@ -388,7 +528,7 @@ class HDEMS(nn.Module):
                   HV Mv (event_combine): (B, 2d, H, W), or (B, 4d, H, W) for concat
           flow  = decoded optical flow (B, 2, H, W)
         """
-        flow, _conf, residual, x = self.motion_inputs(surfaces)
+        flow, _conf, residual, x = self.motion_inputs(surfaces, rot_flow)
         # residual velocity -> hypervector (axis_combine), fused with X (event_combine)
         feats = combine_event_velocity(x, self.velocity_hv(residual), self.event_combine)
         return feats, flow
@@ -398,7 +538,10 @@ class HDEMS(nn.Module):
         surface: torch.Tensor,
         *,
         task: str = "flow",
+        rot_flow: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        """``rot_flow``: (B, 2, H, W) camera-rotation flow of the batch (sample["rot_flow"],
+        from the IMU), removed before the ego fit; ignored when motion.rot_source = none."""
         if surface.dim() == 3:                       # (2, H, W) -> (1, 2, H, W)
             surface = surface.unsqueeze(0)
         multitime = surface.dim() == 5              # (B, T, 2, H, W)
@@ -411,20 +554,18 @@ class HDEMS(nn.Module):
             if not multitime:
                 raise ValueError(f"head {self.head_type} needs the multi-time stack "
                                  "(dataset.time_frames)")
-            flow, conf, residual, x = self.motion_inputs(surface)
-            raw = torch.zeros_like(flow) if self.ablate == "motion" else flow
-            scalars = motion_scalars(residual * self.res_ratio,       # sensor px
-                                     event_pixel_mask(surface[:, :1]),
-                                     raw * self.res_ratio, unit=self.vel_unit_px)
+            m = self.motion_features(surface, rot_flow)
+            scalars = self.motion_channels(m, surface)                # sensor px
             if self.head_type == "mfunet":
-                scalars = torch.cat([scalars, self.evidence_channels(surface, conf)], dim=1)
-            outputs["flow"] = flow
-            outputs["seg_logits"] = self.seg_head(self.pixel_hv(residual), x, scalars)
+                scalars = torch.cat([scalars, self.evidence_channels(surface, m["conf"])], dim=1)
+            outputs["flow"] = m["flow"]
+            outputs["residual"] = m["residual"]
+            outputs["seg_logits"] = self.seg_head(self.pixel_hv(m["residual"]), m["x"], scalars)
             return outputs
 
         # ---- paper two-time / multi-scale motion path -----------------------
         if task == "segmentation" and self.head_type == "motion" and multitime:
-            flow, _conf, residual, phi = self.motion_inputs(surface)  # cached when enabled
+            flow, _conf, residual, phi = self.motion_inputs(surface, rot_flow)  # cached when enabled
             mag = residual.pow(2).sum(1, keepdim=True).clamp_min(1e-12).sqrt()
             motion = torch.cat([residual, mag], dim=1)
             outputs["flow"] = flow
@@ -433,7 +574,7 @@ class HDEMS(nn.Module):
 
         # ---- paper front-end with a per-pixel readout (ridge/prototype/cnn) --
         if task == "segmentation" and self.head_type in ("ridge", "prototype", "cnn") and multitime:
-            feats, flow = self.paper_features(surface)
+            feats, flow = self.paper_features(surface, rot_flow)
             outputs["flow"] = flow
             if self.head_type == "cnn":                      # trained HV-channels CNN
                 outputs["seg_logits"] = self.seg_head(feats)

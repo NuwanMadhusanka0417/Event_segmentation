@@ -132,6 +132,51 @@ def motion_scalars(
     ], dim=1).float()
 
 
+def extra_channel_count(extra_inputs: bool, fine_flow: bool, n_consistency: int) -> int:
+    """Channels ``extra_motion_channels`` adds for these options."""
+    return 3 * int(bool(extra_inputs)) + 3 * int(bool(fine_flow)) + int(n_consistency)
+
+
+def extra_motion_channels(
+    *,
+    derotated: torch.Tensor | None,
+    rotation: torch.Tensor | None,
+    fine_residual: torch.Tensor | None,
+    consistency: torch.Tensor | None,
+    n_consistency: int = 0,
+    unit: float = 0.5,
+) -> torch.Tensor:
+    """Motion channels added by the motion section (2026-10-11), SENSOR px -> (B, C, H, W).
+
+      derotated, rotation  (motion.extra_inputs)  the measured flow VECTOR with the camera
+                           rotation removed (slog x / y), and the rotation's own image
+                           speed: the head can compare a pixel with its surroundings
+                           itself instead of trusting the global ego model alone
+      fine_residual        (motion.fine_flow)  fine flow minus the background
+                           displacement (slog x / y, log speed)
+      consistency          (motion.vsa_consistency)  VSA ego-consistency, one channel
+                           per earlier surface, cosine in [-1, 1]
+    """
+    def slog(v: torch.Tensor) -> torch.Tensor:
+        return torch.sign(v) * torch.log1p(v.abs())
+
+    parts: list[torch.Tensor] = []
+    if derotated is not None:
+        parts += [slog(derotated[:, 0] / unit), slog(derotated[:, 1] / unit),
+                  torch.log1p(rotation.pow(2).sum(1).sqrt() / unit)]
+    if fine_residual is not None:
+        parts += [slog(fine_residual[:, 0] / unit), slog(fine_residual[:, 1] / unit),
+                  torch.log1p(fine_residual.pow(2).sum(1).sqrt() / unit)]
+    out = torch.stack(parts, dim=1).float() if parts else None
+    if n_consistency:
+        cons = consistency.float() if consistency is not None else None
+        if cons is None:
+            ref = derotated if derotated is not None else fine_residual
+            cons = torch.zeros(ref.shape[0], n_consistency, *ref.shape[-2:], device=ref.device)
+        out = cons if out is None else torch.cat([out, cons], dim=1)
+    return out
+
+
 EVENT_COMBINES = ("bind", "bundle", "bindbundle", "concat")
 
 

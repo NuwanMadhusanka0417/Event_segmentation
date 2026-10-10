@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from hdems.config import apply_resolution_ratio, surface_decay
+from hdems.config import apply_resolution_ratio, frontend_option, resolution_ratio_of, surface_decay
 from hdems.data.dsec import DSECDataset
 from hdems.data.evimo import EVIMODataset
 from hdems.data.evimo2_reader import scenes_in_split
@@ -94,4 +94,18 @@ def build_dataset(cfg: dict[str, Any], split: str | None = None):
         use_shards=bool(ds_cfg.get("use_shards", False)),
         # random flips / 180-degree rotation, TRAINING split only
         augment=is_train and bool((cfg.get("train", {}) or {}).get("augment_flip", False)),
+        # camera rotation from the IMU / Vicon -> sample["rot_flow"] (motion.rot_source)
+        rotation=rotation_source(cfg),
+        res_ratio=resolution_ratio_of(cfg),
     )
+
+
+def rotation_source(cfg: dict[str, Any]):
+    """motion.rot_source -> hdems.imu.RotationSource (None for 'none')."""
+    from hdems.imu import RotationSource
+    src = str(frontend_option(cfg, "motion", "rot_source"))
+    if src == "none":
+        return None
+    return RotationSource(src, topic=str(frontend_option(cfg, "motion", "imu_topic")),
+                          calib_path=frontend_option(cfg, "motion", "imu_calib"),
+                          avg_ms=float(frontend_option(cfg, "motion", "imu_avg_ms")))

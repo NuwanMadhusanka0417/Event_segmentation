@@ -12,15 +12,18 @@ Keys (content-addressed, so it can never serve stale flow)
 --------------------------------------------------------
     <root>/<front-end key>/<surface key>.pt
 
-  front-end key = hash of the encoder's actual kernel weights (so d, patch size,
-                  sigma and seed are all covered) + cost-volume / estimator
-                  settings (M, scales, alpha, smooth, vel_scale) + a version.
+  front-end key = hash of the encoder settings that generate its kernels (d, patch
+                  size, sigma, seed, kernel mode, polarity binding, scales, code
+                  version) + cost-volume / estimator settings (M, scales, alpha,
+                  smooth, vel_scale, fine flow) + a version.
   surface key   = hash of the multi-time surface tensor itself (so window,
                   decay, time_frames and resolution are covered implicitly).
 
 Change any of those and the lookup misses and recomputes. Flow + match confidence
-are stored as fp16 (3 x H x W, ~1.8 MB per frame at 480x640) and ALWAYS returned via
-the same fp16 round trip, so a cache hit and a cache miss give bit-identical flow.
+are stored as fp16 (3 x H x W, ~1.8 MB per frame at 480x640; 5 x H x W with the fine
+flow of motion.fine_flow) and ALWAYS returned via the same fp16 round trip, so a cache
+hit and a cache miss give bit-identical flow. The camera rotation (IMU) is applied
+AFTER the cache, so it never changes a cache entry.
 """
 
 from __future__ import annotations
@@ -35,8 +38,15 @@ from typing import Any
 import torch
 
 # Bump when the flow computation itself changes (cost volume / estimator code).
-FLOW_CACHE_VERSION = 3      # 2: zero-padded cost volume (was circular torch.roll)
+FLOW_CACHE_VERSION = 4      # 2: zero-padded cost volume (was circular torch.roll)
 #                             3: stores [u, v, match confidence] (was [u, v])
+#                             4: key = the encoder SETTINGS that generate the kernels, not
+#                                the bits of the kernels: those come out of a convolution
+#                                whose last bits changed with a Windows update (2026-10-11)
+#                                and can differ between machines, silently missing the cache
+# Bump ENCODER_VERSION whenever the encoder's kernel construction changes (encoder.py):
+# the settings below then no longer describe the kernels on their own.
+ENCODER_VERSION = 1
 
 
 def _sha1_tensor(t: torch.Tensor) -> str:
@@ -74,12 +84,16 @@ class FlowCache:
             "kernel": getattr(enc, "kernel_mode", "window"),
             "polarity_binding": bool(getattr(enc, "polarity_binding", False)),
             "descriptor_scales": int(getattr(enc, "n_scales", 1)),
+            # the kernels and role vectors are a deterministic function of these
+            "sigma_k": float(getattr(enc, "sigma_k", 0.0)),
+            "encoder_seed": int(getattr(enc, "seed", 0)),
+            "encoder_version": ENCODER_VERSION,
         }
+        if getattr(model, "fine_flow", False):
+            # the fine estimate is stored with the flow ([u, v, conf, u_fine, v_fine]);
+            # only added when on, so caches without it keep their key
+            settings["fine"] = {"alpha": float(model.fine_alpha), "smooth": int(model.fine_smooth)}
         h = hashlib.sha1(json.dumps(settings, sort_keys=True).encode())
-        # every encoder buffer (kernels for both polarities, role vectors) shapes the flow
-        for name, buf in sorted(enc.state_dict().items()):
-            h.update(name.encode())
-            h.update(_sha1_tensor(buf).encode())
         self._dir = self.root / h.hexdigest()[:16]
         self._dir.mkdir(parents=True, exist_ok=True)
         info = self._dir / "front_end.json"

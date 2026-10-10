@@ -57,6 +57,18 @@ BENCHMARK=hua2025      # hua2025 | none  -> also score with the published protoc
                        #   Hua, Yuan & Fermueller 2025 (IoU over events, 5 sequences)
 BENCH_GT=moving        # moving | moving_slow | tracked   (which objects count as moving)
 BENCH_PRED=fg          # fg | objects   (head's moving pixels, or only what grouping keeps)
+ORACLE=no              # yes -> ALSO run the benchmark with the Vicon (ground-truth) rotation:
+                       #   the upper bound of rotation removal -- never report it as a result
+
+# Motion pipeline (motion: section of the config) ----------------------------
+ROT_SOURCE=imu         # imu   = remove the camera rotation measured by the gyroscope (real sensor;
+                       #         IMU->camera calibration from the TRAIN sequences, configs/imu_calib.json)
+                       # vicon = ground-truth rotation (oracle only) | none = events only
+EGO_MODEL=quadratic    # quadratic | affine (old)   background model fitted after derotation
+FINE_FLOW=yes          # yes | no  second, lightly pooled flow estimate (slow / small movers)
+VSA_CONS=yes           # yes | no  VSA ego-consistency maps (descriptor match at the background-
+                       #           predicted position, 12.5 / 25 / 50 ms; 3 extra encodes per sample)
+EXTRA_INPUTS=yes       # yes | no  derotated flow vector + rotation speed as head inputs
 
 CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
 CONFIG=configs/evimo_seg.yaml
@@ -76,7 +88,12 @@ EV_TAG="${EV_COMBINE}"
 case "${HEAD}" in mfcnn|mfunet) EV_TAG="${HV_INPUT}" ;; esac
 AUG_TAG=""
 if [ "${AUGMENT}" = "no" ]; then AUG_TAG="_noaug"; fi
-RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_TAG}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}${AUG_TAG}"
+# motion tag, e.g. _imu-quad-fcx  (f = fine flow, c = VSA consistency, x = extra inputs)
+MOT_TAG="_${ROT_SOURCE}-${EGO_MODEL:0:4}-"
+[ "${FINE_FLOW}" = "yes" ] && MOT_TAG="${MOT_TAG}f"
+[ "${VSA_CONS}" = "yes" ] && MOT_TAG="${MOT_TAG}c"
+[ "${EXTRA_INPUTS}" = "yes" ] && MOT_TAG="${MOT_TAG}x"
+RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_TAG}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}${AUG_TAG}${MOT_TAG}"
 CKPT="checkpoints/${RUN_NAME}.pt"
 RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${RESULTS_DIR}"
@@ -125,7 +142,12 @@ printf '  %-16s %s\n' \
   VAL_SAMPLES  "${VAL_SAMPLES}  (val frames)" \
   TEST_SAMPLES "${TEST_SAMPLES}  (eval panels)" \
   PANELS       "${PANELS}  (which frames get figures)" \
-  BENCHMARK    "${BENCHMARK}  (gt=${BENCH_GT}, pred=${BENCH_PRED})" \
+  BENCHMARK    "${BENCHMARK}  (gt=${BENCH_GT}, pred=${BENCH_PRED}, oracle=${ORACLE})" \
+  ROT_SOURCE   "${ROT_SOURCE}  (camera rotation removed before the ego fit)" \
+  EGO_MODEL    "${EGO_MODEL}" \
+  FINE_FLOW    "${FINE_FLOW}" \
+  VSA_CONS     "${VSA_CONS}  (VSA ego-consistency maps)" \
+  EXTRA_INPUTS "${EXTRA_INPUTS}" \
   CONFIG       "${CONFIG}"
 echo
 echo "--- PBS resources ---------------------------------------------"
@@ -143,15 +165,19 @@ if git -C "${CODE_DIR}" rev-parse --short HEAD >/dev/null 2>&1; then
 fi
 echo
 echo "--- config file: ${CONFIG}  (* = overridden by this script) ----"
-python - "${CONFIG}" "${HEAD}" "${AX_COMBINE}" "${EV_COMBINE}" "${LABEL_MODE}" "${EV_FEATURE}" "${RES_RATIO}" "${AUGMENT}" "${HV_INPUT}" <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
+python - "${CONFIG}" "${HEAD}" "${AX_COMBINE}" "${EV_COMBINE}" "${LABEL_MODE}" "${EV_FEATURE}" "${RES_RATIO}" "${AUGMENT}" "${HV_INPUT}" \
+  "${ROT_SOURCE}" "${EGO_MODEL}" "${FINE_FLOW}" "${VSA_CONS}" "${EXTRA_INPUTS}" <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
 import sys, yaml
-path, head, ax, ev, lm, feat, rr, aug, hv = sys.argv[1:10]
+path, head, ax, ev, lm, feat, rr, aug, hv, rot, ego, fine, cons, extra = sys.argv[1:15]
 cfg = yaml.safe_load(open(path, encoding="utf-8")) or {}
 # CLI flags passed by this script win over the YAML -- show the value actually used
 override = {"segmentation.head": head, "velocity.axis_combine": ax,
             "velocity.event_combine": ev, "dataset.label_mode": lm,
             "velocity.event_feature": feat, "dataset.resolution_ratio": rr,
-            "train.augment_flip": str(aug == "yes"), "real_fpe.input": hv}
+            "train.augment_flip": str(aug == "yes"), "real_fpe.input": hv,
+            "motion.rot_source": rot, "motion.ego_model": ego,
+            "motion.fine_flow": str(fine == "yes"), "motion.vsa_consistency": str(cons == "yes"),
+            "motion.extra_inputs": str(extra == "yes")}
 def walk(node, prefix=""):
     for k, v in node.items():
         key = f"{prefix}{k}"
@@ -171,12 +197,21 @@ SECONDS=0
 # ---------------------------------------------------------------------------
 # 1. FIT THE HEAD
 # ---------------------------------------------------------------------------
+# IMU -> camera calibration (train sequences only); computed once if missing
+if [ "${ROT_SOURCE}" = "imu" ] && [ ! -f configs/imu_calib.json ]; then
+  echo ">>> [$(date +%T)] calibrating IMU -> camera on the training sequences"
+  python scripts/calibrate_imu.py --config "${CONFIG}" --out configs/imu_calib.json
+fi
+cp configs/imu_calib.json "${RESULTS_DIR}/" 2>/dev/null || true
+
 echo ">>> [$(date +%T)] fitting ${HEAD} head (label_mode=${LABEL_MODE})"
 python scripts/fit_ridge_head.py --config "${CONFIG}" \
   --head "${HEAD}" --event-feature "${EV_FEATURE}" \
   --axis-combine "${AX_COMBINE}" --event-combine "${EV_COMBINE}" \
   --label-mode "${LABEL_MODE}" --resolution-ratio "${RES_RATIO}" --out "${CKPT}" \
   --augment "${AUGMENT}" --hv-input "${HV_INPUT}" \
+  --rot-source "${ROT_SOURCE}" --ego-model "${EGO_MODEL}" --fine-flow "${FINE_FLOW}" \
+  --vsa-consistency "${VSA_CONS}" --extra-inputs "${EXTRA_INPUTS}" \
   --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"
 
 # ---------------------------------------------------------------------------
@@ -212,6 +247,15 @@ if [ "${BENCHMARK}" != "none" ]; then
     --benchmark "${BENCHMARK}" --benchmark-gt "${BENCH_GT}" --benchmark-pred "${BENCH_PRED}" \
     --benchmark-out "${RESULTS_DIR}/benchmark_${BENCHMARK}.json" \
     | tee "${RESULTS_DIR}/benchmark_${BENCHMARK}.txt"
+  if [ "${ORACLE}" = "yes" ] && [ "${ROT_SOURCE}" != "none" ]; then
+    # UPPER BOUND ONLY: the same head with the motion-capture rotation instead of the gyro
+    echo ">>> [$(date +%T)] benchmark ${BENCHMARK} with GROUND-TRUTH rotation (oracle, not a result)"
+    python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
+      --checkpoint "${CKPT}" --device cuda --rot-source vicon \
+      --benchmark "${BENCHMARK}" --benchmark-gt "${BENCH_GT}" --benchmark-pred "${BENCH_PRED}" \
+      --benchmark-out "${RESULTS_DIR}/benchmark_${BENCHMARK}_oracle_vicon.json" \
+      | tee "${RESULTS_DIR}/benchmark_${BENCHMARK}_oracle_vicon.txt"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

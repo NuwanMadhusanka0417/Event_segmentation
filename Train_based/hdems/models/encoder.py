@@ -89,6 +89,8 @@ class VSAEncoder(nn.Module):
         super().__init__()
         self.d = d
         self.patch_size = patch_size
+        self.sigma_k = float(sigma_k)
+        self.seed = int(seed)
         self.pad = patch_size // 2
         self.kernel_mode = kernel
         self.polarity_binding = bool(polarity_binding)

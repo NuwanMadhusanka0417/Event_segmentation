@@ -111,6 +111,11 @@ train:
   num_workers: 8
   use_dice: true          # add Dice to CE (background/foreground imbalance)
   max_val_samples: 150    # hdems.train only (the PBS passes --max-val-samples)
+  val_metric: event_iou   # best epoch by the BENCHMARK metric (IoU over events, frames with a
+  #                        mover) on the held-out scene | fg_iou (old: per-frame pixel IoU over
+  #                        all frames -- one false pixel on a static frame scores 0)
+  tune_threshold: true    # tune the P(moving) threshold on validation; stored in the checkpoint
+  #                        and used by eval / the benchmark (argmax = 0.5 otherwise)
   augment_flip: true      # each training sample randomly as-is / mirrored left-right /
   #                        upside-down / rotated 180 deg. The event surfaces are flipped
   #                        BEFORE the front end, so the flow is re-measured and the
@@ -175,8 +180,34 @@ real_fpe:                # per-pixel hypervector of the motion-first heads (mfcn
   #                        x / y velocity: velocity.axis_combine (bind = Vx ⊛ Vy | bundle)
   seed: 100              # position bases seed / seed+1, velocity bases seed+10 / seed+11
 
+motion:                  # how motion reaches the head (2026-10-11). Benchmark breakdown of the
+  #                        r2_2000 model (491 test frames): event IoU 62.7% with a still camera,
+  #                        18% when it rotates > 60 deg/s; big movers captured the ego fit;
+  #                        slow (< 2 px / 50 ms) and small movers were not seen at all.
+  rot_source: imu        # camera rotation removed from the flow BEFORE the ego fit:
+  #                        imu   = gyroscope of the Prophesee camera on the rig (real sensor)
+  #                        vicon = motion-capture rotation: GROUND TRUTH, oracle / upper bound only
+  #                        none  = events only
+  imu_topic: left        # left IMU: per-axis corr 0.978 / 0.998 / 0.994 with the camera rate
+  imu_calib: configs/imu_calib.json   # IMU -> camera rotation + time offset, estimated on the
+  #                        TRAIN sequences only (python scripts/calibrate_imu.py)
+  imu_avg_ms: 25.0       # gyro averaged over this long before the label time
+  ego_model: quadratic   # background model fitted after derotation: quadratic (6 coefficients
+  #                        per axis, one robust weight per pixel) | affine (old, per axis)
+  ego_prior_px: 1.0      # with the rotation removed, the fit STARTS at "nothing moves" with this
+  #                        scale (SENSOR px per 12.5 ms), so a large mover cannot capture it.
+  #                        0 = plain least-squares start
+  fine_flow: true        # second Eq.12 flow from the SAME cost volume (no extra cost volume):
+  fine_alpha: 0.6        #   lower threshold (0.85 snaps sub-pixel motion to 0) ...
+  fine_smooth: 15        #   ... and lighter pooling (full-res px; scaled by resolution_ratio)
+  extra_inputs: true     # head also gets the derotated flow VECTOR and the rotation speed
+  vsa_consistency: true  # cos(F0(x), F_k(x + background displacement)) for the 3 earlier
+  #                        surfaces (12.5 / 25 / 50 ms): the VSA descriptor tests "is this pixel
+  #                        where the static scene would be?" at sub-pixel precision, no pooling.
+  #                        Costs 3 extra encoder passes per sample.
+
 segmentation:
-  head: mfunet           # mfunet (motion-first U-Net: wide view + event density + flow
+  head: mfunet          # mfunet (motion-first U-Net: wide view + event density + flow
   #                        confidence) | mfcnn (motion-first, 5x5 view) | cnn (HV-channels CNN
   #                        on the fused X/Mv feature) | prototype | ridge | motion
   #                      all -> scripts/fit_ridge_head.py (run_segmentation.pbs)

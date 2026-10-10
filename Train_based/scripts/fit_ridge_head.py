@@ -42,7 +42,10 @@ from hdems.feature_extract import (
     extract_paper_flat_batch,
 )
 from hdems.metrics import mean_iou
+from hdems.imu import ROT_SOURCES
 from hdems.models.hdems import HDEMS, HV_INPUTS
+from hdems.models.motion import EGO_MODELS
+from hdems.protocols import validate_event_iou
 from hdems.ridge_fit import (
     RidgeFitResult,
     fit_ridge_sklearn,
@@ -159,6 +162,18 @@ def main() -> None:
                          "code V per pixel -- pv_bind (P ⊛ V) | pv_bundle (P + V) | pv_concat "
                          "([P | V]) | v (no position). Overrides real_fpe.input. The x / y "
                          "velocity combine is --axis-combine.")
+    ap.add_argument("--rot-source", choices=list(ROT_SOURCES), default=None,
+                    help="Camera rotation removed before the ego fit: imu (gyroscope, "
+                         "configs/imu_calib.json) | vicon (ground truth: ORACLE only) | none "
+                         "(events only). Overrides motion.rot_source.")
+    ap.add_argument("--ego-model", choices=list(EGO_MODELS), default=None,
+                    help="Background motion model fitted after derotation: quadratic | affine "
+                         "(overrides motion.ego_model).")
+    for flag, key, what in (("--fine-flow", "fine_flow", "second, lightly pooled flow estimate"),
+                            ("--vsa-consistency", "vsa_consistency", "VSA ego-consistency maps"),
+                            ("--extra-inputs", "extra_inputs", "derotated flow vector + rotation speed")):
+        ap.add_argument(flag, choices=["yes", "no"], default=None,
+                        help=f"{what} as head input (overrides motion.{key}).")
     ap.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
                     help="Vx,Vy combine (overrides velocity.axis_combine).")
     ap.add_argument("--event-combine", type=str, choices=list(EVENT_COMBINES), default=None,
@@ -205,6 +220,16 @@ def main() -> None:
         cfg["velocity"] = vel
     if args.hv_input:                     # before frontend_settings: the checkpoint records it
         cfg["real_fpe"] = {**(cfg.get("real_fpe") or {}), "input": args.hv_input}
+    mot = dict(cfg.get("motion") or {})   # likewise: the motion options are front end
+    if args.rot_source:
+        mot["rot_source"] = args.rot_source
+    if args.ego_model:
+        mot["ego_model"] = args.ego_model
+    for key in ("fine_flow", "vsa_consistency", "extra_inputs"):
+        val = getattr(args, key)
+        if val:
+            mot[key] = val == "yes"
+    cfg["motion"] = mot
     # Resolution ratio: scales image size, kernel N, search M and Eq.12 pooling.
     cfg = apply_resolution_ratio(cfg, args.resolution_ratio, verbose=True)
     ratio = resolution_ratio_of(cfg)
@@ -251,6 +276,12 @@ def main() -> None:
                   f"in [0, {2 * float(opt('real_fpe', 'vel_range_px')):g}]")
         else:
             print("[fit] pixel hypervector: complex velocity code (real_fpe.enabled: false)")
+        src = opt("motion", "rot_source")
+        print(f"[fit] motion: rotation from {src}"
+              + (" (GROUND TRUTH -- oracle, not a result)" if src == "vicon" else "")
+              + f" | ego model {opt('motion', 'ego_model')} (prior {opt('motion', 'ego_prior_px')} px)"
+              + f" | fine flow {opt('motion', 'fine_flow')} | VSA consistency "
+              f"{opt('motion', 'vsa_consistency')} | extra inputs {opt('motion', 'extra_inputs')}")
     mean_center = bool(seg_cfg.get("ridge_mean_center", True))
     motion_features = bool(seg_cfg.get("ridge_motion_features", True))
     # Paper mode: multi-time surfaces -> fit on the two-time cost-volume features
@@ -298,6 +329,7 @@ def main() -> None:
 
     n_train_full = len(train_ds)
     n_val_full = len(val_ds)
+    val_full = val_ds          # event-IoU validation picks its own frames (those with a mover)
     train_ds = _cap_dataset(train_ds, max_train)
     val_ds = _cap_dataset(val_ds, max_val)
     if len(train_ds) == 0:
@@ -330,7 +362,14 @@ def main() -> None:
         # wasted. Stop after `patience` validations without improvement.
         patience = int(train_cfg.get("patience", 5))
         val_every = max(1, int(train_cfg.get("val_every", 1)))
-        print(f"[train] epochs<={epochs}  validate every {val_every}  "
+        # val_metric event_iou: the benchmark's metric (IoU over events, frames with a
+        # mover) on the held-out scenes. fg_iou (old) is the per-frame PIXEL IoU over
+        # all frames: a static frame with one false pixel scores 0 and dominates it
+        # (the r2_2000 run selected its epoch at "0.06").
+        val_metric = str(train_cfg.get("val_metric", "event_iou"))
+        if label_mode != "motion" or not hasattr(val_full, "index"):
+            val_metric = "fg_iou"
+        print(f"[train] epochs<={epochs}  validate every {val_every} on {val_metric}  "
               f"early-stop patience {patience or 'off'}")
 
         best_score, best_state, best_epoch = float("-inf"), None, 0
@@ -342,12 +381,19 @@ def main() -> None:
                 if epoch % val_every and epoch != epochs:
                     print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}")
                     continue
-                m = evaluate_segmentation(net, val_loader, device, num_classes,
-                                          label_mode=label_mode)
-                # motion mode: select on foreground IoU (the headline metric)
-                score = m.get("fg_iou", m["miou"])
-                print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}  "
-                      f"val_{'fgIoU' if 'fg_iou' in m else 'mIoU'}={score:.4f}")
+                if val_metric == "event_iou":
+                    got, n_val = validate_event_iou(net, val_full, device, thresholds=[0.5],
+                                                    max_frames=max_val)
+                    score = got[0.5]
+                    print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}  "
+                          f"val_eventIoU={score:.4f} ({n_val} frames with a mover)")
+                else:
+                    m = evaluate_segmentation(net, val_loader, device, num_classes,
+                                              label_mode=label_mode)
+                    # motion mode: select on foreground IoU (the headline metric)
+                    score = m.get("fg_iou", m["miou"])
+                    print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}  "
+                          f"val_{'fgIoU' if 'fg_iou' in m else 'mIoU'}={score:.4f}")
             else:                                   # no val split: lowest train loss wins
                 score = -loss
                 print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}")
@@ -363,8 +409,23 @@ def main() -> None:
         if net.flow_cache is not None:
             print(net.flow_cache.summary())
 
+        # Decision threshold on P(moving), tuned on the SAME validation frames with the
+        # benchmark metric (argmax = 0.5 is rarely the best for IoU on an imbalanced task).
+        threshold, curve = None, None
+        if (val_metric == "event_iou" and best_state is not None and num_classes == 2
+                and bool(train_cfg.get("tune_threshold", True))):
+            net.load_state_dict(best_state)
+            grid = [round(0.2 + 0.05 * i, 2) for i in range(13)]          # 0.20 .. 0.80
+            curve, n_val = validate_event_iou(net, val_full, device, thresholds=grid,
+                                              max_frames=max_val)
+            threshold = max(curve, key=lambda t: curve[t] if curve[t] == curve[t] else -1.0)
+            print(f"[train] decision threshold on validation ({n_val} frames): P(moving) > "
+                  f"{threshold:.2f}  event IoU {curve[threshold]:.4f} (0.50: {curve[0.5]:.4f})")
+
         torch.save({"model": best_state, "task": "segmentation", "head": head_type,
                     "epoch": best_epoch, "val_miou": best_score if len(val_ds) else None,
+                    "val_metric": val_metric if len(val_ds) else None,
+                    "decision_threshold": threshold, "threshold_curve": curve,
                     "val_split": val_split,
                     "augment_flip": bool(cfg.get("train", {}).get("augment_flip", False)),
                     "num_samples": len(train_ds), "num_classes": num_classes,

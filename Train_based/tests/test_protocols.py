@@ -58,7 +58,7 @@ class _FixedModel(torch.nn.Module):
         self.pred = torch.from_numpy(pred)
         self.flow_cache = None
 
-    def forward(self, surface, task="segmentation"):
+    def forward(self, surface, task="segmentation", rot_flow=None):
         logits = torch.zeros(1, 2, *self.pred.shape)
         logits[0, 1][self.pred] = 1.0
         return {"seg_logits": logits}

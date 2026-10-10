@@ -57,6 +57,91 @@ def decode_flow(
     return torch.stack([u, v], dim=1)
 
 
+EGO_MODELS = ("affine", "quadratic")
+
+
+def _basis(H: int, W: int, model: str, dev: torch.device) -> torch.Tensor:
+    """Design matrix (HW, 3 | 6) over normalised pixel coordinates."""
+    ys = torch.linspace(-1.0, 1.0, H, device=dev).view(H, 1).expand(H, W).reshape(-1)
+    xs = torch.linspace(-1.0, 1.0, W, device=dev).view(1, W).expand(H, W).reshape(-1)
+    cols = [xs, ys, torch.ones_like(xs)]
+    if model == "quadratic":
+        cols += [xs * xs, xs * ys, ys * ys]
+    elif model != "affine":
+        raise ValueError(f"ego model must be one of {EGO_MODELS}, got {model!r}")
+    return torch.stack(cols, dim=1)
+
+
+@torch.no_grad()
+def ego_residual_joint(
+    flow: torch.Tensor,
+    iters: int = 4,
+    eps: float = 1e-4,
+    *,
+    valid: torch.Tensor | None = None,
+    model: str = "quadratic",
+    prior_px: float | None = None,
+    floor_px: float = 0.05,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Robust background model with ONE weight per pixel for both flow axes.
+
+    model     affine (3 coefficients per axis) | quadratic (6 per axis). Camera
+              rotation and a translating camera over a plane give flow that is
+              quadratic in the image coordinates (the 8-parameter planar flow is a
+              special case); the affine model cannot follow either.
+    prior_px  where the fit STARTS. None: plain least squares, so the first pass is
+              pulled by everything -- a mover covering half the events captures it.
+              A value (working px per interval): the first weights come from the flow
+              itself (Tukey, 0 beyond 4 x prior), i.e. the fit starts at "nothing
+              moves". After IMU derotation the static scene has little flow left, so
+              the fit starts on the background and a large mover cannot take it over.
+              Falls back to the plain start when < 20% of the pixels would be used.
+              Later passes use Tukey weights (exactly 0 beyond c = 4 x scale): Cauchy
+              weights never reach 0, and the quadratic model is flexible enough to bend
+              towards a large mover that keeps even a small weight. The scale is the
+              median residual of the CURRENT inliers (weight >= 0.5), not of all pixels,
+              for the same reason.
+
+    Returns (residual (B, 2, H, W), background model field (B, 2, H, W)).
+    """
+    B, C, H, W = flow.shape
+    dev = flow.device
+    A = _basis(H, W, model, dev)                                   # (HW, P)
+    eye = torch.eye(A.shape[1], device=dev)
+    residual = torch.empty_like(flow)
+    for b in range(B):
+        f = flow[b].reshape(C, -1)                                 # (2, HW)
+        sel = (torch.ones(H * W, dtype=torch.bool, device=dev) if valid is None
+               else valid[b].reshape(-1).to(dev))
+        if int(sel.sum()) < 4 * A.shape[1]:                        # too few events to fit
+            residual[b] = flow[b]
+            continue
+        sel_f = sel.to(flow.dtype)
+        w = sel_f.clone()
+        if prior_px:
+            # Tukey weights around "no motion": a pixel moving > 4 x prior gets weight 0
+            # from the first pass on. If that leaves too little (a fast-translating camera
+            # moves the whole background), start from plain least squares instead.
+            w0 = sel_f * (1.0 - (f.norm(dim=0) / (4.0 * float(prior_px))) ** 2).clamp_min(0.0) ** 2
+            if float(w0.sum()) >= 0.2 * float(sel_f.sum()):
+                w = w0
+        r = f
+        for _ in range(iters):
+            Aw = A * w[:, None]
+            coef = torch.linalg.solve(A.t() @ Aw + eps * eye, Aw.t() @ f.t())   # (P, 2)
+            r = f - (A @ coef).t()
+            rn = r.norm(dim=0)
+            inl = sel & (w >= 0.5 * w[sel].max())
+            s = (rn[inl] if inl.any() else rn[sel]).median().clamp_min(floor_px)
+            c = 4.0 * s
+            w_new = sel_f * (1.0 - (rn / c) ** 2).clamp_min(0.0) ** 2          # Tukey biweight
+            if float(w_new.sum()) < 4 * A.shape[1]:                            # degenerate: keep
+                break
+            w = w_new
+        residual[b] = r.reshape(C, H, W)
+    return residual, flow - residual
+
+
 @torch.no_grad()
 def ego_residual(
     flow: torch.Tensor,
@@ -70,6 +155,7 @@ def ego_residual(
     Fits each flow channel as an affine function of normalized pixel coordinates
     with a few IRLS (Cauchy-weighted) passes so moving-object pixels don't drag
     the background model. Returns residual flow and its magnitude.
+    (The original model; ``ego_residual_joint`` is the quadratic / IMU-anchored one.)
 
     Parameters
     ----------

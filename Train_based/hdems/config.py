@@ -36,6 +36,8 @@ _FRONTEND_KEYS = {
     "dataset": ("height", "width", "window_ms", "time_frames", "resolution_ratio"),
     "velocity": ("vel_norm", "vel_unit_px", "vel_bw", "x_norm", "ego_fit"),
     "real_fpe": ("enabled", "d", "beta_pos", "beta_vel", "vel_range_px", "omega", "input", "seed"),
+    "motion": ("rot_source", "imu_topic", "imu_avg_ms", "imu_calib", "ego_model", "ego_prior_px",
+               "fine_flow", "fine_alpha", "fine_smooth", "extra_inputs", "vsa_consistency"),
 }
 
 # Front-end options added after checkpoints were already trained (2026-09-29). A
@@ -48,6 +50,14 @@ _LEGACY_FRONTEND = {
     ("velocity", "x_norm"): "none",      # event HV X fed at its raw magnitude
     ("velocity", "ego_fit"): "stack",    # ego model fitted on the events of all surfaces
     ("real_fpe", "enabled"): False,      # complex velocity code (added 2026-10-06)
+    # motion section (added 2026-10-11): no rotation removed, per-axis affine ego fit,
+    # no fine flow, none of the extra head inputs
+    ("motion", "rot_source"): "none",
+    ("motion", "ego_model"): "affine",
+    ("motion", "ego_prior_px"): 0.0,
+    ("motion", "fine_flow"): False,
+    ("motion", "extra_inputs"): False,
+    ("motion", "vsa_consistency"): False,
 }
 
 # Current defaults of those options (used when the YAML leaves one out). Checkpoints
@@ -67,6 +77,17 @@ FRONTEND_DEFAULTS = {
     ("real_fpe", "omega"): "uniform",
     ("real_fpe", "input"): "pv_bind",
     ("real_fpe", "seed"): 100,
+    ("motion", "rot_source"): "imu",
+    ("motion", "imu_topic"): "left",
+    ("motion", "imu_avg_ms"): 25.0,
+    ("motion", "imu_calib"): "configs/imu_calib.json",
+    ("motion", "ego_model"): "quadratic",
+    ("motion", "ego_prior_px"): 1.0,
+    ("motion", "fine_flow"): True,
+    ("motion", "fine_alpha"): 0.6,
+    ("motion", "fine_smooth"): 15,
+    ("motion", "extra_inputs"): True,
+    ("motion", "vsa_consistency"): True,
 }
 
 
@@ -116,16 +137,19 @@ def apply_resolution_ratio(
 
     enc = cfg.setdefault("encoder", {})
     match = cfg.setdefault("matching", {})
+    mot = cfg.setdefault("motion", {})
     full = {
         "height": int(ds.get("height", 480)), "width": int(ds.get("width", 640)),
         "patch_size": int(enc.get("patch_size", 21)), "M": int(match.get("M", 7)),
         "smooth": int(match.get("smooth", 1)),
+        "fine_smooth": int(mot.get("fine_smooth", FRONTEND_DEFAULTS[("motion", "fine_smooth")])),
     }
     ds["height"] = full["height"] // r
     ds["width"] = full["width"] // r
     enc["patch_size"] = _odd_scaled(full["patch_size"], r, 3)
     match["M"] = _odd_scaled(full["M"], r, 3)
     match["smooth"] = _odd_scaled(full["smooth"], r, 1) if full["smooth"] > 1 else 1
+    mot["fine_smooth"] = _odd_scaled(full["fine_smooth"], r, 1) if full["fine_smooth"] > 1 else 1
 
     cfg["_resolution_applied"] = True
     cfg["_resolution_full"] = full
