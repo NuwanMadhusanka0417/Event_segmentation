@@ -1,0 +1,185 @@
+#!/bin/bash
+#PBS -N hdems_eval_all
+#PBS -P mi23
+#PBS -q gpuvolta
+#PBS -l ncpus=12
+#PBS -l mem=64GB
+#PBS -l ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+#PBS -l wd
+#PBS -j oe
+# Evaluates every trained checkpoint (run_segmentation.pbs MODE=train) on the eval split.
+# Live logs: submit from Train_nocnn/, note the job id, then:
+#   tail -f hdems_eval_all.o<JOBID>
+# Output is line-flushed (PYTHONUNBUFFERED + python -u) so tail updates during the run,
+# not only when the job finishes.
+
+set -eo pipefail
+
+# ---------------------------------------------------------------------------
+# PARAMETERS
+# ---------------------------------------------------------------------------
+MAX_IMAGES=50
+DETECT=no              # yes | no  (--detect on hdems.eval)
+PANELS=movers          # movers | spread | first   (which eval frames get figures)
+CONFIG=configs/evimo_seg.yaml
+CKPT_DIR=checkpoints
+
+CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_nocnn/Train_nocnn
+VENV=/scratch/jq77/nk8155/seg/bin/activate
+
+# Checkpoints to evaluate (basenames under ${CKPT_DIR}/). Empty = every .pt there.
+# Names as written by run_segmentation.pbs:
+#   [head]_[feature]_[axis]_[event]_[label_mode]_r[R]_[N].pt, e.g.
+#   mfunet_f_bind_split_motion_r2_300.pt
+CHECKPOINTS=()
+
+# Head of checkpoints whose name does not start with one (e.g. best.pt / last.pt).
+# Trained heads (mfunet, mfcnn, cnn, motion) also record it inside the checkpoint.
+GENERIC_CKPT_HEAD=""
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT  (scratch caches + unbuffered Python for live PBS logs)
+# ---------------------------------------------------------------------------
+module load cuda
+module load python3/3.9.2
+source "${VENV}"
+cd "${CODE_DIR}"
+source scripts/nci_env.sh
+export PYTHONUNBUFFERED=1
+
+# PRE-FLIGHT: venv intact, GPU visible, dataset complete (fix printed on failure)
+python scripts/check_env.py --config "${CONFIG}" --require-cuda
+
+if [ "${#CHECKPOINTS[@]}" -eq 0 ]; then
+  shopt -s nullglob
+  CHECKPOINTS=()
+  for p in "${CKPT_DIR}"/*.pt; do CHECKPOINTS+=("$(basename "${p}")"); done
+  shopt -u nullglob
+fi
+if [ "${#CHECKPOINTS[@]}" -eq 0 ]; then
+  echo "no checkpoints in ${CODE_DIR}/${CKPT_DIR} -- train one first (run_segmentation.pbs MODE=train)"
+  exit 1
+fi
+
+BATCH_TAG="$(date +%Y%m%d_%H%M%S)"
+OUT_ROOT="results/batch_eval_${BATCH_TAG}"
+mkdir -p "${OUT_ROOT}"
+
+DETECT_FLAG=""
+if [ "${DETECT}" = "yes" ]; then DETECT_FLAG="--detect"; fi
+
+if command -v stdbuf >/dev/null 2>&1; then
+  PY=(stdbuf -oL -eL python -u)
+else
+  PY=(python -u)
+fi
+
+infer_head() {
+  local base="$1"
+  case "${base}" in
+    mfunet_*) echo mfunet ;;
+    mfcnn_*) echo mfcnn ;;
+    cnn_*) echo cnn ;;
+    motion_*) echo motion ;;
+    prototype_*) echo prototype ;;
+    ridge_*|ridge_head*) echo ridge ;;
+    *) echo "${GENERIC_CKPT_HEAD}" ;;
+  esac
+}
+
+log() {
+  echo "$@" | tee -a "${OUT_ROOT}/batch.log"
+}
+
+log "=== Batch eval ${PBS_JOBID:-local} started $(date) ==="
+log "Host: $(hostname)"
+log "Output root: ${CODE_DIR}/${OUT_ROOT}"
+log "Max panels per model: ${MAX_IMAGES} (${PANELS})"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | tee -a "${OUT_ROOT}/batch.log" || true
+log "---------------------------------------------------------------"
+
+SECONDS=0
+N_OK=0
+N_FAIL=0
+N_SKIP=0
+IDX=0
+TOTAL=${#CHECKPOINTS[@]}
+
+set +e
+for ckpt_name in "${CHECKPOINTS[@]}"; do
+  IDX=$((IDX + 1))
+  base="${ckpt_name%.pt}"
+  ckpt_path="${CKPT_DIR}/${ckpt_name}"
+
+  if [ ! -f "${ckpt_path}" ]; then
+    log ">>> [${IDX}/${TOTAL}] SKIP missing: ${ckpt_path}"
+    N_SKIP=$((N_SKIP + 1))
+    continue
+  fi
+
+  head=$(infer_head "${base}")
+  if [ -z "${head}" ]; then
+    log ">>> [${IDX}/${TOTAL}] SKIP ${ckpt_name}: cannot infer --head (set GENERIC_CKPT_HEAD for best/last)"
+    N_SKIP=$((N_SKIP + 1))
+    continue
+  fi
+
+  model_dir="${OUT_ROOT}/${base}"
+  img_dir="${model_dir}/eval_images"
+  metrics_log="${model_dir}/metrics.log"
+  mkdir -p "${model_dir}"
+
+  log ""
+  log ">>> [$(date +%T)] [${IDX}/${TOTAL}] ${ckpt_name}  head=${head}"
+  log "    checkpoint: ${ckpt_path}"
+  log "    images:     ${img_dir}"
+
+  # the group runs in a subshell (pipeline), so `exit` hands eval's status to PIPESTATUS
+  {
+    echo "=== ${ckpt_name} head=${head} $(date) ==="
+    "${PY[@]}" -m hdems.eval --config "${CONFIG}" \
+      --head "${head}" \
+      --checkpoint "${ckpt_path}" \
+      ${DETECT_FLAG} \
+      --device cuda \
+      --save-images "${img_dir}" \
+      --color-events "${model_dir}/event_colours" \
+      --panels "${PANELS}" \
+      --max-images "${MAX_IMAGES}"
+    rc=$?
+    echo "=== exit=${rc} ==="
+    exit "${rc}"
+  } 2>&1 | tee -a "${metrics_log}" "${OUT_ROOT}/batch.log"
+
+  ec=${PIPESTATUS[0]}
+  if [ "${ec}" -eq 0 ]; then
+    N_OK=$((N_OK + 1))
+    log ">>> [$(date +%T)] OK ${ckpt_name}"
+  else
+    N_FAIL=$((N_FAIL + 1))
+    log ">>> [$(date +%T)] FAILED ${ckpt_name} (exit ${ec}) — continuing"
+  fi
+done
+set -e
+
+log ""
+log "=== Batch eval finished $(date) ==="
+log "OK=${N_OK}  FAILED=${N_FAIL}  SKIPPED=${N_SKIP}  elapsed $((SECONDS/3600))h $((SECONDS%3600/60))m"
+log "Summary: ${OUT_ROOT}/summary.tsv"
+{
+  printf 'checkpoint\thead\tmetrics_log\tpanels_dir\n'
+  for ckpt_name in "${CHECKPOINTS[@]}"; do
+    base="${ckpt_name%.pt}"
+    printf '%s\t%s\t%s\t%s\n' \
+      "${ckpt_name}" "$(infer_head "${base}")" \
+      "${OUT_ROOT}/${base}/metrics.log" \
+      "${OUT_ROOT}/${base}/eval_images"
+  done
+} > "${OUT_ROOT}/summary.tsv"
+
+# qsub run_eval_all.pbs
+# qstat -u nk8155
+# tail -f hdems_eval_all.o<JOBID>
+# tail -f results/batch_eval_*/batch.log

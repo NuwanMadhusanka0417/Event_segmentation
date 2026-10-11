@@ -1,0 +1,4 @@
+# Shell and PBS scripts must keep LF line endings: bash on Gadi fails on CRLF
+# ("set: pipefail\r: invalid option name") when this folder is copied, not cloned.
+*.sh  text eol=lf
+*.pbs text eol=lf

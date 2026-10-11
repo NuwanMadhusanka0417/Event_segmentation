@@ -1,0 +1,253 @@
+#!/bin/bash
+#PBS -N hdems_seg_group
+#PBS -P mi23
+#PBS -q gpuvolta
+#PBS -l ncpus=24
+#PBS -l mem=128GB
+#PBS -l ngpus=2
+#PBS -l walltime=24:00:00
+#PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+#PBS -l wd
+#PBS -j oe
+# ^ -l wd  : start in the directory you ran qsub from
+#   -j oe  : merge stdout+stderr into one log (lands as hdems_seg_group.o<jobid> in that dir)
+
+set -eo pipefail   # stop immediately if fit fails, so eval never runs on a stale/missing checkpoint
+
+# ---------------------------------------------------------------------------
+# PARAMETERS  (edit these; everything below is derived from them)
+# ---------------------------------------------------------------------------
+MODE=vsa_group         # train     = fit a head (HEAD below), then evaluate it
+                       # vsa_group = TRAINING-FREE: cluster event pixels in hypervector space
+                       #             (no CNN, no ego fit, no RANSAC; HEAD..AUGMENT unused)
+                       # threshold = no-CNN baseline: |ego residual| > threshold + RANSAC grouping
+TUNE=yes               # vsa_group / threshold: tune on the held-out validation scene first
+                       #   (scripts/tune_vsa_grouping.py; never on eval). no = config values
+TUNE_FRAMES=100        # validation frames used for tuning
+TUNE_GRID=quick        # quick (8 settings, ~1.3 h at RES_RATIO=2) | full (48 settings, ~7 h)
+                       #   (measured ~3 s/frame without the border gap, ~8 s with it; CPU-bound)
+HEAD=mfunet            # mfunet | mfcnn | cnn | prototype | ridge | motion
+                       #   mfunet = motion-first U-Net: sees ~110 px around each pixel, plus
+                       #            event density + flow confidence channels
+                       #   mfcnn  = motion-first: velocity code Mv + 6 motion channels, and only
+                       #            8 appearance channels (dropped at random while training);
+                       #            sees 5x5 px. Run both to compare.
+                       #   cnn    = HV-channels CNN on the fused X/Mv feature (EV_COMBINE)
+EV_FEATURE=f           # phi | f                (event HV: Phi neighbourhood field, or descriptor F0)
+AX_COMBINE=bind        # bind | bundle          (combine Vx,Vy)
+EV_COMBINE=concat      # bind | bundle | bindbundle | concat   (combine event HV X with velocity Mv)
+                       #   bindbundle = (X^ o Mv) + Mv.   NOT used by HEAD=mfcnn
+LABEL_MODE=motion      # motion = moving vs background (Option A)
+                       # objects = per-object id        (Option B)
+DETECT=yes             # yes | no  -> also report object detection (boxes from instances)
+ABLATION=yes           # yes | no  -> eval also runs without motion / without appearance and
+                       #   prints a verdict: a motion segmenter must collapse without motion
+AUGMENT=yes            # yes | no  -> random flips / 180-degree rotation of training samples
+                       #   (first epochs slower: the flow of each flipped version is computed once)
+RES_RATIO=2            # 1 = full 480x640 | 2 = half 240x320 | 4 = quarter 120x160
+                       #   kernel N, search M and Eq.12 pooling scale with it (~ratio^4 cheaper)
+                       #   vsa_group was developed and measured at 2 (1 is ~4x slower)
+SAMPLES=300            # max train frames   (~1,990 frames with a mover once scene9 is held out)
+VAL_SAMPLES=150        # val frames used to pick the best epoch / alpha -- from the HELD-OUT
+                       #   train scene (dataset.val_scenes: scene9), never the eval set
+TEST_SAMPLES=50        # max eval panels saved
+PANELS=movers          # which eval frames get figures (scores always use ALL frames):
+                       #   movers = only frames with a visible moving object (see object colours)
+                       #   spread = evenly over the whole eval set (moving + static frames)
+                       #   first  = first N frames (old; mostly the static start of each recording)
+
+CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_nocnn/Train_nocnn
+CONFIG=configs/evimo_seg.yaml          # dataset.root is relative to CODE_DIR (../Data/...)
+VENV=/scratch/jq77/nk8155/seg/bin/activate
+                       # a venv on /scratch loses files nothing reads for 100 days (NCI file
+                       # expiry): that is the "Unable to find torch_shm_manager" crash. The
+                       # pre-flight check below catches it; fix: bash scripts/repair_env.sh
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT
+# ---------------------------------------------------------------------------
+module load cuda
+module load python3/3.9.2
+source "${VENV}"
+cd "${CODE_DIR}"
+source scripts/nci_env.sh              # torch / matplotlib caches off the small $HOME quota
+export PYTHONUNBUFFERED=1              # live log lines (tail -f) instead of at the end
+
+# PRE-FLIGHT: venv intact (every installed file present, packages import, GPU
+# visible) and the dataset complete -- fails in seconds with the fix printed,
+# instead of a traceback hours into the job
+python scripts/check_env.py --config "${CONFIG}" --require-cuda
+
+# Derived names -------------------------------------------------------------
+EV_TAG="${EV_COMBINE}"
+case "${HEAD}" in mfcnn|mfunet) EV_TAG="split" ;; esac   # motion-first heads do not fuse X and Mv
+AUG_TAG=""
+if [ "${AUGMENT}" = "no" ]; then AUG_TAG="_noaug"; fi
+RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_TAG}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}${AUG_TAG}"
+case "${MODE}" in
+  train) ;;
+  vsa_group) RUN_NAME="vsagroup_${LABEL_MODE}_r${RES_RATIO}" ;;
+  threshold) RUN_NAME="threshold_${LABEL_MODE}_r${RES_RATIO}" ;;
+  *) echo "unknown MODE=${MODE} (train | vsa_group | threshold)"; exit 1 ;;
+esac
+CKPT="checkpoints/${RUN_NAME}.pt"
+RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "${RESULTS_DIR}"
+
+# ---------------------------------------------------------------------------
+# RUN CONFIGURATION  (printed first, so every log explains its own results)
+# Also saved to ${RESULTS_DIR}/run_config.txt next to the eval images.
+# ---------------------------------------------------------------------------
+{
+echo "==============================================================="
+echo " RUN CONFIGURATION"
+echo "==============================================================="
+echo " Job        : ${PBS_JOBID:-local}"
+echo " Started    : $(date '+%Y-%m-%d %H:%M:%S')"
+echo " Host       : $(hostname)"
+echo " Run name   : ${RUN_NAME}"
+if [ "${MODE}" = "train" ]; then
+  echo " Checkpoint : ${CODE_DIR}/${CKPT}"
+else
+  echo " Checkpoint : none (MODE=${MODE} is training-free)"
+fi
+echo " Results    : ${CODE_DIR}/${RESULTS_DIR}"
+echo
+echo "--- run parameters (this script) ------------------------------"
+printf '  %-16s %s\n' \
+  MODE         "${MODE}" \
+  TUNE         "${TUNE}  (${TUNE_GRID} grid on ${TUNE_FRAMES} validation frames; MODE != train only)" \
+  HEAD         "${HEAD}" \
+  EV_FEATURE   "${EV_FEATURE}" \
+  AX_COMBINE   "${AX_COMBINE}" \
+  EV_COMBINE   "${EV_COMBINE}$( [ "${EV_TAG}" = "split" ] && echo "  (not used by ${HEAD})")" \
+  LABEL_MODE   "${LABEL_MODE}" \
+  DETECT       "${DETECT}" \
+  ABLATION     "${ABLATION}  (eval without motion / appearance)" \
+  AUGMENT      "${AUGMENT}  (training flips / 180-degree rotation)" \
+  RES_RATIO    "${RES_RATIO}  (1 full, 2 half, 4 quarter)" \
+  SAMPLES      "${SAMPLES}  (train frames)" \
+  VAL_SAMPLES  "${VAL_SAMPLES}  (val frames)" \
+  TEST_SAMPLES "${TEST_SAMPLES}  (eval panels)" \
+  PANELS       "${PANELS}  (which frames get figures)" \
+  CONFIG       "${CONFIG}"
+echo
+echo "--- PBS resources ---------------------------------------------"
+qstat -f "${PBS_JOBID}" 2>/dev/null | grep -E 'Resource_List\.(ncpus|ngpus|mem|walltime|jobfs)|queue =' \
+  | sed 's/^ */  /' || echo "  (qstat unavailable)"
+echo
+echo "--- hardware / software ---------------------------------------"
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader 2>/dev/null \
+  | sed 's/^/  GPU /' || echo "  (nvidia-smi unavailable)"
+python -c "import sys, torch; print(f'  python {sys.version.split()[0]} | torch {torch.__version__} | cuda {torch.version.cuda} | gpus visible {torch.cuda.device_count()}')" 2>/dev/null \
+  || echo "  (torch not importable)"
+if git -C "${CODE_DIR}" rev-parse --short HEAD >/dev/null 2>&1; then
+  echo "  git $(git -C "${CODE_DIR}" rev-parse --abbrev-ref HEAD)@$(git -C "${CODE_DIR}" rev-parse --short HEAD)" \
+       "$(git -C "${CODE_DIR}" diff --quiet 2>/dev/null || echo '(uncommitted changes)')"
+fi
+echo
+echo "--- config file: ${CONFIG}  (* = overridden by this script) ----"
+python - "${CONFIG}" "${HEAD}" "${AX_COMBINE}" "${EV_COMBINE}" "${LABEL_MODE}" "${EV_FEATURE}" "${RES_RATIO}" "${AUGMENT}" <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
+import sys, yaml
+path, head, ax, ev, lm, feat, rr, aug = sys.argv[1:9]
+cfg = yaml.safe_load(open(path, encoding="utf-8")) or {}
+# CLI flags passed by this script win over the YAML -- show the value actually used
+override = {"segmentation.head": head, "velocity.axis_combine": ax,
+            "velocity.event_combine": ev, "dataset.label_mode": lm,
+            "velocity.event_feature": feat, "dataset.resolution_ratio": rr,
+            "train.augment_flip": str(aug == "yes")}
+def walk(node, prefix=""):
+    for k, v in node.items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict):
+            walk(v, key + ".")
+        elif key in override and str(v) != override[key]:
+            print(f"  * {key:<34} = {override[key]}   (yaml: {v})")
+        else:
+            print(f"    {key:<34} = {v}")
+walk(cfg)
+PY
+echo "==============================================================="
+} 2>&1 | tee "${RESULTS_DIR}/run_config.txt"
+cp "${CONFIG}" "${RESULTS_DIR}/" 2>/dev/null || true
+SECONDS=0
+
+# --detect adds box-level detection metrics (instances -> boxes) on top of segmentation
+DETECT_FLAG=""
+if [ "${DETECT}" = "yes" ]; then DETECT_FLAG="--detect"; fi
+# --ablation-check re-predicts every frame without motion and without appearance
+# (the head is cheap and the flow comes from the cache, so it adds little time)
+ABLATION_FLAG=""
+if [ "${ABLATION}" = "yes" ]; then ABLATION_FLAG="--ablation-check"; fi
+
+if [ "${MODE}" = "train" ]; then
+  # -------------------------------------------------------------------------
+  # 1. FIT THE HEAD
+  # -------------------------------------------------------------------------
+  echo ">>> [$(date +%T)] fitting ${HEAD} head (label_mode=${LABEL_MODE})"
+  python scripts/fit_ridge_head.py --config "${CONFIG}" \
+    --head "${HEAD}" --event-feature "${EV_FEATURE}" \
+    --axis-combine "${AX_COMBINE}" --event-combine "${EV_COMBINE}" \
+    --label-mode "${LABEL_MODE}" --resolution-ratio "${RES_RATIO}" --out "${CKPT}" \
+    --augment "${AUGMENT}" \
+    --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"
+
+  # -------------------------------------------------------------------------
+  # 2. EVALUATE
+  # -------------------------------------------------------------------------
+  echo ">>> [$(date +%T)] evaluating -> ${RESULTS_DIR}/eval_images"
+  python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
+    --checkpoint "${CKPT}" ${DETECT_FLAG} ${ABLATION_FLAG} \
+    --device cuda --save-images "${RESULTS_DIR}/eval_images" \
+    --color-events "${RESULTS_DIR}/event_colours" \
+    --panels "${PANELS}" --max-images "${TEST_SAMPLES}"
+
+  # CONTROL: predict "moving" at every event pixel. With motion labels this must
+  # score far below the model — if it does not, the labels are not motion.
+  echo ">>> [$(date +%T)] events-only baseline (control)"
+  python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
+    --checkpoint "${CKPT}" --events-only-baseline --device cuda
+else
+  # -------------------------------------------------------------------------
+  # 1. TUNE on the held-out validation scene (training-free: nothing is fitted)
+  # -------------------------------------------------------------------------
+  MODE_FLAG="--vsa-group"
+  if [ "${MODE}" = "threshold" ]; then MODE_FLAG="--threshold-baseline"; fi
+  PARAMS_FLAG=""
+  if [ "${TUNE}" = "yes" ]; then
+    QUICK_FLAG=""
+    if [ "${TUNE_GRID}" = "quick" ]; then QUICK_FLAG="--quick"; fi
+    echo ">>> [$(date +%T)] tuning vsa_grouping + baseline threshold on the validation split"
+    python scripts/tune_vsa_grouping.py --config "${CONFIG}" --split holdout \
+      --resolution-ratio "${RES_RATIO}" --max-frames "${TUNE_FRAMES}" ${QUICK_FLAG} \
+      --device cuda --out "${RESULTS_DIR}/vsa_grouping_tuned.yaml"
+    PARAMS_FLAG="--vsa-params ${RESULTS_DIR}/vsa_grouping_tuned.yaml"
+  fi
+
+  # -------------------------------------------------------------------------
+  # 2. EVALUATE (eval split, once)
+  # -------------------------------------------------------------------------
+  echo ">>> [$(date +%T)] evaluating ${MODE} -> ${RESULTS_DIR}/event_colours"
+  python -m hdems.eval --config "${CONFIG}" ${MODE_FLAG} ${PARAMS_FLAG} ${DETECT_FLAG} \
+    --resolution-ratio "${RES_RATIO}" --device cuda \
+    --color-events "${RESULTS_DIR}/event_colours" \
+    --panels "${PANELS}" --max-images "${TEST_SAMPLES}"
+
+  echo ">>> [$(date +%T)] events-only baseline (control)"
+  python -m hdems.eval --config "${CONFIG}" ${MODE_FLAG} --events-only-baseline \
+    --resolution-ratio "${RES_RATIO}" --device cuda
+fi
+
+# ---------------------------------------------------------------------------
+# 3. COLLECT  (keep a copy of the checkpoint + this log next to the results)
+# ---------------------------------------------------------------------------
+cp "${CKPT}" "${RESULTS_DIR}/" 2>/dev/null || true
+echo "=== Job ${PBS_JOBID} (${RUN_NAME}) finished $(date)  --  elapsed $((SECONDS/3600))h $((SECONDS%3600/60))m ==="
+# When this line completes, PBS tears the job down and stops billing. No qdel needed.
+
+
+#python scripts/check_env.py --config configs/evimo_seg.yaml   # on the login node, before qsub
+#qsub run_segmentation.pbs        # submit; prints a job id like 12345678.gadi-pbs
+#qstat -u nk8155                  # check status: Q=queued, R=running, done=gone from list
+#tail -f hdems_seg_group.o12345678  # watch the log live while it runs
+#qdel 12345678                    # ONLY if you want to cancel early

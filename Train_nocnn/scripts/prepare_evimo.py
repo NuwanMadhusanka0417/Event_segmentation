@@ -1,0 +1,104 @@
+"""Precompute EVIMO2 (surface, mask) samples into .pt shards for fast training.
+
+Run this ONCE, then set ``dataset.use_shards: true``: every epoch then just does
+``torch.load`` instead of decoding events and rebuilding time surfaces, so the
+per-epoch data cost is paid a single time here.
+
+Shards are OFF by default: they bypass the index filters (scene-disjoint split,
+held-out validation scenes, require_mover, rigid object groups), so a stray shard
+folder used to change silently what was trained and scored. Normally the flow cache
+(flow_cache.enabled) already removes the expensive part.
+
+Shards are written to ``<out>/<split>/<sequence>_<frameidx>.pt`` at the
+resolution / window from the config. If you later change height/width/window_ms,
+time_frames or the time-surface decay, DELETE the shards and re-run (cached shards
+are resolution-baked and take priority over raw sequences).
+
+Usage
+-----
+    python scripts/prepare_evimo.py --config configs/evimo_seg.yaml
+    python scripts/prepare_evimo.py --config configs/evimo_seg.yaml --splits train eval
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import torch
+import yaml
+
+# Make the package importable when run as a plain script (python scripts/...),
+# not just via `python -m`. Adds the project root (parent of scripts/) to path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from hdems.config import apply_resolution_ratio, surface_decay
+from hdems.data.evimo2_reader import build_sample_index, load_frame_sample, load_meta
+from hdems.data.motion_labels import frame_motion, params_from_config
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--config", default="configs/evimo_seg.yaml")
+    ap.add_argument("--splits", nargs="+", default=["train", "eval"])
+    ap.add_argument("--out", default=None,
+                    help="output root (default: the dataset root from the config)")
+    args = ap.parse_args()
+
+    with open(args.config, encoding="utf-8-sig") as f:
+        cfg = apply_resolution_ratio(yaml.safe_load(f), verbose=True)
+    ds = cfg.get("dataset", {})
+    root = Path(ds["root"])
+    out_root = Path(args.out) if args.out else root
+
+    height = ds.get("height", 480)             # already divided by resolution_ratio
+    width = ds.get("width", 640)
+    window_s = ds.get("window_ms", 50.0) / 1000.0
+    decay = surface_decay(cfg)                 # time_surface.tau_ms (paper: 35 ms)
+    time_fracs = ds.get("time_frames")
+    motion_params = params_from_config(cfg)
+
+    for split in args.splits:
+        index = build_sample_index(root, split)
+        out_dir = out_root / split
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[{split}] {len(index)} samples -> {out_dir}  ({height}x{width})")
+
+        meta_cache: dict[Path, dict] = {}
+        for k, (seq_dir, fi) in enumerate(index):
+            if seq_dir not in meta_cache:                 # read info.npz once per seq
+                meta_cache[seq_dir] = load_meta(seq_dir)
+            frame = meta_cache[seq_dir]["frames"][fi]
+
+            sample = load_frame_sample(
+                seq_dir, frame, frame_index=fi,
+                out_height=height, out_width=width,
+                window_s=window_s, decay=decay,
+                time_fracs=time_fracs,
+                score_window_s=(float(ds["score_window_ms"]) / 1000.0
+                                if ds.get("score_window_ms") else None),
+            )
+            moving, ambiguous = frame_motion(seq_dir, fi, motion_params, meta_cache[seq_dir])
+            out_path = out_dir / f"{seq_dir.name}_{fi:06d}.pt"
+            # mask_raw MUST be stored: the shard holds raw object ids, and the label
+            # mode (motion needs the per-frame moving set) is applied at load time.
+            shard = {
+                "surface": sample["surface"],
+                "mask": sample["mask"],
+                "mask_raw": True,
+                "moving_ids": sorted(int(i) for i in moving),
+                "ambiguous_ids": sorted(int(i) for i in ambiguous),
+            }
+            if "score_mask" in sample:
+                shard["score_mask"] = sample["score_mask"]
+            torch.save(shard, out_path)
+
+            if (k + 1) % 200 == 0 or (k + 1) == len(index):
+                print(f"  {k + 1}/{len(index)}")
+
+    print("done. Set dataset.use_shards: true to train from these shards.")
+
+
+if __name__ == "__main__":
+    main()

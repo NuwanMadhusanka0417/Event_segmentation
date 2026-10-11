@@ -1,0 +1,207 @@
+# EV-IMO motion segmentation config
+
+d: 512                   # 1024 OOMs a 32GB V100 at 480x640; measured flow is identical
+#                          for d = 64..1024 on EVIMO2, so this costs no accuracy
+
+flow_cache:              # the frozen cost volume is ~80% of a training step: compute
+  enabled: true          # its flow once per sample and reuse it every epoch / run.
+  dir: cache/flow        # ~1.2 MB per frame (~5 GB for train+eval). Keyed on the kernel
+  #                        weights + M/alpha/smooth + the surface itself, so changing
+  #                        any of them recomputes automatically. Safe to delete anytime.
+
+# Values below follow the VSA-Flow paper, Table A1 (DSEC column). Pixel-sized
+# values (patch_size, M, smooth) are FULL-resolution; dataset.resolution_ratio
+# divides them automatically.
+encoder:
+  patch_size: 21          # paper N — HD kernel aperture
+  sigma_k: 1.5            # paper σ_K — Gaussian G in K = D ∗ G
+  kernel: conv            # conv = paper Eq.6 (K = D ∗ G); window = old Gaussian window
+  polarity_binding: true  # paper Eq.7-8: per-polarity kernels, role-bound  (old: summed)
+  scales: 2               # paper S (Eq.9 multi-scale descriptor)           (old: 1)
+
+matching:
+  M: 31                   # paper M — cost-volume search window (±15 px). Was 7 (±3 px):
+  #                         real motion on the moving-camera train scenes is 5-9 px, so
+  #                         M=7 could not represent it and the flow was noise there
+  pyramid_levels: 4
+  scales: [0, 1, 2]       # paper two-time cost volume: F0 vs F1/F2/F4 at pool 1/2/4
+  alpha: 0.85             # paper α — Eq.12 probability-volume threshold   (was 0.3)
+  smooth: 71              # paper sc — Eq.12 cost-volume average pooling   (was 3)
+  vel_scale: 1.0          # displacement->velocity scale (1.0 = pixel units)
+  phi_window: 7           # Φ's OWN neighbourhood (working px, NOT scaled by the ratio).
+  #                         It used to be M: 31x31 = 961 bundled terms in d=512, far past
+  #                         the bundle's capacity (keep <= 9) -> Φ was 370x larger than
+  #                         the velocity code and drowned it. 0 = old behaviour (= M).
+  phi_pad: zero           # Φ borders: zero = no wrap-around | wrap = torch.roll (old)
+
+dataset:
+  name: evimo
+  root: ../Data/EVIMO2_new/samsung_mono/imo   # EVENT camera (Samsung DVS, 640x480)
+  split: train
+  eval_split: eval
+  height: 480            # full sensor resolution
+  width: 640
+  resolution_ratio: 1    # 1 = full, 2 = half (240x320), 4 = quarter (120x160).
+  #                        Also divides patch_size / M / smooth, so they keep covering
+  #                        the same physical area; the cost volume gets ~ratio^4 cheaper.
+  #                        Override per run with --resolution-ratio.
+  window_ms: 50.0
+  time_frames: [1.0, 0.75, 0.5, 0.0]   # paper multi-time surfaces (F0,F1,F2,F4); [] = single-time.
+  #                        F0 (the reference: flow, Φ/F and the ego fit all come from it)
+  #                        now ENDS AT THE LABEL TIME ts and matching runs backwards in time.
+  #                        Old [0.0, 0.25, 0.5, 1.0] put F0 at ts-100..ts-50 ms, so the
+  #                        features described where objects were ~70 ms before the label.
+  #                        The flow sign flips; speeds and grouping are unaffected.
+  #                        Measured on 48 eval frames with a mover (ratio 2): AUC(moving vs
+  #                        static) of the raw |flow| 0.683 -> 0.738; after ego compensation
+  #                        0.704 -> 0.700 (the ego fit, not the flow, is now the limit)
+  score_window_ms: 12.5  # train and score only on pixels with an event in the last 12.5 ms
+  #                        before ts (one flow interval). Older events are the trail a mover
+  #                        leaves behind, and the label at ts calls it "static". 0 = all
+  #                        events of the stack (old). Figures colour these events too.
+  val_split: holdout     # picks the best epoch / alpha: holdout = the val_scenes below,
+  #                        taken out of training | eval = the test set (old: optimistic)
+  val_scenes: [scene9]   # 2 train sequences, 433 frames, 112 with a visible mover (~5% of
+  #                        the training movers). scene12 = still camera, scene6 = 67 frames
+  use_shards: false      # .pt shards (prepare_evimo.py) bypass the split/mover filters
+  label_mode: motion     # motion  = MOVING vs rest, from the pose metadata (Option A, 2 classes)
+  #                        tracked = legacy mask>0 ("on a tracked surface" — includes the
+  #                                  static table, so NOT motion; baseline/ablation only)
+  #                        objects = per-object id (Option B; ids 5..28 -> needs >=29)
+  scene_disjoint: true   # drop train sequences whose scene also appears in eval/
+  #                        (train/ and eval/ hold different takes of scene13/14/15)
+  require_mover: true    # train only on frames where >=1 object is moving ...
+  negative_ratio: 0.1    # ... plus this share of all-static frames as negatives
+  interleave: true       # round-robin across sequences so --max-train-samples N
+  #                        is a balanced sample, not the first sequence only
+
+motion_label:            # label_mode: motion — thresholds in IMAGE PIXELS per window
+  move_px: 1.0           # >= this displacement -> moving
+  static_px: 0.3         # <= this -> static; in between -> ignore (255)
+  boundary_ignore_px: 2  # ignore a band this wide around every mask boundary
+  rot_radius_m: 0.05     # nominal object radius, so spin-in-place counts as motion
+  speed_span_frames: 5   # object speed = straight-line fit over +-5 GT frames (~167 ms).
+  #                        Differencing neighbouring frames (33 ms) turned motion-capture
+  #                        jitter into fake motion: the static table was often "moving".
+  min_moving_px: 100     # a frame "has a mover" only if that object is visible
+  #                        in the mask with at least this many pixels
+
+grouping:                # ONE COLOUR PER MOVING OBJECT (eval + event-colour figures)
+  enabled: true          # the CNN's moving pixels are grouped by the motion model they fit
+  #                        (affine flow per object, sequential RANSAC + merge of neighbours),
+  #                        so a whole object gets one colour even if its flow direction varies.
+  #                        Distances below are FULL-resolution; resolution_ratio scales them.
+  tol_px: 0.7            # a pixel belongs to a motion model within this flow error (px/interval)
+  min_object_px: 160     # smaller groups are not objects
+  max_objects: 8
+  merge_tol_px: 0.7      # neighbouring groups whose joint motion fits within this are one object
+  adjacency_px: 6        # groups this close count as neighbours
+  min_motion_px: 0.25    # an object must move at least this much RELATIVE TO THE CAMERA
+  #                        (px per 12.5 ms interval = motion_label.move_px 1.0 per 50 ms
+  #                        window), else it is background the CNN marked by mistake
+  ransac_iters: 300
+
+vsa_grouping:            # TRAINING-FREE back end (hdems/vsa_grouping.py; eval --vsa-group):
+  #                        every event pixel -> H = P(x,y) ⊙ V(u,v) on the RAW flow, kernel
+  #                        k-means in HV space, merge clusters whose motion is continuous
+  #                        across their border, background = cluster most like the previous
+  #                        frame's background. No ego fit, no CNN, no RANSAC.
+  #                        Pixel / velocity values are FULL-resolution (divided by the ratio).
+  sigma_s_px: 30.0       # position kernel width
+  sigma_v_px: 0.5        # velocity kernel width (px per 12.5 ms interval)
+  k_init: 24             # initial prototypes (over-segment, then merge)
+  iters: 10              # assign / re-bundle iterations
+  max_pixels: 60000      # k-means runs on at most this many event pixels; all are assigned
+  adjacency_px: 6        # clusters closer than this are neighbours
+  merge_band_px: 8       # continuity test: window reach on each side of a shared border
+  merge_gap_px: 0        # skipped zone next to the border (Eq.12 pooling blurs the flow there)
+  merge_vel_px: 0.5      # merge if the two sides' local motion fits differ by less than this
+  min_object_px: 160     # smaller clusters are not objects
+  min_motion_px: 0.25    # an object must move this much relative to the background near it
+  background: temporal   # temporal (previous frame's background prototype) | border | extent
+  bg_min_sim: 0.3        # temporal prior accepted only above this similarity
+  bg_fallback: border    # used for the first frame of a sequence: border | extent
+  smooth_labels_px: 5    # majority filter window in WORKING px (0 = off)
+  flow_smooth_px: null   # Eq.12 pooling for THIS path only (null = matching.smooth)
+  use_confidence: false  # weight pixels by the Σ P² match confidence (a weak cue, measured)
+  seed: 0
+  baseline_threshold_px: 0.5   # --threshold-baseline: |ego residual| above this = moving
+  #                              scripts/tune_vsa_grouping.py tunes all of these on the
+  #                              held-out validation scene and writes vsa_grouping_tuned.yaml
+
+train:
+  task: segmentation
+  batch_size: 1
+  epochs: 30             # upper bound; early stopping usually ends much sooner
+  patience: 5            # stop after this many validations without improvement (0 = off)
+  val_every: 2           # validate every N epochs (always on the last epoch)
+  lr: 1.0e-4
+  num_workers: 8
+  use_dice: true          # add Dice to CE (background/foreground imbalance)
+  max_val_samples: 150    # hdems.train only (the PBS passes --max-val-samples)
+  augment_flip: true      # each training sample randomly as-is / mirrored left-right /
+  #                        upside-down / rotated 180 deg. The event surfaces are flipped
+  #                        BEFORE the front end, so the flow is re-measured and the
+  #                        velocity mirrors with the image. The flow cache stores up to 4
+  #                        versions per frame (first epochs slower, ~4x cache disk).
+  # max_samples: 100      # optional: train on first N frames (or CLI --max-samples)
+
+eval:
+  metrics: [iou, miou]
+  split: eval
+  # max_samples: 20       # optional: eval on first N frames (or CLI --max-samples)
+
+velocity:
+  vel_norm: fixed        # velocity code units: fixed = vel_unit_px per FPE unit, same in every
+  #                        frame | frame = rescaled by the frame's 95th percentile (old: on a
+  #                        still frame it stretched flow noise into "fast motion")
+  vel_unit_px: 0.5       # fixed units: SENSOR px per 12.5 ms interval per FPE unit (codes of
+  #                        velocities 0.5 px apart have cosine 0.61, 1 px apart 0.14)
+  vel_bw: 6.0            # vel_norm: frame only -- FPE bandwidth after the q95 rescaling
+  x_norm: rms            # event HV X scaled to unit RMS per frame before use (raw F is 5-11x,
+  #                        Φ was 100-370x the |.|=1 velocity code) | none (old)
+  ego_fit: stack         # ego-motion model fitted on the events of all 4 surfaces | reference
+  #                        (reference surface only). Measured on 48 eval frames with a mover:
+  #                        AUC(|residual|) stack 0.700, reference 0.696 -- no gain, so stack
+  event_feature: phi     # event HV fused with velocity -> phi (7x7 bundled field) | f (descriptor F0)
+  axis_combine: bind     # combine Vx,Vy -> bind | bundle
+  event_combine: bind    # combine event HV X with velocity code Mv ->
+  #                        bind (X o Mv) | bundle (X + Mv) | bindbundle ((X^ o Mv) + Mv) | concat
+  #                        (not used by head mfcnn: X and Mv go into separate branches)
+
+segmentation:
+  head: mfunet           # mfunet (motion-first U-Net: wide view + event density + flow
+  #                        confidence) | mfcnn (motion-first, 5x5 view) | cnn (HV-channels CNN
+  #                        on the fused X/Mv feature) | prototype | ridge | motion
+  #                      all -> scripts/fit_ridge_head.py (run_segmentation.pbs)
+  num_classes: 32        # used by label_mode=objects/remap; motion forces 2
+  embedding_dim: 32
+  mf_motion_dim: 32      # mfcnn: channels read out of the velocity code Mv
+  mf_app_dim: 8          # mfcnn: appearance channels (1x1 projection of unit-RMS X); 0 = none
+  mf_app_dropout: 0.5    # mfcnn: while training, drop ALL appearance channels of a sample with
+  #                        this probability, so the head must also work from motion alone
+  #                        (mfunet: the event-density channel is dropped with them)
+  mf_widths: [32, 64, 96, 128]   # mfunet: channels at 1, 1/2, 1/4, 1/8 resolution (~1M params)
+  ctx_dim: 32            # motion head: compressed HV context channels
+  flow_beta: 1.0         # motion head: soft-argmax temperature for Phi->velocity
+  ego_iters: 3           # motion head: IRLS passes for global-motion fit
+  mean_center: false     # CNN legacy checkpoints (no centering)
+  motion_features: false
+  ridge_mean_center: true
+  ridge_motion_features: true
+  ridge_weights: checkpoints/ridge_head.pt
+  prototype_weights: checkpoints/prototype_head.pt
+
+ridge:
+  backend: streaming     # streaming | sklearn
+  imbalance: balanced    # balanced | subsample_bg | none
+  bg_subsample_ratio: 0.2
+  # validation split: see dataset.val_split
+  alphas: [1.0e-3, 1.0e-1, 1.0, 10.0, 100.0]
+  # max_train_samples: 50   # optional smoke cap (first N frames)
+  # max_val_samples: 10
+
+time_surface:
+  tau_ms: 35.0           # paper τ_TS (Eq.3): event weight exp(-age / 35 ms).
+  #                        The old `decay: 0.8` was per SECOND, i.e. 0.989 across 50 ms:
+  #                        effectively no decay, so each surface smeared 50 ms of motion.
