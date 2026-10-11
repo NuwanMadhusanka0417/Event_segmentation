@@ -27,7 +27,7 @@ CONFIG=configs/evimo_seg.yaml
 CKPT_DIR=checkpoints
 
 CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_nocnn/Train_nocnn
-VENV=/scratch/jq77/nk8155/seg/bin/activate
+VENV=/scratch/jq77/nk8155/seg1/bin/activate
 
 # Checkpoints to evaluate (basenames under ${CKPT_DIR}/). Empty = every .pt there.
 # Names as written by run_segmentation.pbs:

@@ -58,7 +58,7 @@ PANELS=movers          # which eval frames get figures (scores always use ALL fr
 
 CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_nocnn/Train_nocnn
 CONFIG=configs/evimo_seg.yaml          # dataset.root is relative to CODE_DIR (../Data/...)
-VENV=/scratch/jq77/nk8155/seg/bin/activate
+VENV=/scratch/jq77/nk8155/seg1/bin/activate
                        # a venv on /scratch loses files nothing reads for 100 days (NCI file
                        # expiry): that is the "Unable to find torch_shm_manager" crash. The
                        # pre-flight check below catches it; fix: bash scripts/repair_env.sh

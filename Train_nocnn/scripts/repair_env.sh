@@ -15,7 +15,7 @@
 #     nci-file-expiry recover <UUID>
 
 set -eo pipefail
-VENV="${1:-/scratch/jq77/nk8155/seg/bin/activate}"
+VENV="${1:-/scratch/jq77/nk8155/seg1/bin/activate}"
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 module load python3/3.9.2 2>/dev/null || true

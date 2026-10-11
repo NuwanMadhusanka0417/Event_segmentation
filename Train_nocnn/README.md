@@ -212,7 +212,7 @@ Train_nocnn/
 
 ```bash
 module load python3/3.9.2
-source /scratch/jq77/nk8155/seg/bin/activate
+source /scratch/jq77/nk8155/seg1/bin/activate
 cd /scratch/mi23/nuwan/Event_segmentation_nocnn/Train_nocnn
 pip install -r requirements.txt      # first time only
 
@@ -241,7 +241,7 @@ have no internet):
 ```bash
 nci-file-expiry list-quarantined         # still in quarantine (< 14 days)? then
 nci-file-expiry recover <UUID>           #   restore the files as they were
-bash scripts/repair_env.sh /scratch/jq77/nk8155/seg/bin/activate
+bash scripts/repair_env.sh /scratch/jq77/nk8155/seg1/bin/activate
                                          # or reinstall only the broken packages,
                                          #   same versions (torch: 1-2.5 GB download)
 ```
@@ -250,7 +250,7 @@ Long term, keep the venv on `/g/data` (no expiry) and point `VENV=` in the PBS
 scripts at it:
 
 ```bash
-source /scratch/jq77/nk8155/seg/bin/activate && pip freeze > ~/seg-freeze.txt && deactivate
+source /scratch/jq77/nk8155/seg1/bin/activate && pip freeze > ~/seg-freeze.txt && deactivate
 python3 -m venv /g/data/jq77/nk8155/venvs/seg
 source /g/data/jq77/nk8155/venvs/seg/bin/activate
 pip install -r ~/seg-freeze.txt          # add --extra-index-url https://download.pytorch.org/whl/cuXXX
