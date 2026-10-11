@@ -24,7 +24,10 @@ source scripts/nci_env.sh                 # pip's cache off the small $HOME quot
 export TMPDIR="${CACHE_ROOT}/pip-tmp"     # unpacking torch needs several GB
 mkdir -p "${TMPDIR}"
 
-mapfile -t SPECS < <(python scripts/check_env.py --pip-specs)
+# --venv: stop if `python` is not this venv's own (a renamed venv's bin/activate
+# still points at its old folder) -- never reinstall into the wrong venv
+python scripts/check_env.py --venv "${VENV}" --pip-specs > "${TMPDIR}/broken.txt"
+mapfile -t SPECS < "${TMPDIR}/broken.txt"
 if [ "${#SPECS[@]}" -eq 0 ]; then
   echo ">>> no package has missing files -- nothing to reinstall"
 fi
@@ -37,4 +40,4 @@ for line in "${SPECS[@]}"; do
 done
 
 echo ">>> checking again"
-python scripts/check_env.py --config configs/evimo_seg.yaml
+python scripts/check_env.py --venv "${VENV}" --config configs/evimo_seg.yaml

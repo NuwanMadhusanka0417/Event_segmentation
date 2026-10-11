@@ -53,5 +53,13 @@ def test_pip_spec_keeps_the_cuda_build(tmp_path):
         "torch==2.3.1+cu121", "https://download.pytorch.org/whl/cu121")
 
 
+def test_wrong_venv_is_caught(tmp_path):
+    # a renamed venv: `source seg1/bin/activate` still runs the old venv's python
+    import sys
+    assert check_env.venv_problem(Path(sys.prefix)) is None
+    assert check_env.venv_problem(Path(sys.prefix) / "bin" / "activate") is None
+    assert "not the venv" in check_env.venv_problem(tmp_path / "seg1" / "bin" / "activate")
+
+
 def test_pip_spec_plain_pypi(tmp_path):
     assert check_env.pip_spec(_fake_dist(tmp_path, "pip", version="2.3.1")) == ("torch==2.3.1", "")

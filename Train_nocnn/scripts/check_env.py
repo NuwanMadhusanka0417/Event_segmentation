@@ -4,7 +4,8 @@
 Every PBS script runs this before any real work, so a broken environment stops the
 job in seconds with the fix printed, instead of a traceback hours into the run:
 
-    python scripts/check_env.py --config configs/evimo_seg.yaml --require-cuda
+    python scripts/check_env.py --venv /scratch/jq77/nk8155/seg1 \
+        --config configs/evimo_seg.yaml --require-cuda
     python scripts/check_env.py --pip-specs     # broken packages as pip specs (repair_env.sh)
 
 Why: NCI Gadi quarantines /scratch files that nothing has READ for 100 days and
@@ -15,7 +16,9 @@ loses the ones nothing reads -- e.g. torch/bin/torch_shm_manager, which
     RuntimeError: Unable to find torch_shm_manager at .../torch/bin/torch_shm_manager
 
 Checks
-  1. ``python`` is the activated venv's interpreter (warning only)
+  1. --venv: ``python`` is that venv's own interpreter. A renamed or copied venv
+     keeps its OLD path in bin/activate, so ``source seg1/bin/activate`` can still
+     run the old venv's python (with the old venv's missing files). Stops here if not.
   2. every file pip installed for the packages this code uses (and their
      dependencies) still exists -- read from each package's RECORD
   3. each package really imports, in a subprocess (a crash is reported, not fatal)
@@ -208,6 +211,20 @@ def check_imports(require_cuda: bool, errors: list[str]) -> None:
                       "-- check '#PBS -q gpuvolta -l ngpus=...' and 'module load cuda'")
 
 
+def venv_dir(path: Path) -> Path:
+    """The venv folder, given the folder itself or its bin/activate."""
+    return path.parent.parent if path.name == "activate" else path
+
+
+def venv_problem(expected: Path) -> str | None:
+    """Why ``python`` is not ``expected``'s own interpreter; None when it is."""
+    want = venv_dir(expected)
+    if os.path.realpath(sys.prefix) == os.path.realpath(want):
+        return None
+    return (f"python is {sys.executable}, not the venv {want}'s own "
+            f"(its bin/activate sets VIRTUAL_ENV={os.environ.get('VIRTUAL_ENV', '(not set)')})")
+
+
 def _nonempty(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
 
@@ -257,6 +274,9 @@ def check_data(config: Path, need_depth: bool, errors: list[str]) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--venv", type=Path, default=None,
+                    help="the venv this must run in (its folder or bin/activate): stop if "
+                         "python is another interpreter (renamed / copied venv)")
     ap.add_argument("--config", type=Path, default=None,
                     help="also check the dataset of this config")
     ap.add_argument("--require-cuda", action="store_true",
@@ -268,8 +288,12 @@ def main() -> int:
                          "missing files (used by scripts/repair_env.sh)")
     args = ap.parse_args()
 
+    wrong_venv = venv_problem(args.venv) if args.venv is not None else None
     dists = installed()
     if args.pip_specs:
+        if wrong_venv:               # never "repair" another venv than the one asked for
+            print(f"check_env.py: {wrong_venv}", file=sys.stderr)
+            return 1
         for name in closure(REQUIRED + OPTIONAL, dists):
             found = missing_files(dists[name])
             if found and found[0]:
@@ -282,6 +306,17 @@ def main() -> int:
     print(" PRE-FLIGHT CHECK  (scripts/check_env.py)")
     print("=" * 63)
     print(f"[python] {sys.version.split()[0]}  {sys.executable}")
+    if wrong_venv:
+        want = venv_dir(args.venv)
+        print("=" * 63)
+        print(f" PRE-FLIGHT FAILED:\n   - {wrong_venv}")
+        print(f"""
+ HOW TO FIX  (a renamed or copied venv keeps its OLD path in bin/activate)
+   Point bin/activate at the venv's real folder, then open a new shell:
+        sed -i 's#^VIRTUAL_ENV=.*#VIRTUAL_ENV="{want}"#' {want}/bin/activate
+   Use 'python -m pip', not 'pip': pip's first line still names the old path.""")
+        print("=" * 63)
+        return 1
     if not venv:
         print("  WARNING: no virtualenv is activated")
     elif os.path.realpath(sys.prefix) != os.path.realpath(venv):
@@ -301,7 +336,7 @@ def main() -> int:
     for e in errors:
         print(f"   - {e}")
     if broken or any(e.startswith(("import", "CUDA")) for e in errors):
-        activate = Path(venv or sys.prefix) / "bin" / "activate"
+        activate = (venv_dir(args.venv) if args.venv else Path(venv or sys.prefix)) / "bin" / "activate"
         print(f"""
  HOW TO FIX THE ENVIRONMENT  (on a Gadi LOGIN node: compute nodes have no internet)
    NCI quarantines /scratch files that nothing has read for 100 days and deletes

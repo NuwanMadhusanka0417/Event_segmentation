@@ -41,7 +41,7 @@ export PYTHONUNBUFFERED=1
 
 # PRE-FLIGHT: venv intact, GPU visible, every sequence complete incl. the depth
 # maps the ground-truth flow needs (fix printed on failure: scripts/repair_env.sh)
-python scripts/check_env.py --config "${CONFIG}" --require-cuda --require-depth
+python scripts/check_env.py --venv "${VENV}" --config "${CONFIG}" --require-cuda --require-depth
 
 echo "=== Flow check ${PBS_JOBID:-local} started $(date) ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true

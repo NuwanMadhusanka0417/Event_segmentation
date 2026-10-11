@@ -50,7 +50,7 @@ source scripts/nci_env.sh
 export PYTHONUNBUFFERED=1
 
 # PRE-FLIGHT: venv intact, GPU visible, dataset complete (fix printed on failure)
-python scripts/check_env.py --config "${CONFIG}" --require-cuda
+python scripts/check_env.py --venv "${VENV}" --config "${CONFIG}" --require-cuda
 
 if [ "${#CHECKPOINTS[@]}" -eq 0 ]; then
   shopt -s nullglob

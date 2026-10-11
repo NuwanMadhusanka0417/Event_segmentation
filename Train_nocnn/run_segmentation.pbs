@@ -62,6 +62,8 @@ VENV=/scratch/jq77/nk8155/seg1/bin/activate
                        # a venv on /scratch loses files nothing reads for 100 days (NCI file
                        # expiry): that is the "Unable to find torch_shm_manager" crash. The
                        # pre-flight check below catches it; fix: bash scripts/repair_env.sh
+                       # A RENAMED venv (seg -> seg1) keeps the old path in bin/activate;
+                       # the check stops the job if python is not seg1's own.
 
 # ---------------------------------------------------------------------------
 # ENVIRONMENT
@@ -73,10 +75,10 @@ cd "${CODE_DIR}"
 source scripts/nci_env.sh              # torch / matplotlib caches off the small $HOME quota
 export PYTHONUNBUFFERED=1              # live log lines (tail -f) instead of at the end
 
-# PRE-FLIGHT: venv intact (every installed file present, packages import, GPU
-# visible) and the dataset complete -- fails in seconds with the fix printed,
-# instead of a traceback hours into the job
-python scripts/check_env.py --config "${CONFIG}" --require-cuda
+# PRE-FLIGHT: python is VENV's own, venv intact (every installed file present,
+# packages import, GPU visible) and the dataset complete -- fails in seconds with
+# the fix printed, instead of a traceback hours into the job
+python scripts/check_env.py --venv "${VENV}" --config "${CONFIG}" --require-cuda
 
 # Derived names -------------------------------------------------------------
 EV_TAG="${EV_COMBINE}"
@@ -246,7 +248,7 @@ echo "=== Job ${PBS_JOBID} (${RUN_NAME}) finished $(date)  --  elapsed $((SECOND
 # When this line completes, PBS tears the job down and stops billing. No qdel needed.
 
 
-#python scripts/check_env.py --config configs/evimo_seg.yaml   # on the login node, before qsub
+#python scripts/check_env.py --venv /scratch/jq77/nk8155/seg1 --config configs/evimo_seg.yaml   # login node, before qsub
 #qsub run_segmentation.pbs        # submit; prints a job id like 12345678.gadi-pbs
 #qstat -u nk8155                  # check status: Q=queued, R=running, done=gone from list
 #tail -f hdems_seg_group.o12345678  # watch the log live while it runs
