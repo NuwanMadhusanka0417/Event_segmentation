@@ -72,7 +72,7 @@ EXTRA_INPUTS=yes       # yes | no  derotated flow vector + rotation speed as hea
 
 CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
 CONFIG=configs/evimo_seg.yaml
-VENV=/scratch/jq77/nk8155/seg/bin/activate
+VENV=/scratch/jq77/nk8155/seg1/bin/activate
 
 # ---------------------------------------------------------------------------
 # ENVIRONMENT
@@ -80,6 +80,14 @@ VENV=/scratch/jq77/nk8155/seg/bin/activate
 module load cuda
 module load python3/3.9.2
 source "${VENV}"
+# The venv must provide 'python'. Without it Gadi's placeholder answers instead with
+# "The use of the 'python' command ... has been deprecated" (e.g. after the /scratch
+# 100-day purge removed files from the venv) -- stop here with a clear message.
+if [ "$(command -v python)" != "$(dirname "${VENV}")/python" ]; then
+  echo "ERROR: no python in $(dirname "${VENV}") (found: '$(command -v python)') -- repair or recreate the venv"
+  exit 1
+fi
+python -c "import torch" || { echo "ERROR: torch does not import in ${VENV}"; exit 1; }
 cd "${CODE_DIR}"
 
 # Derived names -------------------------------------------------------------

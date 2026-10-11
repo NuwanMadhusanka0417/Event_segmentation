@@ -30,11 +30,17 @@ FRAMES=20              # frames per split per ratio
 CONFIG=configs/evimo_seg.yaml
 
 CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
-VENV=/scratch/jq77/nk8155/seg/bin/activate
+VENV=/scratch/jq77/nk8155/seg1/bin/activate
 
 module load cuda
 module load python3/3.9.2
 source "${VENV}"
+# the venv must provide 'python' (else Gadi's "'python' command ... deprecated" placeholder)
+if [ "$(command -v python)" != "$(dirname "${VENV}")/python" ]; then
+  echo "ERROR: no python in $(dirname "${VENV}") (found: '$(command -v python)') -- repair or recreate the venv"
+  exit 1
+fi
+python -c "import torch" || { echo "ERROR: torch does not import in ${VENV}"; exit 1; }
 cd "${CODE_DIR}"
 source scripts/nci_env.sh
 export PYTHONUNBUFFERED=1
