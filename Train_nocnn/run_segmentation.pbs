@@ -17,15 +17,26 @@ set -eo pipefail   # stop immediately if fit fails, so eval never runs on a stal
 # ---------------------------------------------------------------------------
 # PARAMETERS  (edit these; everything below is derived from them)
 # ---------------------------------------------------------------------------
-MODE=vsa_group         # train     = fit a head (HEAD below), then evaluate it
+MODE=moving            # train     = fit a head (HEAD below), then evaluate it
+                       # moving    = TRAINING-FREE, recommended: camera rotation removed with the
+                       #             IMU, the rest of the flow tested against the static scene
+                       #             (moving_test.model; default none = |derotated flow|,
+                       #             tuned on validation), failing events grouped
+                       #             into objects (hdems/static_test.py; HEAD..AUGMENT unused)
                        # vsa_group = TRAINING-FREE: cluster event pixels in hypervector space
-                       #             (no CNN, no ego fit, no RANSAC; HEAD..AUGMENT unused)
+                       #             (on IMU-derotated flow when vsa_grouping.derotate: true)
                        # threshold = no-CNN baseline: |ego residual| > threshold + RANSAC grouping
-TUNE=yes               # vsa_group / threshold: tune on the held-out validation scene first
+ROT_SOURCE=imu         # moving / vsa_group: camera rotation removed from the flow
+                       #   imu = gyroscope (real sensor) | none = events only
+                       #   vicon = motion capture: ORACLE upper bound, never a reported result
+TUNE=yes               # moving / vsa_group / threshold: tune on validation sequences first
                        #   (scripts/tune_vsa_grouping.py; never on eval). no = config values
-TUNE_FRAMES=100        # validation frames used for tuning
-TUNE_GRID=quick        # quick (8 settings, ~1.3 h at RES_RATIO=2) | full (48 settings, ~7 h)
-                       #   (measured ~3 s/frame without the border gap, ~8 s with it; CPU-bound)
+TUNE_SCENES=           # validation scenes (comma list, TRAIN split); empty = the config's
+                       #   moving_test.tune_scenes (scene6,13,14,15: scene9 has NO IMU)
+TUNE_FRAMES=150        # validation frames used for tuning
+TUNE_GRID=quick        # quick | full. MODE=moving tunes only the static-scene test (minutes);
+                       #   vsa_group/threshold also run the VSA grid: quick 8 settings ~1.3 h,
+                       #   full 48 settings ~7 h at RES_RATIO=2 (CPU-bound)
 HEAD=mfunet            # mfunet | mfcnn | cnn | prototype | ridge | motion
                        #   mfunet = motion-first U-Net: sees ~110 px around each pixel, plus
                        #            event density + flow confidence channels
@@ -88,9 +99,10 @@ if [ "${AUGMENT}" = "no" ]; then AUG_TAG="_noaug"; fi
 RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_TAG}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}${AUG_TAG}"
 case "${MODE}" in
   train) ;;
-  vsa_group) RUN_NAME="vsagroup_${LABEL_MODE}_r${RES_RATIO}" ;;
+  moving) RUN_NAME="moving_${ROT_SOURCE}_${LABEL_MODE}_r${RES_RATIO}" ;;
+  vsa_group) RUN_NAME="vsagroup_${ROT_SOURCE}_${LABEL_MODE}_r${RES_RATIO}" ;;
   threshold) RUN_NAME="threshold_${LABEL_MODE}_r${RES_RATIO}" ;;
-  *) echo "unknown MODE=${MODE} (train | vsa_group | threshold)"; exit 1 ;;
+  *) echo "unknown MODE=${MODE} (train | moving | vsa_group | threshold)"; exit 1 ;;
 esac
 CKPT="checkpoints/${RUN_NAME}.pt"
 RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
@@ -118,7 +130,8 @@ echo
 echo "--- run parameters (this script) ------------------------------"
 printf '  %-16s %s\n' \
   MODE         "${MODE}" \
-  TUNE         "${TUNE}  (${TUNE_GRID} grid on ${TUNE_FRAMES} validation frames; MODE != train only)" \
+  ROT_SOURCE   "${ROT_SOURCE}  (camera rotation; MODE != train only)" \
+  TUNE         "${TUNE}  (${TUNE_GRID} grid on ${TUNE_FRAMES} validation frames${TUNE_SCENES:+ of ${TUNE_SCENES}}; MODE != train only)" \
   HEAD         "${HEAD}" \
   EV_FEATURE   "${EV_FEATURE}" \
   AX_COMBINE   "${AX_COMBINE}" \
@@ -213,14 +226,23 @@ else
   # -------------------------------------------------------------------------
   # 1. TUNE on the held-out validation scene (training-free: nothing is fitted)
   # -------------------------------------------------------------------------
-  MODE_FLAG="--vsa-group"
-  if [ "${MODE}" = "threshold" ]; then MODE_FLAG="--threshold-baseline"; fi
+  case "${MODE}" in
+    moving) MODE_FLAG="--moving-test" ;;
+    vsa_group) MODE_FLAG="--vsa-group" ;;
+    threshold) MODE_FLAG="--threshold-baseline" ;;
+  esac
+  ROT_FLAG="--rot-source ${ROT_SOURCE}"
   PARAMS_FLAG=""
   if [ "${TUNE}" = "yes" ]; then
     QUICK_FLAG=""
     if [ "${TUNE_GRID}" = "quick" ]; then QUICK_FLAG="--quick"; fi
-    echo ">>> [$(date +%T)] tuning vsa_grouping + baseline threshold on the validation split"
+    SKIP_VSA=""                          # the VSA grid takes hours; MODE=moving does not use it
+    if [ "${MODE}" = "moving" ]; then SKIP_VSA="--skip-vsa"; fi
+    SCENES_FLAG=""
+    if [ -n "${TUNE_SCENES}" ]; then SCENES_FLAG="--val-scenes ${TUNE_SCENES}"; fi
+    echo ">>> [$(date +%T)] tuning on the validation sequences (ranked by FG IoU)"
     python scripts/tune_vsa_grouping.py --config "${CONFIG}" --split holdout \
+      ${ROT_FLAG} ${SCENES_FLAG} ${SKIP_VSA} \
       --resolution-ratio "${RES_RATIO}" --max-frames "${TUNE_FRAMES}" ${QUICK_FLAG} \
       --device cuda --out "${RESULTS_DIR}/vsa_grouping_tuned.yaml"
     PARAMS_FLAG="--vsa-params ${RESULTS_DIR}/vsa_grouping_tuned.yaml"
@@ -230,14 +252,15 @@ else
   # 2. EVALUATE (eval split, once)
   # -------------------------------------------------------------------------
   echo ">>> [$(date +%T)] evaluating ${MODE} -> ${RESULTS_DIR}/event_colours"
-  python -m hdems.eval --config "${CONFIG}" ${MODE_FLAG} ${PARAMS_FLAG} ${DETECT_FLAG} \
+  # metrics are also saved next to the figures (eval_metrics.txt)
+  python -m hdems.eval --config "${CONFIG}" ${MODE_FLAG} ${ROT_FLAG} ${PARAMS_FLAG} ${DETECT_FLAG} \
     --resolution-ratio "${RES_RATIO}" --device cuda \
     --color-events "${RESULTS_DIR}/event_colours" \
-    --panels "${PANELS}" --max-images "${TEST_SAMPLES}"
+    --panels "${PANELS}" --max-images "${TEST_SAMPLES}" 2>&1 | tee "${RESULTS_DIR}/eval_metrics.txt"
 
   echo ">>> [$(date +%T)] events-only baseline (control)"
   python -m hdems.eval --config "${CONFIG}" ${MODE_FLAG} --events-only-baseline \
-    --resolution-ratio "${RES_RATIO}" --device cuda
+    --resolution-ratio "${RES_RATIO}" --device cuda 2>&1 | tee "${RESULTS_DIR}/eval_control.txt"
 fi
 
 # ---------------------------------------------------------------------------

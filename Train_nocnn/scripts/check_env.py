@@ -237,6 +237,14 @@ def check_data(config: Path, need_depth: bool, errors: list[str]) -> None:
     except Exception as e:                       # yaml broken or config unreadable
         errors.append(f"cannot read {config}: {e}")
         return
+    motion = cfg.get("motion") or {}
+    if str(motion.get("rot_source", "none")) == "imu":
+        calib = Path(motion.get("imu_calib", "configs/imu_calib.json"))
+        print(f"[imu]    motion.rot_source = imu, calibration {calib}: "
+              f"{'found' if calib.is_file() else 'MISSING'}")
+        if not calib.is_file():
+            errors.append(f"IMU calibration {calib} not found (python scripts/calibrate_imu.py, "
+                          "or set motion.rot_source: none)")
     ds = cfg.get("dataset") or {}
     if ds.get("name", "dsec") != "evimo":
         print(f"[data]   dataset.name={ds.get('name')!r}: not checked")

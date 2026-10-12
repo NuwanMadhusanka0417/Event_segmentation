@@ -128,6 +128,48 @@ vsa_grouping:            # TRAINING-FREE back end (hdems/vsa_grouping.py; eval -
   baseline_threshold_px: 0.5   # --threshold-baseline: |ego residual| above this = moving
   #                              scripts/tune_vsa_grouping.py tunes all of these on the
   #                              held-out validation scene and writes vsa_grouping_tuned.yaml
+  derotate: true         # cluster the flow with the IMU camera rotation removed (motion:)
+
+motion:                  # CAMERA ROTATION for the training-free back ends (hdems/imu.py)
+  rot_source: imu        # imu   = gyroscope of the Prophesee camera on the same rig (real sensor)
+  #                        vicon = motion-capture rotation: ORACLE / upper bound, never a result
+  #                        none  = events only
+  #                        scene9 / scene10 / scene12 were recorded WITHOUT IMU (rotation 0
+  #                        there); every eval sequence has it
+  imu_topic: left        # left IMU: per-axis corr 0.978 / 0.998 / 0.994 with the camera rate
+  imu_calib: configs/imu_calib.json   # IMU -> camera rotation + time offset, estimated on the
+  #                        TRAIN split only (python scripts/calibrate_imu.py)
+  imu_avg_ms: 25.0       # gyro averaged over this long before the label time
+
+moving_test:             # TRAINING-FREE static-scene test (eval --moving-test, PBS MODE=moving,
+  #                        hdems/static_test.py): IMU rotation removed, the rest of the flow
+  #                        tested against the static scene, failing events = moving, grouped
+  #                        into objects with grouping: (RANSAC). Pixel values are FULL resolution.
+  model: none            # none      = |derotated flow| (default: best measured, see below)
+  #                        epipolar  = depth-independent: a static point moves along its line
+  #                                    through the focus of expansion (camera translation)
+  #                        quadratic = robust quadratic background (a plane, translating camera)
+  #                        affine    = old global affine fit
+  #                        Measured (ratio 2, thresholds from validation, 50 eval figure
+  #                        frames): none 0.358 FG IoU, quadratic 0.336, epipolar 0.312, VSA
+  #                        grouping 0.289. The models only win when the camera turns fast
+  #                        (15-45 deg/s: epipolar 0.221 vs 0.173); most eval frames are slow.
+  #                        The tuner picks one only if it beats none by --min-gain.
+  threshold_px: 0.75     # score above this = moving (px per 12.5 ms interval)
+  static_px: 2.0         # background models switch on only when the derotated background
+  #                        median exceeds this (camera clearly translating); below it the
+  #                        score is |derotated flow|. Best on validation: 2.0 (0.5 hurt eval)
+  tau_px: 0.6            # inlier distance: from the epipolar line / from the quadratic fit
+  hypotheses: 400        # RANSAC hypotheses (epipolar, quadratic)
+  min_rot_px: 0.5        # rotational flow (median) below this is NOT subtracted: the front end
+  #                        rounds sub-pixel motion to 0 (Eq.12 alpha 0.85), so removing a real
+  #                        0.3 px rotation from a flow that reads 0 would CREATE motion
+  #                        (measured: still-camera background 0.06 -> 0.18 px with it removed)
+  tune_scenes: [scene6, scene13, scene14, scene15]   # scripts/tune_vsa_grouping.py tunes on
+  #                        these TRAIN-split sequences: the only ones with IMU besides eval
+  #                        (scene9 has none). 13/14/15 are other takes (recordings) of the eval
+  #                        scenes from EVIMO2's official train split -- say so in the paper,
+  #                        or use [scene6] alone (one short sequence)
 
 train:
   task: segmentation

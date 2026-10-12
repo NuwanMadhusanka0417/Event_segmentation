@@ -485,6 +485,73 @@ almost as often as background/background ones (48% vs 64% at 0.5 px). A 36 px ga
 stops object borders merging (1.3% at 1.0 px) but leaves the background in 20-46
 pieces. See `docs/vsa_grouping_results.md`.
 
+## Training-free back end with the IMU: static-scene test (`MODE=moving`, recommended)
+
+**Why (run `vsagroup_motion_r2_20261012_121328`):** with a moving camera the static
+scene is not one motion: near surfaces move more than far ones, and rotation adds a
+position-dependent field. The VSA clustering therefore split the background into many
+clusters and called all but one of them objects (10-30 "objects" per frame, 1-2 in the
+ground truth; FG IoU 0.05 on the validation scene). The tuner made it worse: it ranked
+by object mIoU, which averages over the GROUND-TRUTH objects only, so extra false
+objects cost nothing.
+
+**What `--moving-test` does** (`hdems/static_test.py`, nothing trained):
+1. **rotation** from the IMU gyroscope (`hdems/imu.py`, `motion:`), turned into image
+   motion per pixel (no depth needed) and subtracted from the flow. Below
+   `moving_test.min_rot_px` it is left in: the front end rounds sub-pixel motion to 0,
+   so removing a real 0.3 px rotation from a flow that reads 0 would create motion.
+2. **translation** (a gyro cannot see it; its image motion depends on depth): the rest
+   of the flow is tested against `moving_test.model`: `none` (default: |derotated
+   flow|, best measured) | `epipolar` (depth-independent: a static point moves along its line through the focus
+   of expansion, estimated by RANSAC) | `quadratic` (a plane seen by a translating
+   camera; RANSAC + Tukey) | `affine` (the old fit) | `none`. If the background barely
+   moves (`static_px`), the score is simply |derotated flow|.
+3. score > `threshold_px` = moving; the moving events are grouped into objects by
+   motion model (`grouping:`, RANSAC) on the derotated flow.
+
+`--vsa-group` also clusters the derotated flow now (`vsa_grouping.derotate: true`).
+
+**IMU coverage:** every eval sequence has gyro data; **scene9, scene10, scene12 have
+none**, so the old validation scene (scene9) cannot tune an IMU method. The tuner uses
+`moving_test.tune_scenes` (scene6 + the train-split takes of scenes 13/14/15 -- other
+recordings of the eval scenes from EVIMO2's official train split; say so in a paper, or
+tune on `[scene6]` only). It now ranks by **FG IoU** (`--rank object` = the old way).
+
+```bash
+python scripts/tune_vsa_grouping.py --resolution-ratio 2 --skip-vsa --device cuda \
+    --out results/tuned.yaml                                   # minutes: no VSA grid
+python -m hdems.eval --moving-test --vsa-params results/tuned.yaml --resolution-ratio 2 \
+    --detect --color-events out/moving --panels movers
+python -m hdems.eval --moving-test --rot-source vicon ...      # ORACLE rotation (upper bound)
+python -m hdems.eval --moving-test --rot-source none ...       # ablation: no IMU
+```
+
+`run_segmentation.pbs`: `MODE=moving`, `ROT_SOURCE=imu|none|vicon`, `TUNE_SCENES`.
+Eval prints how many frames had a gyro rate, were derotated and used the epipolar
+model, and the metrics are also saved in `eval_metrics.txt` next to the figures.
+
+**Measured** (ratio 2; the 50 eval frames of the figures of run
+`vsagroup_motion_r2_20261012_121328`; thresholds picked on 30 validation frames):
+
+| back end | eval FG IoU | objects / frame (GT 1.8) |
+|---|---|---|
+| VSA grouping, raw flow (that run) | 0.280 | 14.5 |
+| VSA grouping, IMU-derotated flow | 0.289 | 14.7 |
+| VSA grouping, Vicon-derotated (oracle) | 0.295 | 15.0 |
+| static test `none` = \|IMU-derotated flow\| | **0.358** | |
+| static test `quadratic` (static_px 1.5) | 0.336 | |
+| static test `epipolar` (static_px 1.0) | 0.312 | |
+
+The VSA clustering, not the motion signal, lost the accuracy: even oracle rotation barely
+helps it, and it still marks ~60% of the static events as moving. The background models
+win only when the camera turns fast (15-45 deg/s: epipolar 0.221 vs 0.173); most eval
+frames have a slow camera (30-77% of event pixels read exactly 0 flow), so the default
+model is `none`. They DID win on the validation takes (epipolar +0.013), which turn at
+20-45 deg/s -- hence `--min-gain` (0.02): the tuner keeps `none` unless a model clearly
+wins (a rule chosen after seeing these eval numbers; say so if it is reported). The IMU
+helps the ranking more than the FG IoU on this eval set (AUC 0.709 -> 0.766, FG IoU
++0.01): it matters when the camera turns, and the eval recordings mostly do not.
+
 ## Notes
 
 - EVIMO2 masks cover every tracked surface, including the static table — see

@@ -28,9 +28,11 @@ from hdems.vsa.velocity import EVENT_COMBINES
 from hdems.vsa_grouping import BackgroundPrior, VSAGroupingParams, vsa_group_objects
 from hdems.vsa_grouping import params_from_config as vsa_grouping_params
 from hdems.seg_features import event_pixel_mask, score_pixel_mask
+from hdems.static_test import StaticTestParams, derotate, moving_score
+from hdems.static_test import params_from_config as static_test_params
 
 HEADS = ("cnn", "mfcnn", "mfunet", "ridge", "prototype", "motion")
-BACK_ENDS = ("head", "vsa_group", "threshold")
+BACK_ENDS = ("head", "vsa_group", "threshold", "moving")
 
 
 def load_config(path: str | Path) -> dict:
@@ -172,6 +174,9 @@ def evaluate_segmentation(
     back_end: str = "head",
     vsa_params: VSAGroupingParams | None = None,
     threshold: float | None = None,
+    static_params: StaticTestParams | None = None,
+    derotate_vsa: bool = False,
+    ratio: int = 1,
 ) -> dict[str, float]:
     """``grouping``: split the CNN's moving pixels into OBJECTS by motion model
     (hdems.grouping) -- one colour per object -- instead of connected components.
@@ -186,6 +191,13 @@ def evaluate_segmentation(
                  fit, no RANSAC); needs ``vsa_params``
       threshold  no-CNN baseline: |ego residual| > ``threshold`` (working px), then
                  ``grouping`` for the objects
+      moving     training-free static-scene test (hdems.static_test): IMU rotation
+                 removed, the rest tested against the background model in
+                 ``static_params``; the failing events are grouped into objects
+                 (``grouping``) on the derotated flow
+
+    ``derotate_vsa``: vsa_group clusters the flow with the IMU rotation removed
+    (batch["rot_flow"]; below static_params.min_rot it is left in).
     """
     if back_end not in BACK_ENDS:
         raise ValueError(f"back_end must be one of {BACK_ENDS}, got {back_end!r}")
@@ -203,9 +215,11 @@ def evaluate_segmentation(
     ablation = ablation and not events_only_baseline and back_end == "head"
     abl = {w: {"fg": [], "changed": 0, "px": 0} for w in ABLATIONS}
     prior = BackgroundPrior() if back_end == "vsa_group" else None
+    imu = {"frames": 0, "with_rate": 0, "derotated": 0, "epipolar": 0}
     pred_title, obj_title = {
         "vsa_group": ("VSA grouping: moving (red)", "OBJECTS: VSA grouping"),
         "threshold": ("|residual| threshold: moving (red)", "OBJECTS: threshold + RANSAC grouping"),
+        "moving": ("IMU + static-scene test: moving (red)", "OBJECTS: static test + RANSAC grouping"),
     }.get(back_end, (None, None))
     # index of the surface that ends at the label time (time_frames entry 1.0)
     base = loader.dataset.dataset if isinstance(loader.dataset, Subset) else loader.dataset
@@ -228,6 +242,12 @@ def evaluate_segmentation(
         valid = events_t & (mask >= 0) & (mask != IGNORE_LABEL)
         flow = None
         vsa_objects = None
+        group_flow = None                  # flow the objects are grouped on (moving)
+        rot = batch.get("rot_flow")
+        rot0 = rot[0].cpu().numpy() if rot is not None else None
+        if rot is not None:
+            imu["frames"] += 1
+            imu["with_rate"] += int(bool(batch["rot_ok"][0])) if "rot_ok" in batch else 1
         t0 = time.perf_counter()
         if events_only_baseline:
             # Control: call EVERY event pixel "moving". It never looks at the model,
@@ -238,10 +258,28 @@ def evaluate_segmentation(
             t0 = time.perf_counter()                         # time the back end only
             seq = batch["seq_id"][0] if "seq_id" in batch else None
             fi = int(batch["frame_index"][0]) if "frame_index" in batch else None
+            fl = flow[0]
+            if derotate_vsa and rot0 is not None and static_params is not None:
+                d, used = derotate(fl.cpu().numpy(), rot0, static_params.min_rot)
+                imu["derotated"] += int(used)
+                fl = torch.from_numpy(d.astype(np.float32))
             vsa_objects, _ = vsa_group_objects(
-                flow[0], event_pixel_mask(surface[:, :1])[0], model, vsa_params,
+                fl, event_pixel_mask(surface[:, :1])[0], model, vsa_params,
                 conf=conf[0, 0], prior=prior, seq_id=seq, frame_index=fi)
             pred = torch.from_numpy(vsa_objects > 0).long().unsqueeze(0).to(device)
+        elif back_end == "moving":
+            flow, _ = model.compute_motion(surface)
+            t0 = time.perf_counter()
+            ev0 = event_pixel_mask(surface[:, :1])[0]
+            intr = batch.get("intrinsics")
+            score, d, info = moving_score(
+                flow[0], ev0, static_params, rot_flow=rot0,
+                intrinsics=intr[0].cpu().numpy() if intr is not None else None, ratio=ratio)
+            imu["derotated"] += int(info["derotated"])
+            imu["epipolar"] += int(info.get("mode") == "epipolar")
+            group_flow = d.astype(np.float32)
+            pred = (torch.from_numpy(score > static_params.threshold).to(device)
+                    & ev0.to(device)).long().unsqueeze(0)
         elif back_end == "threshold":
             flow = model.compute_flow(surface)
             t0 = time.perf_counter()
@@ -275,8 +313,11 @@ def evaluate_segmentation(
             if grouping is not None and flow is not None:
                 # objects = the moving pixels grouped by motion model (the same
                 # ego-compensated velocity the head saw); vsa_group has its own objects
-                res, _ = model.residual_from_flow(flow, surface)
-                res = res[0].cpu().numpy()
+                if group_flow is not None:
+                    res = group_flow
+                else:
+                    res, _ = model.residual_from_flow(flow, surface)
+                    res = res[0].cpu().numpy()
                 objects = (vsa_objects if vsa_objects is not None
                            else group_objects(res, pred_fg & ev, grouping))
                 if gt_inst is not None and ((gt_inst > 0) & ev).any():
@@ -371,6 +412,8 @@ def evaluate_segmentation(
             out["hull_iou"] = float(np.nanmean(hull_scores))
     if backend_ms:
         out["backend_ms"] = float(np.mean(backend_ms))
+    if imu["frames"]:
+        out.update({f"imu_{k}": v for k, v in imu.items()})
     if ablation:
         for what, a in abl.items():
             fin = [v for v in a["fg"] if v == v]
@@ -477,21 +520,34 @@ def main() -> None:
     mode.add_argument("--threshold-baseline", action="store_true",
                       help="No-CNN BASELINE: |ego residual| > vsa_grouping.baseline_threshold_px "
                            "= moving, then RANSAC grouping. No checkpoint.")
+    mode.add_argument("--moving-test", action="store_true",
+                      help="TRAINING-FREE: camera rotation removed with the IMU, the rest tested "
+                           "against the static scene (moving_test.model: epipolar | quadratic | "
+                           "affine | none), failing events grouped into objects "
+                           "(hdems/static_test.py). No checkpoint.")
+    parser.add_argument("--rot-source", choices=["imu", "vicon", "none"], default=None,
+                        help="Camera rotation removed from the flow (overrides motion.rot_source). "
+                             "vicon = motion capture: an ORACLE, never a test result.")
     parser.add_argument("--vsa-params", type=str, default=None,
                         help="YAML with tuned vsa_grouping values (scripts/tune_vsa_grouping.py). "
                              "Default: configs/vsa_grouping_tuned.yaml if it exists.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    back_end = "vsa_group" if args.vsa_group else "threshold" if args.threshold_baseline else "head"
+    back_end = ("vsa_group" if args.vsa_group else "threshold" if args.threshold_baseline
+                else "moving" if args.moving_test else "head")
+    if args.rot_source:
+        cfg["motion"] = {**(cfg.get("motion") or {}), "rot_source": args.rot_source}
     if back_end != "head":
         # tuned values (validation split only) override the YAML defaults
         tuned = Path(args.vsa_params) if args.vsa_params else Path(args.config).with_name(
             "vsa_grouping_tuned.yaml")
         if tuned.exists():
-            cfg["vsa_grouping"] = {**(cfg.get("vsa_grouping") or {}),
-                                   **(load_config(tuned).get("vsa_grouping") or {})}
-            print(f"[eval] tuned vsa_grouping values from {tuned}")
+            doc = load_config(tuned) or {}
+            for section in ("vsa_grouping", "moving_test"):
+                if doc.get(section):
+                    cfg[section] = {**(cfg.get(section) or {}), **doc[section]}
+            print(f"[eval] tuned vsa_grouping / moving_test values from {tuned}")
         elif args.vsa_params:
             raise SystemExit(f"--vsa-params {tuned} not found")
         smooth = (cfg.get("vsa_grouping") or {}).get("flow_smooth_px")
@@ -500,7 +556,8 @@ def main() -> None:
             # The flow cache keys on it, so a separate cache directory is used.
             cfg["matching"] = {**cfg.get("matching", {}), "smooth": int(smooth)}
             print(f"[eval] vsa_grouping.flow_smooth_px: matching.smooth -> {smooth} (full res)")
-        mode_flag = "--vsa-group" if back_end == "vsa_group" else "--threshold-baseline"
+        mode_flag = {"vsa_group": "--vsa-group", "threshold": "--threshold-baseline",
+                     "moving": "--moving-test"}[back_end]
         for flag, bad in (("--checkpoint", args.checkpoint), ("--ablation-check", args.ablation_check)):
             if bad:
                 print(f"[eval] {flag} is ignored with {mode_flag}")
@@ -658,6 +715,17 @@ def main() -> None:
         # the no-CNN back ends only use the front end (flow): the head is never called
         model = build_model(head if back_end == "head" else "cnn")
         vsa_params = vsa_grouping_params(cfg) if back_end == "vsa_group" else None
+        st_params = static_test_params(cfg)
+        rot_src = str((cfg.get("motion") or {}).get("rot_source", "none"))
+        derotate_vsa = back_end == "vsa_group" and bool(
+            (cfg.get("vsa_grouping") or {}).get("derotate", False)) and rot_src != "none"
+        if back_end in ("moving", "vsa_group"):
+            print(f"[eval] camera rotation: motion.rot_source={rot_src}"
+                  + ("  (ORACLE: motion capture, not a test result)" if rot_src == "vicon" else "")
+                  + (f"; VSA grouping on {'derotated' if derotate_vsa else 'RAW'} flow"
+                     if back_end == "vsa_group" else ""))
+        if back_end == "moving":
+            print(f"[eval] static-scene test (working units): {st_params}")
         thr = None
         if back_end == "threshold":
             thr_full = float((cfg.get("vsa_grouping") or {}).get("baseline_threshold_px", 0.5))
@@ -697,6 +765,8 @@ def main() -> None:
                            if (save_dir is not None or args.color_events) else None),
             ablation=args.ablation_check,
             back_end=back_end, vsa_params=vsa_params, threshold=thr,
+            static_params=st_params, derotate_vsa=derotate_vsa,
+            ratio=resolution_ratio_of(cfg),
         )
         if model.flow_cache is not None:
             print(model.flow_cache.summary())
@@ -711,6 +781,9 @@ def main() -> None:
             title = "VSA GROUPING (training-free: no CNN, no ego fit, no RANSAC)"
         elif back_end == "threshold":
             title = "THRESHOLD BASELINE (no CNN: |ego residual| > threshold, RANSAC grouping)"
+        elif back_end == "moving":
+            title = (f"STATIC-SCENE TEST (training-free: IMU rotation + {st_params.model} "
+                     "background model, RANSAC grouping)")
         else:
             title = f"Head: {head}"
         print(f"{title}  label_mode: {label_mode}")
@@ -768,6 +841,11 @@ def main() -> None:
             else:
                 verdict = f"PARTLY uses motion -- removing it costs {drop:.0%} of the FG IoU"
             print(f"Verdict: {verdict}")
+        if "imu_frames" in metrics:
+            print(f"IMU: {metrics['imu_with_rate']} of {metrics['imu_frames']} frames have a gyro "
+                  f"rate; rotation removed in {metrics['imu_derotated']}"
+                  + (f"; translation estimated (epipolar) in {metrics['imu_epipolar']}"
+                     if back_end == "moving" else ""))
         if "backend_ms" in metrics:
             print(f"Decision time: {metrics['backend_ms']:.1f} ms/frame after the flow "
                   f"({device}; flow from the cache when available)")

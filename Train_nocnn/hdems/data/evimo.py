@@ -34,9 +34,21 @@ def flip_sample(sample: dict[str, Any], dims: tuple[int, ...]) -> dict[str, Any]
     if not dims:
         return sample
     hw = tuple(sample["mask"].shape[-2:])
-    return {k: (torch.flip(v, dims) if isinstance(v, torch.Tensor) and v.dim() >= 2
-                and tuple(v.shape[-2:]) == hw else v)
-            for k, v in sample.items()}
+    out = {k: (torch.flip(v, dims) if isinstance(v, torch.Tensor) and v.dim() >= 2
+               and tuple(v.shape[-2:]) == hw else v)
+           for k, v in sample.items()}
+    if "rot_flow" in out:
+        # a displacement FIELD: mirroring the image also mirrors the vectors
+        # (a horizontal flip negates u, a vertical flip negates v), exactly as the
+        # flow re-measured on the flipped surfaces does
+        sign = torch.tensor([-1.0 if -1 in dims else 1.0, -1.0 if -2 in dims else 1.0])
+        out["rot_flow"] = out["rot_flow"] * sign.view(2, 1, 1)
+    if "intrinsics" in out:
+        # mirrored principal point (fx, fy unchanged), in sensor pixels
+        fx, fy, cx, cy, w, h = out["intrinsics"].tolist()
+        out["intrinsics"] = torch.tensor([fx, fy, w - 1 - cx if -1 in dims else cx,
+                                          h - 1 - cy if -2 in dims else cy, w, h])
+    return out
 
 
 class EVIMODataset(Dataset):
@@ -77,6 +89,8 @@ class EVIMODataset(Dataset):
         score_window_ms: float | None = None,
         use_shards: bool = False,
         augment: bool = False,
+        rotation: Any = None,
+        res_ratio: int = 1,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -94,6 +108,14 @@ class EVIMODataset(Dataset):
         # random flip / 180-degree rotation per sample (training only): 3 training
         # scenes are little data, and mirrored motion is still valid motion
         self.augment = bool(augment)
+        # Camera rotation (hdems.imu.RotationSource): each sample gets ``rot_flow``, the
+        # image motion the rotation causes over ONE flow interval, in working pixels --
+        # the same units and direction as the front end's flow (targets lie earlier) --
+        # and ``rot_ok`` (False: no gyro data for this sequence, rot_flow is zero).
+        self.rotation = rotation if rotation is not None and rotation.source != "none" else None
+        self.res_ratio = int(res_ratio)
+        tf = sorted((float(f) for f in (self.time_frames or [])), reverse=True)
+        self.interval_s = (tf[0] - tf[1]) * self.window_s if len(tf) > 1 else None
 
         # Pre-built .pt shards bypass EVERY index filter (scene-disjoint split, held-out
         # validation scenes, require_mover, rigid groups) and freeze the time frames,
@@ -169,7 +191,28 @@ class EVIMODataset(Dataset):
         # background prior) follow time, although the index interleaves sequences
         sample["seq_id"] = seq_dir.name
         sample["frame_index"] = int(frame_idx)
+        # camera intrinsics in SENSOR pixels + sensor size (geometry of the static test)
+        mm = meta["meta"]
+        sample["intrinsics"] = torch.tensor(
+            [float(mm["fx"]), float(mm["fy"]), float(mm["cx"]), float(mm["cy"]),
+             float(mm.get("res_x", self.width * self.res_ratio)),
+             float(mm.get("res_y", self.height * self.res_ratio))])
+        if self.rotation is not None and self.interval_s:
+            sample["rot_flow"], ok = self._rot_flow(seq_dir, meta, float(frame["ts"]))
+            sample["rot_ok"] = torch.tensor(ok)
         return sample
+
+    def _rot_flow(self, seq_dir: Path, meta: dict[str, Any], ts: float) -> tuple[torch.Tensor, bool]:
+        """(2, H, W) rotational flow over one interval, and whether a rate existed
+        (scene9/10/12 were recorded without IMU: zeros, False)."""
+        from hdems.imu import rotation_flow
+        w = self.rotation.omega(seq_dir.name, meta, ts)
+        if w is None:
+            return torch.zeros(2, self.height, self.width), False
+        mm = meta["meta"]
+        return torch.from_numpy(rotation_flow(
+            w, float(mm["fx"]), float(mm["fy"]), float(mm["cx"]), float(mm["cy"]),
+            self.interval_s, self.height, self.width, self.res_ratio)), True
 
     def _apply_labels(
         self,
