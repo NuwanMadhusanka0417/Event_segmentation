@@ -391,7 +391,9 @@ def run_published_benchmark(args, cfg: dict, model: HDEMS, dataset, eval_split: 
         bm.save_json(Path(args.benchmark_out), bench, scores, stats,
                      {**s, "head": model.seg_head.__class__.__name__,
                       "checkpoint": args.checkpoint or args.ridge_checkpoint or args.prototype_checkpoint,
-                      "max_per_sequence": args.max_samples})
+                      "max_per_sequence": args.max_samples,
+                      "decision_threshold": getattr(model, "decision_threshold", None),
+                      "temporal_beta": stats.get("temporal_beta", 0.0)})
         print(f"Per-frame scores -> {Path(args.benchmark_out).resolve()}")
     if model.flow_cache is not None:
         print(model.flow_cache.summary())
@@ -475,6 +477,10 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=None,
                         help="Decision threshold on P(moving) (default: the one tuned on "
                              "validation and stored in the checkpoint, else argmax).")
+    parser.add_argument("--temporal-beta", type=float, default=None,
+                        help="Benchmark: weight of the previous frame's prediction carried along "
+                             "the flow (hdems/temporal_filter.py), 0 = off. Default: the value "
+                             "tuned on validation and stored in the checkpoint.")
     parser.add_argument("--rot-source", choices=list(ROT_SOURCES), default=None,
                         help="Override motion.rot_source of the checkpoint, e.g. 'vicon' = "
                              "ground-truth rotation (an ORACLE upper bound, not a result).")
@@ -580,6 +586,13 @@ def main() -> None:
                 if model.decision_threshold is not None:
                     print(f"[eval] decision threshold P(moving) > {model.decision_threshold:.2f}"
                           f" ({'--threshold' if args.threshold is not None else 'from the checkpoint'})")
+                # temporal filter weight tuned on validation (benchmark only); 0 = off
+                stored_b = ckpt.get("temporal_beta") if isinstance(ckpt, dict) else None
+                model.temporal_beta = float(args.temporal_beta if args.temporal_beta is not None
+                                            else (stored_b or 0.0))
+                if model.temporal_beta:
+                    print(f"[eval] temporal filter beta {model.temporal_beta:g} "
+                          f"({'--temporal-beta' if args.temporal_beta is not None else 'from the checkpoint'})")
             elif task == "segmentation":
                 raise SystemExit(f"a checkpoint is required for head={head_name!r} "
                                  "(an untrained head would give meaningless results)")

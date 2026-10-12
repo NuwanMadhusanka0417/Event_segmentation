@@ -464,6 +464,26 @@ checkpoint, used by eval and the benchmark; `--threshold` overrides).
 PBS: `ROT_SOURCE`, `EGO_MODEL`, `FINE_FLOW`, `VSA_CONS`, `EXTRA_INPUTS`, and
 `ORACLE=yes` for an extra benchmark run with the Vicon rotation (upper bound).
 
+## Temporal consistency (`hdems/temporal_filter.py`)
+
+Each frame used to be segmented on its own. The benchmark paper's key ingredient is
+temporal consistency, so P(moving) is now carried from frame to frame, causally (past
+frames only). The flow at frame t points to where each pixel was EARLIER, so the
+previous frame's map is pulled into the current one by backward warping:
+
+    P~_t(x) = P_t(x) + beta * valid(x) * (P~_{t-1}(x + flow_t(x) dt / 12.5 ms) - P_t(x))
+
+`valid` drops positions outside the image and applies an occlusion check: where an
+object WAS, the revealed background moves differently from the object did, so the
+old "moving" probability is not copied there (no ghost trail). State resets on gaps
+> 50 ms and per sequence.
+
+beta is tuned together with the decision threshold on the held-out scene at the end
+of training (`train.temporal_betas`, 0 always tried) and stored in the checkpoint; the
+benchmark runs every frame of each sequence in time order and uses it. `--temporal-beta`
+overrides; PBS `TEMPORAL_ABLATION=yes` also writes `benchmark_hua2025_no_temporal.txt`.
+No retraining needed: it works on any trained head.
+
 ## Comparing with a published method (`--benchmark`)
 
 ```bash

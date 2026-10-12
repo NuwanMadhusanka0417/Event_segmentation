@@ -116,6 +116,10 @@ train:
   #                        all frames -- one false pixel on a static frame scores 0)
   tune_threshold: true    # tune the P(moving) threshold on validation; stored in the checkpoint
   #                        and used by eval / the benchmark (argmax = 0.5 otherwise)
+  temporal_betas: [0.0, 0.3, 0.5, 0.7, 0.85]   # temporal consistency (hdems/temporal_filter.py):
+  #                        weight of the previous frame's prediction, carried along the flow
+  #                        (causal). Tuned with the threshold on validation; 0 is always tried,
+  #                        so the filter is kept only if it helps. Benchmark uses the chosen one
   augment_flip: true      # each training sample randomly as-is / mirrored left-right /
   #                        upside-down / rotated 180 deg. The event surfaces are flipped
   #                        BEFORE the front end, so the flow is re-measured and the

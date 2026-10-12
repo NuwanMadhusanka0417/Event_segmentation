@@ -411,21 +411,34 @@ def main() -> None:
 
         # Decision threshold on P(moving), tuned on the SAME validation frames with the
         # benchmark metric (argmax = 0.5 is rarely the best for IoU on an imbalanced task).
-        threshold, curve = None, None
+        # Together with the weight of the temporal filter (hdems/temporal_filter.py): the
+        # previous frame's prediction carried along the flow. beta = 0 is always tried,
+        # so the filter is only kept when it helps on validation.
+        threshold, curve, beta_best = None, None, 0.0
         if (val_metric == "event_iou" and best_state is not None and num_classes == 2
                 and bool(train_cfg.get("tune_threshold", True))):
             net.load_state_dict(best_state)
             grid = [round(0.2 + 0.05 * i, 2) for i in range(13)]          # 0.20 .. 0.80
-            curve, n_val = validate_event_iou(net, val_full, device, thresholds=grid,
-                                              max_frames=max_val)
-            threshold = max(curve, key=lambda t: curve[t] if curve[t] == curve[t] else -1.0)
-            print(f"[train] decision threshold on validation ({n_val} frames): P(moving) > "
-                  f"{threshold:.2f}  event IoU {curve[threshold]:.4f} (0.50: {curve[0.5]:.4f})")
+            betas = sorted({0.0, *(float(b) for b in train_cfg.get("temporal_betas", [0.0]))})
+            curve, best = {}, (-1.0, 0.0, 0.5)
+            for beta in betas:
+                got, n_val = validate_event_iou(net, val_full, device, thresholds=grid,
+                                                max_frames=max_val, temporal_beta=beta)
+                curve[f"beta={beta:g}"] = got
+                t = max(got, key=lambda k: got[k] if got[k] == got[k] else -1.0)
+                print(f"[train] validation, temporal beta {beta:g}: best P(moving) > {t:.2f} "
+                      f"event IoU {got[t]:.4f}  (0.50: {got[0.5]:.4f})  [{n_val} frames]")
+                if got[t] > best[0]:
+                    best = (got[t], beta, t)
+            _, beta_best, threshold = best
+            print(f"[train] chosen: temporal beta {beta_best:g}, P(moving) > {threshold:.2f} "
+                  f"(event IoU {best[0]:.4f} on validation)")
 
         torch.save({"model": best_state, "task": "segmentation", "head": head_type,
                     "epoch": best_epoch, "val_miou": best_score if len(val_ds) else None,
                     "val_metric": val_metric if len(val_ds) else None,
                     "decision_threshold": threshold, "threshold_curve": curve,
+                    "temporal_beta": beta_best,
                     "val_split": val_split,
                     "augment_flip": bool(cfg.get("train", {}).get("augment_flip", False)),
                     "num_samples": len(train_ds), "num_classes": num_classes,

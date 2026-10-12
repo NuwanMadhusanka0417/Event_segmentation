@@ -41,7 +41,8 @@ import torch.nn.functional as F
 from hdems.data.evimo2_reader import gt_key, load_meta
 from hdems.data.motion_labels import MotionParams, sequence_motion
 from hdems.grouping import GroupingParams, group_objects
-from hdems.seg_features import predict_labels, rot_flow_of, score_pixel_mask
+from hdems.seg_features import rot_flow_of, score_pixel_mask
+from hdems.temporal_filter import TemporalFilter
 
 GT_MODES = ("moving", "moving_slow", "tracked")
 PRED_SOURCES = ("fg", "objects")   # fg = the head's moving pixels | objects = after grouping
@@ -203,15 +204,25 @@ class GTFrames:
         self.masks: dict[Path, Any] = {}
         self.streams: dict[Path, EventStream] = {}
 
+    def _open(self, seq_dir: Path) -> None:
+        if seq_dir not in self.metas:
+            self.metas[seq_dir] = load_meta(seq_dir)
+            self.masks[seq_dir] = np.load(seq_dir / "dataset_mask.npz")
+            self.streams[seq_dir] = EventStream(seq_dir)
+
+    def time_of(self, k: int) -> tuple[str, int, float]:
+        """(sequence name, frame index, label time ts) of dataset frame k."""
+        seq_dir, fi = self.dataset.index[k]
+        seq_dir = Path(seq_dir)
+        self._open(seq_dir)
+        return seq_dir.name, int(fi), float(self.metas[seq_dir]["frames"][fi]["ts"])
+
     def __call__(self, k: int):
         """-> (gt (H, W) bool, {window: (x, y)}, frame index, ts), or the reason it is
         skipped: "no_gt_pixels" / "no_gt_events"."""
         seq_dir, fi = self.dataset.index[k]
         seq_dir = Path(seq_dir)
-        if seq_dir not in self.metas:
-            self.metas[seq_dir] = load_meta(seq_dir)
-            self.masks[seq_dir] = np.load(seq_dir / "dataset_mask.npz")
-            self.streams[seq_dir] = EventStream(seq_dir)
+        self._open(seq_dir)
         meta = self.metas[seq_dir]
         obj = self.masks[seq_dir][gt_key("mask", fi)] // 1000
         sm = sequence_motion(seq_dir, self.params, meta)
@@ -233,11 +244,29 @@ class GTFrames:
         self.metas.clear()
 
 
+def forward_sample(model: Any, sample: dict, device: torch.device):
+    """Model output for one dataset sample -> (out dict, surface, rot_flow)."""
+    surface = sample["surface"].unsqueeze(0).to(device)
+    rot = rot_flow_of(sample, device)
+    return model(surface, task="segmentation", rot_flow=rot), surface, rot
+
+
+def moving_prob(out: dict) -> torch.Tensor:
+    """(H, W) P(moving) at working resolution from a model output."""
+    logits = out["seg_logits"]
+    if logits.shape[1] == 2:
+        return logits.softmax(dim=1)[0, 1]
+    return (logits.argmax(dim=1)[0] > 0).float()
+
+
 def moving_probability(model: Any, sample: dict, device: torch.device) -> torch.Tensor:
     """(H, W) P(moving) at working resolution for one dataset sample."""
-    surface = sample["surface"].unsqueeze(0).to(device)
-    out = model(surface, task="segmentation", rot_flow=rot_flow_of(sample, device))
-    return out["seg_logits"].softmax(dim=1)[0, 1]
+    return moving_prob(forward_sample(model, sample, device)[0])
+
+
+def _in_time_order(gtf: GTFrames, ks: Iterable[int]) -> list[int]:
+    """Dataset frames sorted by (sequence, frame index): the index interleaves sequences."""
+    return sorted(ks, key=lambda k: gtf.time_of(k)[:2])
 
 
 @torch.no_grad()
@@ -250,6 +279,7 @@ def validate_event_iou(
     window_ms: float = 12.5,
     gt_mode: str = "moving",
     max_frames: int | None = None,
+    temporal_beta: float = 0.0,
 ) -> tuple[dict[float, float], int]:
     """The benchmark's metric on any EVIMO split, for MODEL SELECTION (validation).
 
@@ -258,6 +288,10 @@ def validate_event_iou(
     per-frame pixel IoU over all frames (where a static frame with one false pixel
     scores 0 and dominates the mean). One forward per frame serves every threshold.
     ``dataset`` may be a Subset of an EVIMODataset. -> ({threshold: mean IoU}, frames).
+
+    ``temporal_beta`` > 0: the prediction is filtered over time (TemporalFilter), so
+    EVERY frame of each sequence is run, in time order; only frames with a mover are
+    scored.
     """
     base = dataset.dataset if hasattr(dataset, "indices") else dataset
     pool = list(dataset.indices) if hasattr(dataset, "indices") else list(range(len(base)))
@@ -265,12 +299,27 @@ def validate_event_iou(
     gtf = GTFrames(base, [window_ms], gt_mode)
     model.eval()
     ious: dict[float, list[float]] = {t: [] for t in thresholds}
+    tf = (TemporalFilter(temporal_beta, getattr(base, "interval_s", None) or 0.0125)
+          if temporal_beta else None)
     try:
+        pool = _in_time_order(gtf, pool)
         keep = [k for k in pool if not isinstance(gtf(k), str)]
-        for k in _spread_cap(keep, max_frames):
+        scored = set(_spread_cap(keep, max_frames))
+        run = pool if tf is not None else [k for k in pool if k in scored]
+        if tf is not None and scored:                    # nothing after the last scored frame
+            last = max(i for i, k in enumerate(run) if k in scored)
+            run = run[: last + 1]
+        for k in run:
+            out, _surface, _rot = forward_sample(model, base[k], device)
+            prob = moving_prob(out)
+            if tf is not None:
+                seq, _fi, ts = gtf.time_of(k)
+                flow = out.get("flow")
+                prob = tf(seq, prob, None if flow is None else flow[0], ts)
+            if k not in scored:
+                continue
             gt, evs, _fi, _ts = gtf(k)
             H, W = gt.shape
-            prob = moving_probability(model, base[k], device)
             prob_full = F.interpolate(prob[None, None].float(), size=(H, W), mode="nearest")[0, 0]
             x, y = evs[float(window_ms)]
             p_ev = prob_full.cpu().numpy()[y, x]
@@ -299,6 +348,7 @@ def run_benchmark(
     min_gt_events: int = 1,
     max_per_sequence: int | None = None,
     log_every: int = 100,
+    temporal_beta: float | None = None,
 ) -> tuple[list[ProtocolScores], dict[str, Any]]:
     """Score ``model`` on the benchmark's sequences of ``dataset`` (an EVIMODataset).
 
@@ -306,12 +356,20 @@ def run_benchmark(
     it (the paper's "frames containing moving objects"). Frames without any are found
     from the masks and events first and never reach the model. ``max_per_sequence``
     (smoke tests) keeps that many of the remaining frames, evenly spaced.
+
+    ``temporal_beta`` (None = the model's ``temporal_beta``, tuned on validation; 0 =
+    off): P(moving) is filtered over time (hdems.temporal_filter), so every frame of
+    each sequence runs in time order -- causal, past frames only -- and the frames
+    with a mover are scored as before.
     """
     windows = [float(w) for w in windows_ms]
     if pred_source == "objects" and grouping is None:
         raise ValueError("pred='objects' needs grouping parameters")
     model.eval()
     thr = getattr(model, "decision_threshold", None)
+    thr = 0.5 if thr is None else float(thr)
+    beta = float(getattr(model, "temporal_beta", 0.0) or 0.0) if temporal_beta is None else float(temporal_beta)
+    tf = TemporalFilter(beta, getattr(dataset, "interval_s", None) or 0.0125) if beta else None
     frame_gt = GTFrames(dataset, windows, gt_mode, min_gt_events)
 
     all_frames: dict[str, list[int]] = {}
@@ -320,33 +378,46 @@ def run_benchmark(
         if lab is not None:
             all_frames.setdefault(lab, []).append(k)
     stats = {"candidates": sum(map(len, all_frames.values())), "no_gt_pixels": 0,
-             "no_gt_events": 0, "run": 0,
+             "no_gt_events": 0, "run": 0, "forward": 0, "temporal_beta": beta,
              "missing": [lab for lab in bench.reported if lab not in all_frames]}
 
     scores = [ProtocolScores(w) for w in windows]
     try:
         # 1. frames that contain a moving object (masks + events only -- cheap); the
-        #    smoke-test cap is applied to THESE, so a capped run still scores movers
-        order: list[tuple[str, int]] = []
+        #    smoke-test cap is applied to THESE, so a capped run still scores movers.
+        #    With the temporal filter every frame up to the last scored one also runs.
+        order: list[tuple[str, int, bool]] = []
         for lab in bench.reported:
+            seq_frames = _in_time_order(frame_gt, all_frames.get(lab, []))
             keep = []
-            for k in all_frames.get(lab, []):
+            for k in seq_frames:
                 r = frame_gt(k)
                 if isinstance(r, str):
                     stats[r] += 1
                 else:
                     keep.append(k)
-            order += [(lab, k) for k in _spread_cap(keep, max_per_sequence)]
+            scored = set(_spread_cap(keep, max_per_sequence))
+            if tf is None:
+                order += [(lab, k, True) for k in seq_frames if k in scored]
+            elif scored:
+                last = max(i for i, k in enumerate(seq_frames) if k in scored)
+                order += [(lab, k, k in scored) for k in seq_frames[: last + 1]]
 
         # 2. run the model on them
-        for n, (lab, k) in enumerate(order):
+        for n, (lab, k, score_it) in enumerate(order):
+            sample = dataset[k]
+            out, surface, rot = forward_sample(model, sample, device)
+            stats["forward"] += 1
+            prob = moving_prob(out)
+            if tf is not None:
+                seq, _fi, ts_k = frame_gt.time_of(k)
+                flow = out.get("flow")
+                prob = tf(seq, prob, None if flow is None else flow[0], ts_k)
+            if not score_it:
+                continue
             gt, evs, fi, ts = frame_gt(k)
             H, W = gt.shape
-            sample = dataset[k]
-            surface = sample["surface"].unsqueeze(0).to(device)
-            rot = rot_flow_of(sample, device)
-            out = model(surface, task="segmentation", rot_flow=rot)
-            pred_t = predict_labels(out["seg_logits"], thr)[0] > 0
+            pred_t = prob > thr
             if pred_source == "objects":
                 if out.get("flow") is None:
                     raise ValueError("pred='objects' needs a head that returns the flow")
@@ -383,8 +454,8 @@ def format_report(bench: Benchmark, scores: list[ProtocolScores], stats: dict[st
         f"=== BENCHMARK {bench.name}: {bench.citation} ===",
         "metric : IoU over events at full sensor resolution, only frames with a moving object,",
         "         per-frame IoU averaged per sequence, no ignore band",
-        f"setting: gt={gt_mode}  pred={pred_source}  "
-        f"(the paper does not state its event window / GT definition)",
+        f"setting: gt={gt_mode}  pred={pred_source}  temporal beta={stats.get('temporal_beta', 0.0):g}"
+        f"  (the paper does not state its event window / GT definition)",
         f"frames : {stats['candidates']} in these sequences: {stats['no_gt_pixels']} without "
         f"a moving object, {stats['no_gt_events']} without a GT-moving event, "
         f"{stats['run']} scored",
