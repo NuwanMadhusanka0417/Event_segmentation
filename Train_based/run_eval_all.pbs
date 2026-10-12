@@ -24,7 +24,7 @@ DETECT=no              # yes | no  (--detect on hdems.eval)
 CONFIG=configs/evimo_seg.yaml
 CKPT_DIR=checkpoints
 
-CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
+CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_paper1/Train_based
 VENV=/scratch/jq77/nk8155/seg1/bin/activate
 
 # All checkpoints to evaluate (basename under ${CKPT_DIR}/).

@@ -72,7 +72,7 @@ VSA_CONS=yes           # yes | no  VSA ego-consistency maps (descriptor match at
                        #           predicted position, 12.5 / 25 / 50 ms; 3 extra encodes per sample)
 EXTRA_INPUTS=yes       # yes | no  derotated flow vector + rotation speed as head inputs
 
-CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
+CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_paper1/Train_based
 CONFIG=configs/evimo_seg.yaml
 VENV=/scratch/jq77/nk8155/seg1/bin/activate
 

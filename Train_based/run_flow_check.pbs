@@ -29,7 +29,7 @@ RATIOS=(4 2 1)         # resolution ratios to check (cheapest first)
 FRAMES=20              # frames per split per ratio
 CONFIG=configs/evimo_seg.yaml
 
-CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_2/Train_based
+CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_paper1/Train_based
 VENV=/scratch/jq77/nk8155/seg1/bin/activate
 
 module load cuda
