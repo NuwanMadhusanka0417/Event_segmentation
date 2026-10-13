@@ -43,7 +43,7 @@ from hdems.vsa.velocity import (
 
 ABLATIONS = ("motion", "appearance")
 # real_fpe.input: how the position code P joins the velocity code V per pixel
-HV_INPUTS = ("pv_bind", "pv_bundle", "pv_concat", "v")
+HV_INPUTS = ("pv_bind", "pv_bundle", "pv_concat", "v", "none")   # none = no hypervector (ablation)
 MOTION_FIRST_HEADS = ("mfcnn", "mfunet")
 EVIDENCE_CHANNELS = 2          # mfunet: event density + flow confidence
 
@@ -163,6 +163,7 @@ class HDEMS(nn.Module):
         self.fine_smooth = int(frontend_option(cfg, "motion", "fine_smooth"))
         self.extra_inputs = bool(frontend_option(cfg, "motion", "extra_inputs"))
         self.vsa_consistency = bool(frontend_option(cfg, "motion", "vsa_consistency"))
+        self.density_input = bool(frontend_option(cfg, "motion", "density_input"))
         tf_all = [float(f) for f in tf]
         step = (tf_all[0] - tf_all[1]) if len(tf_all) > 1 else 1.0
         # earlier surfaces, in flow intervals before the reference (1, 2, 4)
@@ -408,7 +409,9 @@ class HDEMS(nn.Module):
         """
         s = surfaces[:, self.label_t].abs().sum(1, keepdim=True) * self.res_ratio ** 2
         density = torch.log1p(s)
-        if self.ablate == "appearance":
+        if self.ablate == "appearance" or not self.density_input:
+            # motion.density_input = false: where events ARE is a shortcut (on a still
+            # camera only movers make events), so the head may be denied it
             density = torch.zeros_like(density)
         if self.ablate == "motion":
             conf = torch.zeros_like(conf)
@@ -440,6 +443,7 @@ class HDEMS(nn.Module):
                 pv_bundle  (P + V) / √2     side by side in one vector
                 pv_concat  [P | V]          2*d_hv channels, the head combines them
                 v          V                no absolute position
+                none       zeros            ablation: no hypervector at all
             Everything is built as Fourier spectra (binding = product, bundling = sum,
             both Hermitian) and turned real by one inverse FFT per vector.
         real_fpe off -> the complex velocity code (velocity_hv).
@@ -454,6 +458,8 @@ class HDEMS(nn.Module):
             zero = torch.zeros_like(ux)
             spec_v = (torch.exp(1j * self.hv_vel.phase(ux, zero, dim=1))
                       + torch.exp(1j * self.hv_vel.phase(zero, uy, dim=1))) / math.sqrt(2)
+        if self.hv_input == "none":                    # ablation: no hypervector at all
+            return torch.zeros_like(spec_v.real)
         if self.hv_input == "v":
             return to_real(spec_v, dim=1)
         H, W = residual.shape[-2:]

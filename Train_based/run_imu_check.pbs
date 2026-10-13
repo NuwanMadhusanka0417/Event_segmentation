@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -N imu_check
+#PBS -P mi23
+#PBS -q gpuvolta
+#PBS -l ncpus=12
+#PBS -l mem=96GB
+#PBS -l ngpus=1
+#PBS -l walltime=03:00:00
+#PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+#PBS -l wd
+#PBS -j oe
+# Short job, NO training: tunes the gyro window / shift / gain used to remove camera
+# rotation (motion.imu_avg_ms, imu_shift_ms, imu_gain) on VALIDATION frames -- never the
+# test set -- and checks the flow's own scale against ground-truth flow.
+#
+#   qsub run_imu_check.pbs
+#   then read the table at the end of imu_check.o<JOBID> and set the three values in
+#   configs/evimo_seg.yaml before the next run_segmentation.pbs
+
+set -eo pipefail
+
+RES_RATIO=2
+FRAMES=80                                           # validation frames with a mover
+SPLIT_ARGS="scene13_dyn_test_03,scene14_dyn_test_02"  # same held-out takes as SPLIT=official
+CONFIG=configs/evimo_seg.yaml
+CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_paper1/Train_based
+VENV=/scratch/jq77/nk8155/seg1/bin/activate
+
+module load cuda
+module load python3/3.9.2
+source "${VENV}"
+if [ "$(command -v python)" != "$(dirname "${VENV}")/python" ]; then
+  echo "ERROR: no python in $(dirname "${VENV}") (found: '$(command -v python)') -- repair or recreate the venv"
+  exit 1
+fi
+cd "${CODE_DIR}"
+source scripts/nci_env.sh
+export PYTHONUNBUFFERED=1
+
+# validation = the held-out takes of the official split (a temporary config copy)
+TMP_CFG="$(mktemp --suffix=.yaml)"
+python - "${CONFIG}" "${TMP_CFG}" "${SPLIT_ARGS}" <<'PY'
+import sys, yaml
+src, dst, seqs = sys.argv[1:4]
+cfg = yaml.safe_load(open(src, encoding="utf-8"))
+cfg["dataset"]["scene_disjoint"] = False
+cfg["dataset"]["val_sequences"] = [s for s in seqs.split(",") if s]
+yaml.safe_dump(cfg, open(dst, "w", encoding="utf-8"))
+PY
+
+echo "=== IMU timing check ${PBS_JOBID:-local} started $(date) ==="
+python scripts/check_imu_timing.py --config "${TMP_CFG}" --split holdout \
+  --resolution-ratio "${RES_RATIO}" --max-frames "${FRAMES}" --device cuda --gt
+rm -f "${TMP_CFG}"
+echo "=== finished $(date) ==="

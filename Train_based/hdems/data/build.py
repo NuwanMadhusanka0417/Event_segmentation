@@ -47,24 +47,41 @@ def build_dataset(cfg: dict[str, Any], split: str | None = None):
     train_split = ds_cfg.get("split", "train")
     eval_split = ds_cfg.get("eval_split", "eval")
     val_scenes = {str(s).lower() for s in (ds_cfg.get("val_scenes") or [])}
+    # val_sequences: hold out individual TAKES instead of whole scenes (wins over
+    # val_scenes). With the official split (scene_disjoint: false) the validation set
+    # can then be a take of the TEST scenes -- the epoch and the decision threshold
+    # are chosen on data that looks like the test, not on an unrelated scene.
+    val_seqs = [str(s).lower() for s in (ds_cfg.get("val_sequences") or [])]
     holdout = val_split_of(cfg) == HOLDOUT
-    if (split == HOLDOUT or holdout) and not val_scenes:
-        raise ValueError("dataset.val_split is 'holdout' but dataset.val_scenes is empty")
+    if (split == HOLDOUT or holdout) and not (val_scenes or val_seqs):
+        raise ValueError("dataset.val_split is 'holdout' but dataset.val_scenes and "
+                         "dataset.val_sequences are both empty")
 
     # Scene-disjoint splits: train/ and eval/ hold different takes of the SAME
     # scenes (scene13/14/15), so training on both leaks the eval scenes. Drop the
     # shared scenes from the TRAIN split and leave the eval set intact. The held-out
-    # validation scenes are dropped from training as well.
+    # validation scenes (or takes) are dropped from training as well.
+    # scene_disjoint: false = EVIMO2's own train/eval split (other takes of the test
+    # scenes are trained on, the test takes never are).
     exclude: set[str] = set()
     only: set[str] | None = None
+    ex_seqs: list[str] = []
+    only_seqs: list[str] | None = None
     folder = split
     if split == train_split:
         if ds_cfg.get("scene_disjoint", False):
             exclude = scenes_in_split(ds_cfg["root"], eval_split)
         if holdout:
-            exclude |= val_scenes
-    elif split == HOLDOUT:                     # validation = held-out TRAIN scenes
-        folder, only = train_split, val_scenes
+            if val_seqs:
+                ex_seqs = val_seqs
+            else:
+                exclude |= val_scenes
+    elif split == HOLDOUT:                     # validation = held-out TRAIN scenes / takes
+        folder = train_split
+        if val_seqs:
+            only_seqs = val_seqs
+        else:
+            only = val_scenes
 
     is_train = split == train_split
     return EVIMODataset(
@@ -95,17 +112,29 @@ def build_dataset(cfg: dict[str, Any], split: str | None = None):
         # random flips / 180-degree rotation, TRAINING split only
         augment=is_train and bool((cfg.get("train", {}) or {}).get("augment_flip", False)),
         # camera rotation from the IMU / Vicon -> sample["rot_flow"] (motion.rot_source)
-        rotation=rotation_source(cfg),
+        # the motion-capture fallback for sequences without a gyroscope is for
+        # TRAINING / VALIDATION only: the test split always uses the real sensor
+        rotation=rotation_source(cfg, allow_fallback=split != eval_split),
         res_ratio=resolution_ratio_of(cfg),
+        exclude_sequences=ex_seqs,
+        only_sequences=only_seqs,
     )
 
 
-def rotation_source(cfg: dict[str, Any]):
-    """motion.rot_source -> hdems.imu.RotationSource (None for 'none')."""
+def rotation_source(cfg: dict[str, Any], allow_fallback: bool = False):
+    """motion.rot_source -> hdems.imu.RotationSource (None for 'none').
+
+    ``allow_fallback``: apply motion.rot_fallback for sequences without a gyroscope
+    (only for training / validation datasets; the test split never gets it).
+    """
     from hdems.imu import RotationSource
     src = str(frontend_option(cfg, "motion", "rot_source"))
     if src == "none":
         return None
     return RotationSource(src, topic=str(frontend_option(cfg, "motion", "imu_topic")),
                           calib_path=frontend_option(cfg, "motion", "imu_calib"),
-                          avg_ms=float(frontend_option(cfg, "motion", "imu_avg_ms")))
+                          avg_ms=float(frontend_option(cfg, "motion", "imu_avg_ms")),
+                          shift_ms=float(frontend_option(cfg, "motion", "imu_shift_ms")),
+                          gain=float(frontend_option(cfg, "motion", "imu_gain")),
+                          fallback=(str(frontend_option(cfg, "motion", "rot_fallback"))
+                                    if allow_fallback else "none"))

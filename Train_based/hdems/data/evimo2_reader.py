@@ -369,6 +369,8 @@ def build_sample_index(
     motion_params: MotionParams | None = None,
     min_moving_px: int = 100,
     window_s: float = 0.05,
+    exclude_sequences: Iterable[str] = (),
+    only_sequences: Iterable[str] | None = None,
 ) -> list[tuple[Path, int]]:
     """List of (sequence_dir, frame_index) for frames that HAVE a GT mask.
 
@@ -383,15 +385,26 @@ def build_sample_index(
     ``require_mover``   keep only frames where >=1 object is moving, plus
                         ``negative_ratio`` x that many all-static frames as negatives.
     ``interleave``      round-robin across sequences so a prefix is balanced.
+    ``exclude_sequences`` / ``only_sequences``  the same per SEQUENCE (name prefix, e.g.
+                        "scene13_dyn_test_03"): one take of a scene can be held out for
+                        validation while the scene's other takes are trained on.
     """
     exclude = {s.lower() for s in exclude_scenes}
     only = None if only_scenes is None else {s.lower() for s in only_scenes}
+    ex_seq = [s.lower() for s in exclude_sequences]
+    only_seq = None if only_sequences is None else [s.lower() for s in only_sequences]
     params = motion_params or MotionParams()
     per_seq: list[list[tuple[Path, int]]] = []
     n_pos_all = n_neg_all = 0
 
     for seq_dir in find_sequence_dirs(root, split):
+        name = seq_dir.name.lower()
         if only is not None and scene_of(seq_dir.name) not in only:
+            continue
+        if only_seq is not None and not any(name.startswith(p) for p in only_seq):
+            continue
+        if any(name.startswith(p) for p in ex_seq):
+            print(f"[data] excluding {seq_dir.name}: held out for validation")
             continue
         if scene_of(seq_dir.name) in exclude:
             print(f"[data] excluding {seq_dir.name}: scene {scene_of(seq_dir.name)} "

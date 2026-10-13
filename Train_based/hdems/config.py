@@ -37,7 +37,8 @@ _FRONTEND_KEYS = {
     "velocity": ("vel_norm", "vel_unit_px", "vel_bw", "x_norm", "ego_fit"),
     "real_fpe": ("enabled", "d", "beta_pos", "beta_vel", "vel_range_px", "omega", "input", "seed"),
     "motion": ("rot_source", "imu_topic", "imu_avg_ms", "imu_calib", "ego_model", "ego_prior_px",
-               "fine_flow", "fine_alpha", "fine_smooth", "extra_inputs", "vsa_consistency"),
+               "fine_flow", "fine_alpha", "fine_smooth", "extra_inputs", "vsa_consistency",
+               "imu_shift_ms", "imu_gain", "density_input", "rot_fallback"),
 }
 
 # Front-end options added after checkpoints were already trained (2026-09-29). A
@@ -58,6 +59,11 @@ _LEGACY_FRONTEND = {
     ("motion", "fine_flow"): False,
     ("motion", "extra_inputs"): False,
     ("motion", "vsa_consistency"): False,
+    # added 2026-10-13: checkpoints without them used no shift, gain 1, event density on
+    ("motion", "imu_shift_ms"): 0.0,
+    ("motion", "imu_gain"): 1.0,
+    ("motion", "density_input"): True,
+    ("motion", "rot_fallback"): "none",  # IMU runs before 2026-10-13: nothing removed without a gyro
 }
 
 # Current defaults of those options (used when the YAML leaves one out). Checkpoints
@@ -88,6 +94,10 @@ FRONTEND_DEFAULTS = {
     ("motion", "fine_smooth"): 15,
     ("motion", "extra_inputs"): True,
     ("motion", "vsa_consistency"): True,
+    ("motion", "imu_shift_ms"): 0.0,
+    ("motion", "imu_gain"): 1.0,
+    ("motion", "density_input"): True,
+    ("motion", "rot_fallback"): "vicon",
 }
 
 

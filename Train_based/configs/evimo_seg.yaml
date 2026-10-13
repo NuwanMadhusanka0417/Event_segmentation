@@ -63,13 +63,20 @@ dataset:
   #                        taken out of training | eval = the test set (old: optimistic)
   val_scenes: [scene9]   # 2 train sequences, 433 frames, 112 with a visible mover (~5% of
   #                        the training movers). scene12 = still camera, scene6 = 67 frames
+  val_sequences: []      # hold out single TAKES instead (wins over val_scenes), e.g. with the
+  #                        official split (scene_disjoint: false):
+  #                        [scene13_dyn_test_03, scene14_dyn_test_02] = 141 + 115 frames with a
+  #                        mover, one take of each benchmark scene. scene9 then trains. The
+  #                        threshold tuned on scene9 (0.20) cut test precision 64 -> 49: it is
+  #                        not like the test scenes. PBS: SPLIT=official
   use_shards: false      # .pt shards (prepare_evimo.py) bypass the split/mover filters
   label_mode: motion     # motion  = MOVING vs rest, from the pose metadata (Option A, 2 classes)
   #                        tracked = legacy mask>0 ("on a tracked surface" — includes the
   #                                  static table, so NOT motion; baseline/ablation only)
   #                        objects = per-object id (Option B; ids 5..28 -> needs >=29)
   scene_disjoint: true   # drop train sequences whose scene also appears in eval/
-  #                        (train/ and eval/ hold different takes of scene13/14/15)
+  #                        (train/ and eval/ hold different takes of scene13/14/15).
+  #                        false = EVIMO2's own split: 3935 train frames instead of 2204
   require_mover: true    # train only on frames where >=1 object is moving ...
   negative_ratio: 0.1    # ... plus this share of all-static frames as negatives
   interleave: true       # round-robin across sequences so --max-train-samples N
@@ -193,9 +200,18 @@ motion:                  # how motion reaches the head (2026-10-11). Benchmark b
   #                        vicon = motion-capture rotation: GROUND TRUTH, oracle / upper bound only
   #                        none  = events only
   imu_topic: left        # left IMU: per-axis corr 0.978 / 0.998 / 0.994 with the camera rate
+  rot_fallback: vicon    # sequences WITHOUT a gyroscope recording -- scene9, scene10, scene12
+  #                        (all of the strict-split training data!) -- use the motion-capture
+  #                        rotation, TRAINING / VALIDATION only (the test split has the IMU and
+  #                        never gets this). none = remove nothing there, as the IMU runs up to
+  #                        2026-10-13 did: trained without rotation removal, tested with it
   imu_calib: configs/imu_calib.json   # IMU -> camera rotation + time offset, estimated on the
   #                        TRAIN sequences only (python scripts/calibrate_imu.py)
-  imu_avg_ms: 25.0       # gyro averaged over this long before the label time
+  imu_avg_ms: 25.0       # gyro averaged over this long before the label time ...
+  imu_shift_ms: 0.0      # ... shifted by this (ms) ...
+  imu_gain: 1.0          # ... and scaled into the FLOW's units. Measured flow = 1.28 x predicted
+  #                        rotation on static test pixels: tune all three with
+  #                        scripts/check_imu_timing.py on validation frames (run_imu_check.pbs)
   ego_model: quadratic   # background model fitted after derotation: quadratic (6 coefficients
   #                        per axis, one robust weight per pixel) | affine (old, per axis)
   ego_prior_px: 1.0      # with the rotation removed, the fit STARTS at "nothing moves" with this
@@ -205,6 +221,9 @@ motion:                  # how motion reaches the head (2026-10-11). Benchmark b
   fine_alpha: 0.6        #   lower threshold (0.85 snaps sub-pixel motion to 0) ...
   fine_smooth: 15        #   ... and lighter pooling (full-res px; scaled by resolution_ratio)
   extra_inputs: true     # head also gets the derotated flow VECTOR and the rotation speed
+  density_input: true    # event density as a head input. false = deny the head this shortcut
+  #                        (with a still camera only movers make events): removing motion cost
+  #                        only 11% of the FG IoU on the r2_300 IMU model (34% before)
   vsa_consistency: true  # cos(F0(x), F_k(x + background displacement)) for the 3 earlier
   #                        surfaces (12.5 / 25 / 50 ms): the VSA descriptor tests "is this pixel
   #                        where the static scene would be?" at sub-pixel precision, no pooling.

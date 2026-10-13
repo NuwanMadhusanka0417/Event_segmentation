@@ -2,10 +2,10 @@
 #PBS -N hdems_seg_group
 #PBS -P mi23
 #PBS -q gpuvolta
-#PBS -l ncpus=24
-#PBS -l mem=128GB
-#PBS -l ngpus=2
-#PBS -l walltime=24:00:00
+#PBS -l ncpus=12
+#PBS -l mem=96GB
+#PBS -l ngpus=1
+#PBS -l walltime=48:00:00
 #PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
 #PBS -l wd
 #PBS -j oe
@@ -34,7 +34,8 @@ HV_INPUT=pv_bind       # mfcnn / mfunet (real FPE): how the pixel POSITION code 
                        #   pv_bundle = (P + V)/√2   side by side in one 500-d vector
                        #   pv_concat = [P | V]      1000 channels, the U-Net combines them
                        #   v         = V only       no absolute position
-EV_COMBINE=concat      # bind | bundle | bindbundle | concat   (combine event HV X with velocity Mv)
+                       #   none      = no hypervector (ablation: does the VSA code help?)
+EV_COMBINE=concat     # bind | bundle | bindbundle | concat   (combine event HV X with velocity Mv)
                        #   bindbundle = (X^ o Mv) + Mv.   NOT used by HEAD=mfcnn / mfunet
 LABEL_MODE=motion      # motion = moving vs background (Option A)
                        # objects = per-object id        (Option B)
@@ -43,11 +44,16 @@ ABLATION=yes           # yes | no  -> eval also runs without motion / without ap
                        #   prints a verdict: a motion segmenter must collapse without motion
 AUGMENT=yes            # yes | no  -> random flips / 180-degree rotation of training samples
                        #   (first epochs slower: the flow of each flipped version is computed once)
-RES_RATIO=1            # 1 = full 480x640 | 2 = half 240x320 | 4 = quarter 120x160
+RES_RATIO=2            # 1 = full 480x640 | 2 = half 240x320 | 4 = quarter 120x160
                        #   kernel N, search M and Eq.12 pooling scale with it (~ratio^4 cheaper)
-SAMPLES=300            # max train frames   (~1,990 frames with a mover once scene9 is held out)
-VAL_SAMPLES=150        # val frames used to pick the best epoch / alpha -- from the HELD-OUT
-                       #   train scene (dataset.val_scenes: scene9), never the eval set
+SAMPLES=4000           # max train frames (more than exist = ALL: 2204 strict split, ~3700 official)
+VAL_SAMPLES=300        # max validation frames WITH A MOVER (epoch + threshold choice); never eval
+SPLIT=official         # official = EVIMO2's own train/eval split: other takes of the test scenes
+                       #            are trained on, validation = VAL_SEQUENCES (takes of 13 / 14)
+                       # disjoint = no take of a test scene is trained on, validation = scene9 (old)
+VAL_SEQUENCES=scene13_dyn_test_03,scene14_dyn_test_02   # SPLIT=official only: held-out takes
+                       #   (141 + 115 frames with a mover, one take of each benchmark scene)
+DENSITY=yes            # yes | no  event density as a head input (no = deny the head that shortcut)
 TEST_SAMPLES=50        # max eval panels saved
 PANELS=movers          # which eval frames get figures (scores always use ALL frames):
                        #   movers = only frames with a visible moving object (see object colours)
@@ -91,8 +97,14 @@ if [ "$(command -v python)" != "$(dirname "${VENV}")/python" ]; then
 fi
 python -c "import torch" || { echo "ERROR: torch does not import in ${VENV}"; exit 1; }
 cd "${CODE_DIR}"
+# matplotlib / torch caches -> scratch: $HOME is tiny ("Disk quota exceeded" otherwise)
+source scripts/nci_env.sh
 
 # Derived names -------------------------------------------------------------
+# Every job gets its OWN checkpoint and results folder (the job number is part of both):
+# identical jobs started together used to overwrite one checkpoint and share one folder.
+JOB_NUM="${PBS_JOBID%%.*}"
+JOB_NUM="${JOB_NUM:-local$$}"
 EV_TAG="${EV_COMBINE}"
 # motion-first heads do not fuse X and Mv; their name records the position+velocity input
 case "${HEAD}" in mfcnn|mfunet) EV_TAG="${HV_INPUT}" ;; esac
@@ -103,17 +115,24 @@ MOT_TAG="_${ROT_SOURCE}-${EGO_MODEL:0:4}-"
 [ "${FINE_FLOW}" = "yes" ] && MOT_TAG="${MOT_TAG}f"
 [ "${VSA_CONS}" = "yes" ] && MOT_TAG="${MOT_TAG}c"
 [ "${EXTRA_INPUTS}" = "yes" ] && MOT_TAG="${MOT_TAG}x"
-RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_TAG}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}${AUG_TAG}${MOT_TAG}"
-CKPT="checkpoints/${RUN_NAME}.pt"
-RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
+[ "${DENSITY}" = "no" ] && MOT_TAG="${MOT_TAG}_noden"
+SPLIT_TAG=""
+[ "${SPLIT}" = "official" ] && SPLIT_TAG="_official"
+if [ "${SPLIT}" = "official" ]; then
+  SPLIT_ARGS=(--scene-disjoint no --val-sequences "${VAL_SEQUENCES}")
+else
+  SPLIT_ARGS=(--scene-disjoint yes --val-sequences none)
+fi
+RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_TAG}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}${AUG_TAG}${MOT_TAG}${SPLIT_TAG}"
+CKPT="checkpoints/${RUN_NAME}_${JOB_NUM}.pt"
+RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)_${JOB_NUM}"
 mkdir -p "${RESULTS_DIR}"
 
 # Job log in the results folder too: from here on, everything (run configuration,
 # training, eval, control, benchmark, errors) goes to the PBS log AND to
 # ${RESULTS_DIR}/<job name>.o<job number> -- the same name as the PBS copy. PBS only
 # delivers its copy when the job ends; this one fills up while the job runs (tail -f).
-JOB_NUM="${PBS_JOBID%%.*}"
-LOG_FILE="${RESULTS_DIR}/${PBS_JOBNAME:-hdems_seg_group}.o${JOB_NUM:-local}"
+LOG_FILE="${RESULTS_DIR}/${PBS_JOBNAME:-hdems_seg_group}.o${JOB_NUM}"
 export PYTHONUNBUFFERED=1          # python output reaches the log at once and in order
 exec > >(tee -a "${LOG_FILE}") 2>&1
 LOG_TEE_PID=$!
@@ -158,6 +177,8 @@ printf '  %-16s %s\n' \
   FINE_FLOW    "${FINE_FLOW}" \
   VSA_CONS     "${VSA_CONS}  (VSA ego-consistency maps)" \
   EXTRA_INPUTS "${EXTRA_INPUTS}" \
+  DENSITY      "${DENSITY}  (event density as a head input)" \
+  SPLIT        "${SPLIT}$( [ "${SPLIT}" = "official" ] && echo "  (validation: ${VAL_SEQUENCES})")" \
   CONFIG       "${CONFIG}"
 echo
 echo "--- PBS resources ---------------------------------------------"
@@ -176,9 +197,10 @@ fi
 echo
 echo "--- config file: ${CONFIG}  (* = overridden by this script) ----"
 python - "${CONFIG}" "${HEAD}" "${AX_COMBINE}" "${EV_COMBINE}" "${LABEL_MODE}" "${EV_FEATURE}" "${RES_RATIO}" "${AUGMENT}" "${HV_INPUT}" \
-  "${ROT_SOURCE}" "${EGO_MODEL}" "${FINE_FLOW}" "${VSA_CONS}" "${EXTRA_INPUTS}" <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
+  "${ROT_SOURCE}" "${EGO_MODEL}" "${FINE_FLOW}" "${VSA_CONS}" "${EXTRA_INPUTS}" "${DENSITY}" "${SPLIT}" \
+  <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
 import sys, yaml
-path, head, ax, ev, lm, feat, rr, aug, hv, rot, ego, fine, cons, extra = sys.argv[1:15]
+path, head, ax, ev, lm, feat, rr, aug, hv, rot, ego, fine, cons, extra, dens, split = sys.argv[1:17]
 cfg = yaml.safe_load(open(path, encoding="utf-8")) or {}
 # CLI flags passed by this script win over the YAML -- show the value actually used
 override = {"segmentation.head": head, "velocity.axis_combine": ax,
@@ -187,7 +209,8 @@ override = {"segmentation.head": head, "velocity.axis_combine": ax,
             "train.augment_flip": str(aug == "yes"), "real_fpe.input": hv,
             "motion.rot_source": rot, "motion.ego_model": ego,
             "motion.fine_flow": str(fine == "yes"), "motion.vsa_consistency": str(cons == "yes"),
-            "motion.extra_inputs": str(extra == "yes")}
+            "motion.extra_inputs": str(extra == "yes"), "motion.density_input": str(dens == "yes"),
+            "dataset.scene_disjoint": str(split != "official")}
 def walk(node, prefix=""):
     for k, v in node.items():
         key = f"{prefix}{k}"
@@ -221,7 +244,8 @@ python scripts/fit_ridge_head.py --config "${CONFIG}" \
   --label-mode "${LABEL_MODE}" --resolution-ratio "${RES_RATIO}" --out "${CKPT}" \
   --augment "${AUGMENT}" --hv-input "${HV_INPUT}" \
   --rot-source "${ROT_SOURCE}" --ego-model "${EGO_MODEL}" --fine-flow "${FINE_FLOW}" \
-  --vsa-consistency "${VSA_CONS}" --extra-inputs "${EXTRA_INPUTS}" \
+  --vsa-consistency "${VSA_CONS}" --extra-inputs "${EXTRA_INPUTS}" --density-input "${DENSITY}" \
+  "${SPLIT_ARGS[@]}" \
   --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"
 
 # ---------------------------------------------------------------------------

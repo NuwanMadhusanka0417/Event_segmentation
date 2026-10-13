@@ -45,7 +45,12 @@ import numpy as np
 from hdems.data.motion_labels import _quat_to_matrix
 
 ROT_SOURCES = ("none", "imu", "vicon")
+# For a sequence WITHOUT a gyroscope recording (rot_source imu): "vicon" = motion-capture
+# rotation instead (training / validation only -- never the test split), "none" = remove
+# nothing (the behaviour before 2026-10-13).
+ROT_FALLBACKS = ("none", "vicon")
 IMU_TOPICS = {"left": "/prophesee/left/imu", "right": "/prophesee/right/imu"}
+_WARNED: set[str] = set()
 
 
 # --------------------------------------------------------------------------- SO(3)
@@ -172,30 +177,59 @@ def rotation_flow(
 
 
 class RotationSource:
-    """Per-sample camera angular velocity (camera frame) from the IMU or Vicon."""
+    """Per-sample camera angular velocity (camera frame) from the IMU or Vicon.
+
+    The rate is averaged over [ts - avg_ms + shift_ms, ts + shift_ms] and multiplied by
+    ``gain``. shift / gain default to 0 / 1; scripts/check_imu_timing.py estimates them
+    on TRAINING or VALIDATION frames (never the test set) -- e.g. the front end's flow
+    can measure displacements on a slightly different scale than the true motion
+    (measured flow = 1.28 x IMU rotation on 2026-10-11), and the rotation removed must
+    be in the FLOW's units.
+    """
 
     def __init__(self, source: str = "none", *, topic: str = "left",
-                 calib_path: str | Path | None = None, avg_ms: float = 25.0) -> None:
+                 calib_path: str | Path | None = None, avg_ms: float = 25.0,
+                 shift_ms: float = 0.0, gain: float = 1.0, fallback: str = "none") -> None:
         if source not in ROT_SOURCES:
             raise ValueError(f"motion.rot_source must be one of {ROT_SOURCES}, got {source!r}")
+        if fallback not in ROT_FALLBACKS:
+            raise ValueError(f"motion.rot_fallback must be one of {ROT_FALLBACKS}, got {fallback!r}")
         self.source = source
         self.topic = topic
         self.avg_s = float(avg_ms) / 1000.0
+        self.shift_s = float(shift_ms) / 1000.0
+        self.gain = float(gain)
+        self.fallback = fallback
         self.calib = load_calib(calib_path, topic) if source == "imu" else None
         self._rates: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.no_imu: set[str] = set()          # sequences that had no gyroscope recording
 
     def _series(self, key: str, meta: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
         if key not in self._rates:
             if self.source == "imu":
                 ts, w = gyro(meta, self.topic)
-                self._rates[key] = (ts + self.calib.dt, w @ self.calib.R.T)
+                if ts.size == 0:
+                    # EVIMO2 has NO gyroscope in scene9 / 10 / 12 (the strict-split training
+                    # scenes). Removing nothing there while the test removes the rotation
+                    # trains and tests different inputs; "vicon" keeps training consistent.
+                    self.no_imu.add(key)
+                    if key not in _WARNED:
+                        _WARNED.add(key)
+                        print(f"[imu] {key}: no gyroscope recording -> "
+                              + ("motion-capture rotation (fallback)" if self.fallback == "vicon"
+                                 else "no rotation removed"))
+                    self._rates[key] = vicon_rates(meta) if self.fallback == "vicon" else (ts, w)
+                else:
+                    self._rates[key] = (ts + self.calib.dt, w @ self.calib.R.T)
             else:
                 self._rates[key] = vicon_rates(meta)
         return self._rates[key]
 
     def omega(self, key: str, meta: dict[str, Any], ts: float) -> np.ndarray | None:
-        """Mean camera rate over the avg_ms before the label time ``ts`` (None = no data)."""
+        """Mean camera rate over the avg_ms before the label time ``ts`` (shifted by
+        shift_ms), times gain (None = no data)."""
         if self.source == "none":
             return None
         t, w = self._series(key, meta)
-        return window_mean(t, w, ts - self.avg_s, ts)
+        w_mean = window_mean(t, w, ts - self.avg_s + self.shift_s, ts + self.shift_s)
+        return None if w_mean is None else self.gain * w_mean

@@ -171,9 +171,18 @@ def main() -> None:
                          "(overrides motion.ego_model).")
     for flag, key, what in (("--fine-flow", "fine_flow", "second, lightly pooled flow estimate"),
                             ("--vsa-consistency", "vsa_consistency", "VSA ego-consistency maps"),
-                            ("--extra-inputs", "extra_inputs", "derotated flow vector + rotation speed")):
+                            ("--extra-inputs", "extra_inputs", "derotated flow vector + rotation speed"),
+                            ("--density-input", "density_input", "event density (a non-motion cue)")):
         ap.add_argument(flag, choices=["yes", "no"], default=None,
                         help=f"{what} as head input (overrides motion.{key}).")
+    ap.add_argument("--scene-disjoint", choices=["yes", "no"], default=None,
+                    help="yes = never train on any take of a test scene (strict); no = EVIMO2's "
+                         "own train/eval split (other takes of the test scenes are trained on). "
+                         "Overrides dataset.scene_disjoint.")
+    ap.add_argument("--val-sequences", type=str, default=None,
+                    help="Comma-separated sequences (name prefixes) held out for validation "
+                         "instead of dataset.val_scenes, e.g. "
+                         "scene13_dyn_test_03,scene14_dyn_test_02. 'none' = use val_scenes.")
     ap.add_argument("--axis-combine", type=str, choices=["bind", "bundle"], default=None,
                     help="Vx,Vy combine (overrides velocity.axis_combine).")
     ap.add_argument("--event-combine", type=str, choices=list(EVENT_COMBINES), default=None,
@@ -225,10 +234,20 @@ def main() -> None:
         mot["rot_source"] = args.rot_source
     if args.ego_model:
         mot["ego_model"] = args.ego_model
-    for key in ("fine_flow", "vsa_consistency", "extra_inputs"):
+    for key in ("fine_flow", "vsa_consistency", "extra_inputs", "density_input"):
         val = getattr(args, key)
         if val:
             mot[key] = val == "yes"
+    dset = dict(cfg.get("dataset") or {})
+    if args.scene_disjoint:
+        dset["scene_disjoint"] = args.scene_disjoint == "yes"
+    if args.val_sequences is not None:
+        dset["val_sequences"] = ([] if args.val_sequences.strip().lower() in ("", "none")
+                                 else [s.strip() for s in args.val_sequences.split(",") if s.strip()])
+    cfg["dataset"] = dset
+    print(f"[fit] split: scene_disjoint={dset.get('scene_disjoint', False)}  validation "
+          + (f"takes {dset['val_sequences']}" if dset.get("val_sequences")
+             else f"scenes {dset.get('val_scenes')}"))
     cfg["motion"] = mot
     # Resolution ratio: scales image size, kernel N, search M and Eq.12 pooling.
     cfg = apply_resolution_ratio(cfg, args.resolution_ratio, verbose=True)
@@ -281,7 +300,10 @@ def main() -> None:
               + (" (GROUND TRUTH -- oracle, not a result)" if src == "vicon" else "")
               + f" | ego model {opt('motion', 'ego_model')} (prior {opt('motion', 'ego_prior_px')} px)"
               + f" | fine flow {opt('motion', 'fine_flow')} | VSA consistency "
-              f"{opt('motion', 'vsa_consistency')} | extra inputs {opt('motion', 'extra_inputs')}")
+              f"{opt('motion', 'vsa_consistency')} | extra inputs {opt('motion', 'extra_inputs')}"
+              + f" | event density {opt('motion', 'density_input')}"
+              + (f" | IMU shift {opt('motion', 'imu_shift_ms')} ms gain {opt('motion', 'imu_gain')}"
+                 if src == "imu" else ""))
     mean_center = bool(seg_cfg.get("ridge_mean_center", True))
     motion_features = bool(seg_cfg.get("ridge_motion_features", True))
     # Paper mode: multi-time surfaces -> fit on the two-time cost-volume features
@@ -373,6 +395,21 @@ def main() -> None:
               f"early-stop patience {patience or 'off'}")
 
         best_score, best_state, best_epoch = float("-inf"), None, 0
+
+        def save_checkpoint(threshold, curve, beta):
+            """Best model so far + everything eval needs to rebuild it."""
+            torch.save({"model": best_state, "task": "segmentation", "head": head_type,
+                        "epoch": best_epoch, "val_miou": best_score if len(val_ds) else None,
+                        "val_metric": val_metric if len(val_ds) else None,
+                        "decision_threshold": threshold, "threshold_curve": curve,
+                        "temporal_beta": beta,
+                        "val_split": val_split,
+                        "augment_flip": bool(cfg.get("train", {}).get("augment_flip", False)),
+                        "num_samples": len(train_ds), "num_classes": num_classes,
+                        "axis_combine": axis, "event_combine": event,
+                        "event_feature": feature, "label_mode": label_mode,
+                        "resolution_ratio": ratio, "frontend": frontend,
+                        "head_config": head_settings(cfg)}, out_path)
         stale = 0                                  # validations since the last improvement
         for epoch in range(1, epochs + 1):
             loss = train_one_epoch(net, tr_loader, optimizer, device, "segmentation",
@@ -400,6 +437,9 @@ def main() -> None:
             if score > best_score:
                 best_score, best_epoch, stale = score, epoch, 0
                 best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+                # Saved at every improvement, so a job killed by its walltime still leaves
+                # the best model so far (threshold / temporal beta are tuned at the end).
+                save_checkpoint(None, None, 0.0)
             else:
                 stale += 1
                 if patience and stale >= patience:
@@ -418,7 +458,9 @@ def main() -> None:
         if (val_metric == "event_iou" and best_state is not None and num_classes == 2
                 and bool(train_cfg.get("tune_threshold", True))):
             net.load_state_dict(best_state)
-            grid = [round(0.2 + 0.05 * i, 2) for i in range(13)]          # 0.20 .. 0.80
+            # 0.05 .. 0.80: all three r2_300 IMU runs chose 0.20, the lowest value of the
+            # old grid, so the best threshold may lie below it
+            grid = [round(0.05 * i, 2) for i in range(1, 17)]
             betas = sorted({0.0, *(float(b) for b in train_cfg.get("temporal_betas", [0.0]))})
             curve, best = {}, (-1.0, 0.0, 0.5)
             for beta in betas:
@@ -434,18 +476,7 @@ def main() -> None:
             print(f"[train] chosen: temporal beta {beta_best:g}, P(moving) > {threshold:.2f} "
                   f"(event IoU {best[0]:.4f} on validation)")
 
-        torch.save({"model": best_state, "task": "segmentation", "head": head_type,
-                    "epoch": best_epoch, "val_miou": best_score if len(val_ds) else None,
-                    "val_metric": val_metric if len(val_ds) else None,
-                    "decision_threshold": threshold, "threshold_curve": curve,
-                    "temporal_beta": beta_best,
-                    "val_split": val_split,
-                    "augment_flip": bool(cfg.get("train", {}).get("augment_flip", False)),
-                    "num_samples": len(train_ds), "num_classes": num_classes,
-                    "axis_combine": axis, "event_combine": event,
-                    "event_feature": feature, "label_mode": label_mode,
-                    "resolution_ratio": ratio, "frontend": frontend,
-                    "head_config": head_settings(cfg)}, out_path)
+        save_checkpoint(threshold, curve, beta_best)
         print(f"[train] saved {out_path}  best epoch={best_epoch}  score={best_score:.4f}")
         return
 

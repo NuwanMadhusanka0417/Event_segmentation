@@ -86,6 +86,8 @@ class EVIMODataset(Dataset):
         augment: bool = False,
         rotation: Any = None,
         res_ratio: int = 1,
+        exclude_sequences: Iterable[str] = (),
+        only_sequences: Iterable[str] | None = None,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -131,6 +133,8 @@ class EVIMODataset(Dataset):
                 motion_params=self.motion_params,
                 min_moving_px=min_moving_px,
                 window_s=self.window_s,
+                exclude_sequences=exclude_sequences,
+                only_sequences=only_sequences,
             )
         )
 

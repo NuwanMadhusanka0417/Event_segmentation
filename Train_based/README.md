@@ -464,6 +464,33 @@ checkpoint, used by eval and the benchmark; `--threshold` overrides).
 PBS: `ROT_SOURCE`, `EGO_MODEL`, `FINE_FLOW`, `VSA_CONS`, `EXTRA_INPUTS`, and
 `ORACLE=yes` for an extra benchmark run with the Vicon rotation (upper bound).
 
+## Splits, IMU coverage and shortcut ablations (2026-10-13)
+
+**EVIMO2 has no gyroscope in scene9, scene10 and scene12** — i.e. in all of the strict
+split's training and validation data (only scenes 6, 13, 14, 15 have one). The IMU runs up
+to 2026-10-13 therefore trained with NO rotation removed and were tested WITH it.
+`motion.rot_fallback: vicon` now uses the motion-capture rotation for training /
+validation sequences without a gyroscope (never for the test split, which always has
+the IMU) — state this in the paper.
+
+| PBS option | effect |
+|---|---|
+| `SPLIT=official` | EVIMO2's own split (`dataset.scene_disjoint: false`): other takes of the test scenes are trained on; validation = `VAL_SEQUENCES`, held-out takes of scenes 13 / 14 (`dataset.val_sequences`), so the epoch and the decision threshold are chosen on data like the test (scene9's threshold cut test precision 64 → 49) |
+| `SPLIT=disjoint` | the old strict split, validation scene9 |
+| `DENSITY=no` | event density removed from the head input (a shortcut: with a still camera only movers make events) |
+| `HV_INPUT=v / none` | hypervector without absolute position / no hypervector (ablations) |
+
+Every job now writes its own checkpoint and results folder (job number in both), the
+checkpoint is saved at each validation improvement (a job killed by its walltime keeps
+its best model), the threshold grid starts at 0.05, and caches go to scratch
+(`scripts/nci_env.sh`).
+
+**Gyro timing:** `qsub run_imu_check.pbs` (≈1 h, no training) runs
+`scripts/check_imu_timing.py` on the validation takes: slope / correlation of measured
+flow vs predicted rotation and the residual AUC for each averaging window and time shift,
+plus the flow's scale against ground-truth flow. Set `motion.imu_avg_ms`, `imu_shift_ms`,
+`imu_gain` from it.
+
 ## Temporal consistency (`hdems/temporal_filter.py`)
 
 Each frame used to be segmented on its own. The benchmark paper's key ingredient is
