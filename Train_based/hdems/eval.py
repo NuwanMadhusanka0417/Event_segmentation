@@ -25,9 +25,10 @@ from hdems.imu import ROT_SOURCES
 from hdems.visualize import save_event_colour_figure
 from hdems.detection import detection_metrics, masks_to_boxes
 from hdems.instances import binary_iou, connected_components, instance_metrics
-from hdems.models.hdems import ABLATIONS, HDEMS
+from hdems.baselines import BASELINE_CUES, THRESHOLD_GRID_PX, CueBaseline
+from hdems.models.hdems import ABLATIONS, BACKGROUND_SOURCES, FLOW_SOURCES, HDEMS
 from hdems.vsa.velocity import EVENT_COMBINES
-from hdems.seg_features import predict_labels, rot_flow_of, score_pixel_mask
+from hdems.seg_features import motion_kwargs, predict_labels, score_pixel_mask
 
 HEADS = ("cnn", "mfcnn", "mfunet", "ridge", "prototype", "motion")
 
@@ -201,7 +202,8 @@ def evaluate_segmentation(
     for batch in loader:
         surface = batch["surface"].to(device)
         mask = batch["mask"].to(device).long()
-        rot = rot_flow_of(batch, device)
+        aux = motion_kwargs(batch, device)          # rotation (+ oracle fields)
+        rot = aux.get("rot_flow")
         # Score on EVENT pixels only (pixels without events carry no evidence), only
         # on events near the label time (older ones are the trail a mover leaves
         # behind, which the label calls static), and never on the ignore label
@@ -214,7 +216,7 @@ def evaluate_segmentation(
             # so the front end is skipped entirely (no loss is reported).
             pred = events_t.long()
         else:
-            out_m = model(surface, task="segmentation", rot_flow=rot)
+            out_m = model(surface, task="segmentation", **aux)
             logits, flow = out_m["seg_logits"], out_m.get("flow")
             if valid.any():
                 total_loss += seg_loss(logits, mask.masked_fill(~valid, IGNORE_LABEL)).item()
@@ -241,7 +243,7 @@ def evaluate_segmentation(
                 # ego-compensated velocity the head saw)
                 res = out_m.get("residual")
                 if res is None:
-                    res, _ = model.residual_from_flow(flow, surface, rot)
+                    res, _ = model.residual_from_flow(flow, surface, rot, aux.get("gt_background"))
                 res = res[0].cpu().numpy()
                 objects = group_objects(res, pred_fg & ev, grouping)
                 if gt_inst is not None and ((gt_inst > 0) & ev).any():
@@ -263,7 +265,7 @@ def evaluate_segmentation(
             for what in ABLATIONS:
                 model.ablate = what
                 try:
-                    p2 = predict_labels(model(surface, task="segmentation", rot_flow=rot)["seg_logits"], thr)
+                    p2 = predict_labels(model(surface, task="segmentation", **aux)["seg_logits"], thr)
                 finally:
                     model.ablate = None
                 a = abl[what]
@@ -349,15 +351,21 @@ def measure_seg_latency(model: HDEMS, surface: torch.Tensor, device: torch.devic
     report the speed of a disk read instead of the VSA front end."""
     model.eval()
     surface = surface.to(device)
+    # an ORACLE model needs its ground-truth fields: give them all-NaN, so it runs (and is
+    # timed as) the real pipeline -- ground truth is not something a deployed system computes
+    nan = torch.full((surface.shape[0], 2, *surface.shape[-2:]), float("nan"), device=device)
+    oracle = {k: nan for k, on in (("gt_flow", getattr(model, "flow_source", "vsa") == "gt"),
+                                   ("gt_background", getattr(model, "background_source", "fit") == "gt"))
+              if on}
     cache, model.flow_cache = model.flow_cache, None
     try:
         for _ in range(5):
-            model(surface, task="segmentation")
+            model(surface, task="segmentation", **oracle)
         if device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(repeats):
-            model(surface, task="segmentation")
+            model(surface, task="segmentation", **oracle)
         if device.type == "cuda":
             torch.cuda.synchronize()
     finally:
@@ -385,18 +393,45 @@ def run_published_benchmark(args, cfg: dict, model: HDEMS, dataset, eval_split: 
         max_per_sequence=args.max_samples,
     )
     print(bm.format_report(bench, scores, stats, gt_mode=s["gt"], pred_source=s["pred"]))
+    oracles = {k: getattr(getattr(model, "model", model), k, None)
+               for k in ("rot_source", "flow_source", "background_source")}
+    if oracles["rot_source"] == "vicon" or "gt" in (oracles["flow_source"], oracles["background_source"]):
+        print(f"ORACLE inputs {oracles} -- an upper bound, NOT a result")
     if args.max_samples:
         print(f"(smoke test: at most {args.max_samples} frames per sequence -- not comparable)")
     if args.benchmark_out:
         bm.save_json(Path(args.benchmark_out), bench, scores, stats,
-                     {**s, "head": model.seg_head.__class__.__name__,
+                     {**s, "head": getattr(model, "name", None) or model.seg_head.__class__.__name__,
+                      "oracles": oracles,
                       "checkpoint": args.checkpoint or args.ridge_checkpoint or args.prototype_checkpoint,
                       "max_per_sequence": args.max_samples,
                       "decision_threshold": getattr(model, "decision_threshold", None),
+                      "threshold_curve": getattr(model, "threshold_curve", None),
                       "temporal_beta": stats.get("temporal_beta", 0.0)})
         print(f"Per-frame scores -> {Path(args.benchmark_out).resolve()}")
     if model.flow_cache is not None:
         print(model.flow_cache.summary())
+
+
+def tune_baseline(args, cfg: dict, baseline: CueBaseline, device: torch.device) -> None:
+    """Training-free baseline: choose the cue threshold (px) on the VALIDATION takes
+    with the benchmark metric -- the same rule as the trained heads, never the test."""
+    from hdems.data.build import HOLDOUT
+    val_ds = build_dataset(cfg, split=HOLDOUT)
+    if len(val_ds) == 0:
+        raise SystemExit("baseline: the validation split is empty -- pass --val-sequences")
+    s = bm.settings(cfg, gt=args.benchmark_gt)
+    got, n = bm.validate_event_iou(baseline, val_ds, device, thresholds=THRESHOLD_GRID_PX,
+                                   gt_mode=s["gt"], max_frames=args.baseline_val_frames)
+    t = max(got, key=lambda k: got[k] if got[k] == got[k] else -1.0)
+    print(f"[baseline] {baseline.cue}: validation event IoU per threshold (sensor px / interval), "
+          f"{n} frames with a mover:")
+    print("  " + "  ".join(f"{k:g}:{v:.3f}" for k, v in got.items()))
+    print(f"[baseline] chosen threshold {t:g} px (validation event IoU {got[t]:.4f})"
+          + ("  -- AT THE EDGE of the grid: the best value may lie outside it"
+             if t in (min(got), max(got)) else ""))
+    baseline.decision_threshold = float(t)
+    baseline.threshold_curve = {f"{k:g}": v for k, v in got.items()}
 
 
 def _apply_head_config(cfg: dict, head: str | None) -> dict:
@@ -484,7 +519,26 @@ def main() -> None:
     parser.add_argument("--rot-source", choices=list(ROT_SOURCES), default=None,
                         help="Override motion.rot_source of the checkpoint, e.g. 'vicon' = "
                              "ground-truth rotation (an ORACLE upper bound, not a result).")
+    parser.add_argument("--flow-source", choices=list(FLOW_SOURCES), default=None,
+                        help="Override motion.flow_source: gt = ground-truth flow (ORACLE).")
+    parser.add_argument("--background-source", choices=list(BACKGROUND_SOURCES), default=None,
+                        help="Override motion.background_source: gt = true static-world flow "
+                             "instead of the ego fit (ORACLE).")
+    parser.add_argument("--baseline", choices=list(BASELINE_CUES), default=None,
+                        help="TRAINING-FREE baseline with --benchmark: threshold one motion cue "
+                             "(sensor px), no head; a checkpoint is optional (front end only). "
+                             "residual = |flow - background| | derotated = |flow - IMU rotation| "
+                             "| foe / perp = depth-free FOE residual (hdems/foe.py). The threshold "
+                             "is --threshold (px) or tuned on the validation takes.")
+    parser.add_argument("--val-sequences", type=str, default=None,
+                        help="--baseline: comma-separated held-out takes for tuning its threshold "
+                             "(default dataset.val_sequences), e.g. "
+                             "scene13_dyn_test_03,scene14_dyn_test_02.")
+    parser.add_argument("--baseline-val-frames", type=int, default=300,
+                        help="--baseline: validation frames with a mover used for the threshold.")
     args = parser.parse_args()
+    if args.baseline and not args.benchmark:
+        raise SystemExit("--baseline scores the published protocol: add --benchmark hua2025")
 
     cfg = load_config(args.config)
     if args.label_mode:
@@ -537,6 +591,16 @@ def main() -> None:
     if args.rot_source:                 # e.g. the Vicon oracle on an IMU-trained head
         cfg["motion"] = {**(cfg.get("motion") or {}), "rot_source": args.rot_source}
         print(f"[eval] camera rotation source overridden: {args.rot_source}")
+    for key in ("flow_source", "background_source"):     # oracle inputs at test time
+        val = getattr(args, key)
+        if val:
+            cfg["motion"] = {**(cfg.get("motion") or {}), key: val}
+            print(f"[eval] motion.{key} overridden: {val}"
+                  + ("  (ORACLE -- an upper bound, not a result)" if val == "gt" else ""))
+    if args.val_sequences is not None:
+        cfg["dataset"] = {**cfg.get("dataset", {}), "val_split": "holdout",
+                          "val_sequences": [q.strip() for q in args.val_sequences.split(",")
+                                            if q.strip()]}
     # --resolution-ratio overrides; otherwise the checkpoint's (via frontend) or YAML's.
     cfg = apply_resolution_ratio(cfg, args.resolution_ratio, verbose=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -652,6 +716,15 @@ def main() -> None:
                   f"{ridge_ms:12.2f} {ridge.seg_head_param_count():12,}")
             return
 
+        if args.baseline:
+            # front end only (restored from --checkpoint when one is given); no head
+            model = CueBaseline(HDEMS(_apply_head_config(cfg, head)).to(device).eval(), args.baseline,
+                                threshold=args.threshold)
+            print(f"[eval] TRAINING-FREE baseline: threshold |{args.baseline}| (sensor px), no head")
+            if model.decision_threshold is None:
+                tune_baseline(args, cfg, model, device)
+            run_published_benchmark(args, cfg, model, dataset, eval_split, device)
+            return
         model = build_model(head)
         if args.benchmark:
             run_published_benchmark(args, cfg, model, dataset, eval_split, device)

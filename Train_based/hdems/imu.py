@@ -53,6 +53,16 @@ IMU_TOPICS = {"left": "/prophesee/left/imu", "right": "/prophesee/right/imu"}
 _WARNED: set[str] = set()
 
 
+def _main_process() -> bool:
+    """False inside a DataLoader worker: each worker is its own process, so a warning
+    printed there appears once PER WORKER AND PER EPOCH (2,600 log lines in one run)."""
+    try:
+        from torch.utils.data import get_worker_info
+        return get_worker_info() is None
+    except Exception:          # torch missing / unusual context: print
+        return True
+
+
 # --------------------------------------------------------------------------- SO(3)
 def hat(w: np.ndarray) -> np.ndarray:
     return np.array([[0.0, -w[2], w[1]], [w[2], 0.0, -w[0]], [-w[1], w[0], 0.0]])
@@ -213,7 +223,7 @@ class RotationSource:
                     # scenes). Removing nothing there while the test removes the rotation
                     # trains and tests different inputs; "vicon" keeps training consistent.
                     self.no_imu.add(key)
-                    if key not in _WARNED:
+                    if key not in _WARNED and _main_process():
                         _WARNED.add(key)
                         print(f"[imu] {key}: no gyroscope recording -> "
                               + ("motion-capture rotation (fallback)" if self.fallback == "vicon"

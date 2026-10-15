@@ -118,7 +118,20 @@ def build_dataset(cfg: dict[str, Any], split: str | None = None):
         res_ratio=resolution_ratio_of(cfg),
         exclude_sequences=ex_seqs,
         only_sequences=only_seqs,
+        # ORACLE diagnostics: ground-truth flow / background as model inputs
+        oracle_inputs=oracle_inputs(cfg),
     )
+
+
+def oracle_inputs(cfg: dict[str, Any]) -> tuple[str, ...]:
+    """Ground-truth fields the samples must carry for motion.flow_source /
+    background_source = gt (empty for the real pipeline)."""
+    out = []
+    if str(frontend_option(cfg, "motion", "flow_source")) == "gt":
+        out.append("gt_flow")
+    if str(frontend_option(cfg, "motion", "background_source")) == "gt":
+        out.append("gt_background")
+    return tuple(out)
 
 
 def rotation_source(cfg: dict[str, Any], allow_fallback: bool = False):

@@ -22,7 +22,7 @@ from hdems.data.motion_labels import IGNORE_LABEL
 from hdems.losses.flow import epe_loss
 from hdems.losses.seg import dice_loss, seg_loss
 from hdems.models.hdems import HDEMS
-from hdems.seg_features import rot_flow_of, score_pixel_mask
+from hdems.seg_features import motion_kwargs, score_pixel_mask
 from hdems.vsa.velocity import EVENT_COMBINES
 
 
@@ -50,7 +50,7 @@ def train_one_epoch(
     for batch in loader:
         surface = batch["surface"].to(device)
         optimizer.zero_grad()
-        out = model(surface, task=task, rot_flow=rot_flow_of(batch, device))
+        out = model(surface, task=task, **motion_kwargs(batch, device))
 
         if task == "flow":
             loss = epe_loss(out["flow"], batch["flow"].to(device))

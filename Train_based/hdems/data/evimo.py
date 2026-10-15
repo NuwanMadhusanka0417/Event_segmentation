@@ -20,6 +20,10 @@ from hdems.data.motion_labels import MotionParams, frame_motion, rigid_groups
 
 
 FLIPS = ((), (-1,), (-2,), (-2, -1))      # none | horizontal | vertical | 180-degree rotation
+# Displacement fields a sample may carry, (2, H, W) in working px: the camera-rotation
+# flow and the ORACLE inputs (ground-truth flow / ground-truth static-world flow).
+VECTOR_FIELDS = ("rot_flow", "gt_flow", "gt_background")
+ORACLE_INPUTS = ("gt_flow", "gt_background")
 
 
 def flip_sample(sample: dict[str, Any], dims: tuple[int, ...]) -> dict[str, Any]:
@@ -37,12 +41,13 @@ def flip_sample(sample: dict[str, Any], dims: tuple[int, ...]) -> dict[str, Any]
     out = {k: (torch.flip(v, dims) if isinstance(v, torch.Tensor) and v.dim() >= 2
                and tuple(v.shape[-2:]) == hw else v)
            for k, v in sample.items()}
-    if "rot_flow" in out:
-        # a displacement FIELD: mirroring the image also mirrors the vectors
-        # (a horizontal flip negates u, a vertical flip negates v), exactly as the
-        # flow re-measured on the flipped surfaces does
-        sign = torch.tensor([-1.0 if -1 in dims else 1.0, -1.0 if -2 in dims else 1.0])
-        out["rot_flow"] = out["rot_flow"] * sign.view(2, 1, 1)
+    # a displacement FIELD: mirroring the image also mirrors the vectors (a horizontal
+    # flip negates u, a vertical flip negates v), exactly as the flow re-measured on
+    # the flipped surfaces does
+    sign = torch.tensor([-1.0 if -1 in dims else 1.0, -1.0 if -2 in dims else 1.0])
+    for key in VECTOR_FIELDS:
+        if key in out:
+            out[key] = out[key] * sign.view(2, 1, 1)
     return out
 
 
@@ -88,6 +93,7 @@ class EVIMODataset(Dataset):
         res_ratio: int = 1,
         exclude_sequences: Iterable[str] = (),
         only_sequences: Iterable[str] | None = None,
+        oracle_inputs: Iterable[str] = (),
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -112,6 +118,15 @@ class EVIMODataset(Dataset):
         self.res_ratio = int(res_ratio)
         tf = sorted((float(f) for f in (self.time_frames or [])), reverse=True)
         self.interval_s = (tf[0] - tf[1]) * self.window_s if len(tf) > 1 else None
+        # ORACLE inputs (motion.flow_source / background_source = gt): ground truth from
+        # depth + poses over the same F0 -> F1 interval, NaN where there is no depth.
+        # Diagnostics only -- what the pipeline could do with perfect flow / background.
+        self.oracle_inputs = tuple(str(o) for o in oracle_inputs)
+        bad = [o for o in self.oracle_inputs if o not in ORACLE_INPUTS]
+        if bad:
+            raise ValueError(f"oracle inputs must be in {ORACLE_INPUTS}, got {bad}")
+        if self.oracle_inputs and not self.time_frames:
+            raise ValueError("oracle inputs need the multi-time stack (dataset.time_frames)")
 
         # Pre-built .pt shards bypass EVERY index filter (scene-disjoint split, held-out
         # validation scenes, require_mover, rigid groups) and freeze the time frames,
@@ -187,7 +202,20 @@ class EVIMODataset(Dataset):
         )
         if self.rotation is not None and self.interval_s:
             out["rot_flow"] = self._rot_flow(seq_dir, meta, float(frame["ts"]))
+        for key in self.oracle_inputs:
+            out[key] = self._gt_field(seq_dir, frame_idx, meta, static=key == "gt_background")
         return out
+
+    def _gt_field(self, seq_dir: Path, frame_idx: int, meta: dict[str, Any],
+                  *, static: bool) -> torch.Tensor:
+        """(2, H, W) ground-truth flow (static=False) or static-world flow (True) over
+        one interval, working px, same direction as the front end's flow; NaN = unknown."""
+        from hdems.data.gt_flow import gt_flow_for_sample, to_working
+        g = gt_flow_for_sample(seq_dir, frame_idx, self.window_s, self.time_frames, meta,
+                               static=static)
+        if g is None:
+            return torch.full((2, self.height, self.width), float("nan"))
+        return torch.from_numpy(to_working(g, self.res_ratio, self.height, self.width))
 
     def _rot_flow(self, seq_dir: Path, meta: dict[str, Any], ts: float) -> torch.Tensor:
         """(2, H, W) rotational flow over one interval; zeros where there is no rate."""

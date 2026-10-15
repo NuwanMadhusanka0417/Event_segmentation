@@ -228,6 +228,10 @@ motion:                  # how motion reaches the head (2026-10-11). Benchmark b
   #                        surfaces (12.5 / 25 / 50 ms): the VSA descriptor tests "is this pixel
   #                        where the static scene would be?" at sub-pixel precision, no pooling.
   #                        Costs 3 extra encoder passes per sample.
+  flow_source: vsa       # ORACLES (diagnostics, never results): gt = ground-truth flow (depth +
+  background_source: fit #   poses) instead of the VSA flow | gt = the true static-world flow
+  #                        instead of rotation + ego fit. Both only where EVIMO2 has depth (the
+  #                        tracked objects); elsewhere vsa / fit. run_segmentation.pbs ORACLE_INPUT
 
 segmentation:
   head: mfunet          # mfunet (motion-first U-Net: wide view + event density + flow

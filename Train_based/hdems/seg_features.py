@@ -31,6 +31,24 @@ def rot_flow_of(batch: dict, device: torch.device | str | None = None) -> torch.
     return r.to(device) if device is not None else r
 
 
+MOTION_FIELDS = ("rot_flow", "gt_flow", "gt_background")
+
+
+def motion_kwargs(batch: dict, device: torch.device | str | None = None) -> dict[str, torch.Tensor]:
+    """The batch's displacement fields as HDEMS.forward keyword arguments: the camera
+    rotation and, for ORACLE runs, the ground-truth flow / background. Only fields the
+    batch carries are returned, each (B, 2, H, W)."""
+    out = {}
+    if not isinstance(batch, dict):
+        return out
+    for key in MOTION_FIELDS:
+        v = batch.get(key)
+        if v is not None:
+            v = v if v.dim() == 4 else v.unsqueeze(0)
+            out[key] = v.to(device) if device is not None else v
+    return out
+
+
 def predict_labels(logits: torch.Tensor, threshold: float | None = None) -> torch.Tensor:
     """(B, C, H, W) logits -> (B, H, W) labels.
 

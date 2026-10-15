@@ -45,6 +45,9 @@ ABLATIONS = ("motion", "appearance")
 # real_fpe.input: how the position code P joins the velocity code V per pixel
 HV_INPUTS = ("pv_bind", "pv_bundle", "pv_concat", "v", "none")   # none = no hypervector (ablation)
 MOTION_FIRST_HEADS = ("mfcnn", "mfunet")
+# ORACLE inputs (motion.flow_source / background_source): upper bounds, never results
+FLOW_SOURCES = ("vsa", "gt")          # gt = ground-truth flow where there is depth
+BACKGROUND_SOURCES = ("fit", "gt")    # gt = true static-world flow where there is depth
 EVIDENCE_CHANNELS = 2          # mfunet: event density + flow confidence
 
 
@@ -164,6 +167,16 @@ class HDEMS(nn.Module):
         self.extra_inputs = bool(frontend_option(cfg, "motion", "extra_inputs"))
         self.vsa_consistency = bool(frontend_option(cfg, "motion", "vsa_consistency"))
         self.density_input = bool(frontend_option(cfg, "motion", "density_input"))
+        #   flow_source / background_source = gt: ORACLES (sample["gt_flow"] /
+        #   sample["gt_background"]) -- where the pipeline would be with perfect flow or
+        #   a perfect background model. Pixels without ground truth keep vsa / fit.
+        self.flow_source = str(frontend_option(cfg, "motion", "flow_source"))
+        self.background_source = str(frontend_option(cfg, "motion", "background_source"))
+        if self.flow_source not in FLOW_SOURCES:
+            raise ValueError(f"motion.flow_source must be one of {FLOW_SOURCES}, got {self.flow_source!r}")
+        if self.background_source not in BACKGROUND_SOURCES:
+            raise ValueError(f"motion.background_source must be one of {BACKGROUND_SOURCES}, "
+                             f"got {self.background_source!r}")
         tf_all = [float(f) for f in tf]
         step = (tf_all[0] - tf_all[1]) if len(tf_all) > 1 else 1.0
         # earlier surfaces, in flow intervals before the reference (1, 2, 4)
@@ -277,14 +290,51 @@ class HDEMS(nn.Module):
         rot_flow = rot_flow.to(device=like.device, dtype=like.dtype)
         return rot_flow.unsqueeze(0) if rot_flow.dim() == 3 else rot_flow
 
+    @staticmethod
+    def _oracle(name: str, field: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor:
+        """A ground-truth field of the batch, (B, 2, H, W) on like's device (NaN = unknown)."""
+        if field is None:
+            raise ValueError(f"motion.*_source = gt needs sample[{name!r}]: build the dataset "
+                             "from the same config (hdems.data.build.oracle_inputs)")
+        field = field.to(device=like.device, dtype=like.dtype)
+        return field.unsqueeze(0) if field.dim() == 3 else field
+
+    @staticmethod
+    def _fill(truth: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
+        """truth where both components are finite, fallback elsewhere."""
+        ok = torch.isfinite(truth).all(dim=1, keepdim=True)
+        return torch.where(ok, torch.nan_to_num(truth), fallback)
+
+    def oracle_flow(self, raw: torch.Tensor, gt_flow: torch.Tensor | None) -> torch.Tensor:
+        """motion.flow_source = gt: the front end's flow (and fine flow) replaced by the
+        ground-truth flow wherever it is known; the match confidence is kept."""
+        if self.flow_source != "gt":
+            return raw
+        g = self._oracle("gt_flow", gt_flow, raw)
+        parts = [self._fill(g, raw[:, :2]), raw[:, 2:3]]
+        if raw.shape[1] >= 5:
+            parts.append(self._fill(g, raw[:, 3:5]))
+        return torch.cat(parts, dim=1)
+
     def background_fit(self, flow: torch.Tensor, surfaces: torch.Tensor,
-                       rot_flow: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+                       rot_flow: torch.Tensor | None = None,
+                       gt_background: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Flow -> (residual, background displacement), working px per interval.
 
         The camera rotation (``rot_flow``, from the IMU) is removed first; the ego
         model (motion.ego_model) is fitted to what is left. background = rotation +
         fitted model, i.e. where a STATIC point would have moved.
+        motion.background_source = gt: the true static-world flow (``gt_background``)
+        replaces the fitted background wherever it is known (oracle).
         """
+        residual, background = self._background_fit(flow, surfaces, rot_flow)
+        if self.background_source == "gt":
+            background = self._fill(self._oracle("gt_background", gt_background, flow), background)
+            residual = flow - background
+        return residual, background
+
+    def _background_fit(self, flow: torch.Tensor, surfaces: torch.Tensor,
+                        rot_flow: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         rot = self._rot(rot_flow, flow)
         f = flow if rot is None else flow - rot
         valid = self.ego_mask(surfaces)
@@ -298,9 +348,10 @@ class HDEMS(nn.Module):
         return residual, flow - residual
 
     def residual_from_flow(self, flow: torch.Tensor, surfaces: torch.Tensor,
-                           rot_flow: torch.Tensor | None = None):
+                           rot_flow: torch.Tensor | None = None,
+                           gt_background: torch.Tensor | None = None):
         """Ego-compensated (residual) velocity, working px per interval -> (residual, |residual|)."""
-        residual, _ = self.background_fit(flow, surfaces, rot_flow)
+        residual, _ = self.background_fit(flow, surfaces, rot_flow, gt_background)
         return residual, residual.pow(2).sum(1, keepdim=True).clamp_min(1e-12).sqrt()
 
     def consistency_maps(self, surfaces: torch.Tensor, f0: torch.Tensor,
@@ -334,17 +385,21 @@ class HDEMS(nn.Module):
         return torch.stack(out, dim=1).float()
 
     def motion_features(self, surfaces: torch.Tensor,
-                        rot_flow: torch.Tensor | None = None) -> dict[str, torch.Tensor | None]:
+                        rot_flow: torch.Tensor | None = None, *,
+                        gt_flow: torch.Tensor | None = None,
+                        gt_background: torch.Tensor | None = None) -> dict[str, torch.Tensor | None]:
         """Shared front end of every multi-time head.
 
         -> flow, conf, residual, x (event HV, unit-RMS when velocity.x_norm = rms),
            background, rot, fine_residual, consistency (the last three may be None).
         ``self.ablate`` zeroes the motion or the appearance inputs.
+        ``gt_flow`` / ``gt_background``: the oracle inputs (motion.flow_source /
+        background_source = gt), ignored otherwise.
         """
-        raw = self.compute_motion_all(surfaces)
+        raw = self.oracle_flow(self.compute_motion_all(surfaces), gt_flow)
         flow, conf = raw[:, :2], raw[:, 2:3]
         rot = self._rot(rot_flow, flow)
-        residual, background = self.background_fit(flow, surfaces, rot)
+        residual, background = self.background_fit(flow, surfaces, rot, gt_background)
         fine_res = raw[:, 3:5] - background if (self.fine_flow and raw.shape[1] >= 5) else None
         # Only the reference surface is needed for X, so a cache hit skips the other
         # three encodes as well as the cost volume (unless vsa_consistency needs them).
@@ -371,9 +426,10 @@ class HDEMS(nn.Module):
                 "background": background, "rot": rot, "fine_residual": fine_res,
                 "consistency": cons}
 
-    def motion_inputs(self, surfaces: torch.Tensor, rot_flow: torch.Tensor | None = None):
+    def motion_inputs(self, surfaces: torch.Tensor, rot_flow: torch.Tensor | None = None,
+                      **oracle: torch.Tensor | None):
         """(flow, confidence, residual, X) -- see ``motion_features``."""
-        m = self.motion_features(surfaces, rot_flow)
+        m = self.motion_features(surfaces, rot_flow, **oracle)
         return m["flow"], m["conf"], m["residual"], m["x"]
 
     def motion_channels(self, m: dict[str, torch.Tensor | None], surfaces: torch.Tensor) -> torch.Tensor:
@@ -526,7 +582,8 @@ class HDEMS(nn.Module):
         """(B, T, 2, H, W) -> flow (B, 2, H, W) (see ``compute_motion``)."""
         return self.compute_motion(surfaces)[0]
 
-    def paper_features(self, surfaces: torch.Tensor, rot_flow: torch.Tensor | None = None):
+    def paper_features(self, surfaces: torch.Tensor, rot_flow: torch.Tensor | None = None,
+                       **oracle: torch.Tensor | None):
         """Paper front-end features for a linear (Ridge) readout.
 
         (B, T, 2, H, W) -> (feats, flow):
@@ -534,7 +591,7 @@ class HDEMS(nn.Module):
                   HV Mv (event_combine): (B, 2d, H, W), or (B, 4d, H, W) for concat
           flow  = decoded optical flow (B, 2, H, W)
         """
-        flow, _conf, residual, x = self.motion_inputs(surfaces, rot_flow)
+        flow, _conf, residual, x = self.motion_inputs(surfaces, rot_flow, **oracle)
         # residual velocity -> hypervector (axis_combine), fused with X (event_combine)
         feats = combine_event_velocity(x, self.velocity_hv(residual), self.event_combine)
         return feats, flow
@@ -545,9 +602,14 @@ class HDEMS(nn.Module):
         *,
         task: str = "flow",
         rot_flow: torch.Tensor | None = None,
+        gt_flow: torch.Tensor | None = None,
+        gt_background: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """``rot_flow``: (B, 2, H, W) camera-rotation flow of the batch (sample["rot_flow"],
-        from the IMU), removed before the ego fit; ignored when motion.rot_source = none."""
+        from the IMU), removed before the ego fit; ignored when motion.rot_source = none.
+        ``gt_flow`` / ``gt_background``: ORACLE inputs (sample fields of the same name),
+        used only when motion.flow_source / background_source = gt."""
+        oracle = {"gt_flow": gt_flow, "gt_background": gt_background}
         if surface.dim() == 3:                       # (2, H, W) -> (1, 2, H, W)
             surface = surface.unsqueeze(0)
         multitime = surface.dim() == 5              # (B, T, 2, H, W)
@@ -560,7 +622,7 @@ class HDEMS(nn.Module):
             if not multitime:
                 raise ValueError(f"head {self.head_type} needs the multi-time stack "
                                  "(dataset.time_frames)")
-            m = self.motion_features(surface, rot_flow)
+            m = self.motion_features(surface, rot_flow, **oracle)
             scalars = self.motion_channels(m, surface)                # sensor px
             if self.head_type == "mfunet":
                 scalars = torch.cat([scalars, self.evidence_channels(surface, m["conf"])], dim=1)
@@ -571,7 +633,7 @@ class HDEMS(nn.Module):
 
         # ---- paper two-time / multi-scale motion path -----------------------
         if task == "segmentation" and self.head_type == "motion" and multitime:
-            flow, _conf, residual, phi = self.motion_inputs(surface, rot_flow)  # cached when enabled
+            flow, _conf, residual, phi = self.motion_inputs(surface, rot_flow, **oracle)  # cached when enabled
             mag = residual.pow(2).sum(1, keepdim=True).clamp_min(1e-12).sqrt()
             motion = torch.cat([residual, mag], dim=1)
             outputs["flow"] = flow
@@ -580,7 +642,7 @@ class HDEMS(nn.Module):
 
         # ---- paper front-end with a per-pixel readout (ridge/prototype/cnn) --
         if task == "segmentation" and self.head_type in ("ridge", "prototype", "cnn") and multitime:
-            feats, flow = self.paper_features(surface, rot_flow)
+            feats, flow = self.paper_features(surface, rot_flow, **oracle)
             outputs["flow"] = flow
             if self.head_type == "cnn":                      # trained HV-channels CNN
                 outputs["seg_logits"] = self.seg_head(feats)

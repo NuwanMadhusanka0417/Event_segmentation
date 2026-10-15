@@ -541,6 +541,53 @@ eval (`BENCHMARK=hua2025`).
 mask (16.7 ms late) and dropped scene13_dyn_test_05 and scene9_dyn_train_02.
 Checkpoints trained before that saw those labels — retrain before reporting.
 
+## Where is accuracy lost? Phase-1 diagnostics (2026-10-15)
+
+Which stage limits the score: the flow, the background model, or the head? Each
+diagnostic below swaps ONE stage for ground truth or removes it. Oracle numbers are
+upper bounds and never results; every threshold is tuned on the validation takes.
+
+| step | what changes | how |
+|---|---|---|
+| O1 | ground-truth flow (depth + poses) replaces the VSA flow | `ORACLE_INPUT=flow` (train + test) or `--flow-source gt` (test only) |
+| O2 | true static-world flow replaces rotation + ego fit | `ORACLE_INPUT=background` / `--background-source gt` |
+| O3 | no head: threshold one cue (sensor px / 12.5 ms) | `--baseline residual\|derotated\|foe\|perp` |
+| FOE | depth-free background test instead of the ego fit | `scripts/check_foe_residual.py` (validation only) |
+
+Ground truth exists only where EVIMO2 has depth, which is the tracked objects
+including the table. Elsewhere the model keeps its own flow and fit. The fields are
+`sample["gt_flow"]` and `sample["gt_background"]`, in working px over the same F0 → F1
+interval as the flow (`hdems/data/gt_flow.py`). They are flipped with the image and
+applied after the flow cache. `motion.flow_source` / `background_source` are
+front-end settings, so a checkpoint records them and eval rebuilds the oracle.
+
+**FOE test** (`hdems/foe.py`). With the rotation removed, a static point moves along
+its line through the focus of expansion, at a speed that depends on depth. So the
+part of the flow across that line (`perp`), plus any part moving against the
+expansion, is 0 for a static point at any depth. That holds even where a quadratic
+ego model fails (near objects in front of a far wall). The FOE is estimated by
+RANSAC on flow-line pairs, in homogeneous form, so sideways motion (FOE at infinity)
+works too. With too little translation (< 30% of the event pixels move ≥ 1 px after
+derotation) the cue is |flow − rotation|.
+
+Measured on 60 validation frames at half resolution (2026-10-15, local): the **FOE cue
+does not help** (AUC 0.665, vs 0.784 for the residual). The camera hardly translates
+(median 0.02 m/s), so the frames where pixels still move after derotation are mostly
+**leftover rotation**, which has no FOE. The best cue was the plain derotated flow
+(AUC 0.792, event IoU 28.9% vs 25.2% for the residual). On those high-motion frames the
+ego fit scored below chance (per-frame AUC 0.43, vs 0.67 without it); on quiet frames it
+helped (0.92 vs 0.85).
+
+```bash
+qsub run_phase1_diag.pbs        # FOE pre-test + baselines; with CKPT=... also O1/O2 at test time
+# O1 / O2 trained runs: run_segmentation.pbs with ORACLE_INPUT=flow|background|both, SAMPLES=1500,
+# and one ORACLE_INPUT=none run of the same size to compare with
+```
+
+Reading the ladder: a large gain from O1 means the front end is the bottleneck. A
+large gain from O2 (or from the FOE cue) means the background model is. If neither
+helps but the baseline is far below the head, the head and labels are where to work.
+
 ## Notes
 
 - EVIMO2 masks cover every tracked surface, including the static table — see

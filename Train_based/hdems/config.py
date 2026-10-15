@@ -38,7 +38,8 @@ _FRONTEND_KEYS = {
     "real_fpe": ("enabled", "d", "beta_pos", "beta_vel", "vel_range_px", "omega", "input", "seed"),
     "motion": ("rot_source", "imu_topic", "imu_avg_ms", "imu_calib", "ego_model", "ego_prior_px",
                "fine_flow", "fine_alpha", "fine_smooth", "extra_inputs", "vsa_consistency",
-               "imu_shift_ms", "imu_gain", "density_input", "rot_fallback"),
+               "imu_shift_ms", "imu_gain", "density_input", "rot_fallback",
+               "flow_source", "background_source"),
 }
 
 # Front-end options added after checkpoints were already trained (2026-09-29). A
@@ -64,6 +65,9 @@ _LEGACY_FRONTEND = {
     ("motion", "imu_gain"): 1.0,
     ("motion", "density_input"): True,
     ("motion", "rot_fallback"): "none",  # IMU runs before 2026-10-13: nothing removed without a gyro
+    # added 2026-10-15 (oracle diagnostics): measured flow, fitted background
+    ("motion", "flow_source"): "vsa",
+    ("motion", "background_source"): "fit",
 }
 
 # Current defaults of those options (used when the YAML leaves one out). Checkpoints
@@ -98,6 +102,11 @@ FRONTEND_DEFAULTS = {
     ("motion", "imu_gain"): 1.0,
     ("motion", "density_input"): True,
     ("motion", "rot_fallback"): "vicon",
+    # ORACLES (hdems.models.hdems, 2026-10-15) -- upper bounds, never results:
+    #   flow_source       vsa = the VSA front end | gt = ground-truth flow (depth + poses)
+    #   background_source fit = rotation + ego fit | gt = true static-world flow
+    ("motion", "flow_source"): "vsa",
+    ("motion", "background_source"): "fit",
 }
 
 

@@ -1,0 +1,99 @@
+#!/bin/bash
+#PBS -N phase1_diag
+#PBS -P mi23
+#PBS -q gpuvolta
+#PBS -l ncpus=12
+#PBS -l mem=96GB
+#PBS -l ngpus=1
+#PBS -l walltime=08:00:00
+#PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+#PBS -l wd
+#PBS -j oe
+# Phase-1 diagnostics, NO training (the oracle TRAINING runs are run_segmentation.pbs
+# with ORACLE_INPUT=flow | background | both):
+#
+#   1b  FOE pre-test: does the depth-free FOE residual separate movers better than the
+#       ego fit?  AUC + best event IoU per cue on the VALIDATION takes only.
+#   1a  training-free baselines on the published benchmark (hua2025): threshold one
+#       motion cue, no head. The threshold is tuned on the validation takes.
+#   O1/O2 at test time: an EXISTING trained head (CKPT) re-scored with ground-truth flow /
+#       background (oracles, never results). Skipped when CKPT is empty.
+#
+#   qsub run_phase1_diag.pbs
+#   results: results/phase1_<date>_<job>/  (one .txt + .json per step, and this log)
+
+set -eo pipefail
+
+RES_RATIO=2
+VAL_SEQUENCES=scene13_dyn_test_03,scene14_dyn_test_02   # held-out takes (SPLIT=official)
+VAL_FRAMES=300                 # validation frames with a mover (FOE test + thresholds)
+BASELINES="residual derotated foe"   # cues to score: residual | derotated | foe | perp
+CKPT=checkpoints/mfunet_f_bind_pv_bind_motion_r2_4000_imu-quad-fcx_official_181118790.pt
+                               # ^ the official-split run (46.8%): baselines use ITS front end and
+                               #   the test-time oracles re-score it. "" = YAML front end, no oracles
+BENCH_GT=moving
+CONFIG=configs/evimo_seg.yaml
+CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_paper1/Train_based
+VENV=/scratch/jq77/nk8155/seg1/bin/activate
+
+module load cuda
+module load python3/3.9.2
+source "${VENV}"
+if [ "$(command -v python)" != "$(dirname "${VENV}")/python" ]; then
+  echo "ERROR: no python in $(dirname "${VENV}") (found: '$(command -v python)') -- repair or recreate the venv"
+  exit 1
+fi
+python -c "import torch" || { echo "ERROR: torch does not import in ${VENV}"; exit 1; }
+cd "${CODE_DIR}"
+source scripts/nci_env.sh
+export PYTHONUNBUFFERED=1
+if [ -n "${CKPT}" ] && [ ! -f "${CKPT}" ]; then
+  echo "ERROR: CKPT ${CKPT} not found in ${CODE_DIR} -- ls checkpoints/*official*.pt, or set CKPT=\"\""
+  exit 1
+fi
+
+JOB_NUM="${PBS_JOBID%%.*}"
+JOB_NUM="${JOB_NUM:-local$$}"
+OUT="results/phase1_$(date +%Y%m%d_%H%M%S)_${JOB_NUM}"
+mkdir -p "${OUT}"
+exec > >(tee -a "${OUT}/${PBS_JOBNAME:-phase1_diag}.o${JOB_NUM}") 2>&1
+LOG_TEE_PID=$!
+trap 'exec >&- 2>&-; wait "${LOG_TEE_PID}" 2>/dev/null || true' EXIT
+CKPT_ARGS=()
+[ -n "${CKPT}" ] && CKPT_ARGS=(--checkpoint "${CKPT}")
+echo "=== Phase-1 diagnostics ${PBS_JOBID:-local} started $(date) -> ${OUT}"
+echo "    ratio ${RES_RATIO} | validation ${VAL_SEQUENCES} (${VAL_FRAMES} frames) | baselines: ${BASELINES}"
+echo "    front end: ${CKPT:-the YAML (${CONFIG})}"
+SECONDS=0
+
+# 1b. FOE pre-test (validation takes only)
+echo ">>> [$(date +%T)] FOE pre-test on the validation takes"
+python scripts/check_foe_residual.py --config "${CONFIG}" "${CKPT_ARGS[@]}" \
+  --val-sequences "${VAL_SEQUENCES}" --resolution-ratio "${RES_RATIO}" \
+  --max-frames "${VAL_FRAMES}" --device cuda --out "${OUT}/foe_check.json" \
+  | tee "${OUT}/foe_check.txt"
+
+# 1a. training-free baselines on the benchmark (threshold from the validation takes)
+for CUE in ${BASELINES}; do
+  echo ">>> [$(date +%T)] training-free baseline: |${CUE}| thresholded, no head"
+  python -m hdems.eval --config "${CONFIG}" "${CKPT_ARGS[@]}" --device cuda \
+    --resolution-ratio "${RES_RATIO}" \
+    --baseline "${CUE}" --val-sequences "${VAL_SEQUENCES}" --baseline-val-frames "${VAL_FRAMES}" \
+    --benchmark hua2025 --benchmark-gt "${BENCH_GT}" \
+    --benchmark-out "${OUT}/baseline_${CUE}.json" | tee "${OUT}/baseline_${CUE}.txt"
+done
+
+# O1 / O2 at test time on the trained head (upper bounds -- never report as results)
+if [ -n "${CKPT}" ]; then
+  for OR in "--background-source gt" "--flow-source gt" "--flow-source gt --background-source gt"; do
+    TAG=$(echo "${OR}" | sed 's/--//g; s/-source gt//g; s/ /+/g')
+    echo ">>> [$(date +%T)] trained head with GROUND-TRUTH ${TAG} (oracle)"
+    # shellcheck disable=SC2086
+    python -m hdems.eval --config "${CONFIG}" --checkpoint "${CKPT}" --device cuda ${OR} \
+      --benchmark hua2025 --benchmark-gt "${BENCH_GT}" \
+      --benchmark-out "${OUT}/oracle_${TAG}.json" | tee "${OUT}/oracle_${TAG}.txt"
+  done
+fi
+
+echo "=== finished $(date)  --  elapsed $((SECONDS/3600))h $((SECONDS%3600/60))m"
+echo "    summary: grep -h -A9 'event window 12.5' ${OUT}/*.txt"

@@ -175,6 +175,12 @@ def main() -> None:
                             ("--density-input", "density_input", "event density (a non-motion cue)")):
         ap.add_argument(flag, choices=["yes", "no"], default=None,
                         help=f"{what} as head input (overrides motion.{key}).")
+    ap.add_argument("--flow-source", choices=["vsa", "gt"], default=None,
+                    help="ORACLE: gt = train/validate on ground-truth flow (depth + poses) where "
+                         "it exists instead of the VSA flow (overrides motion.flow_source).")
+    ap.add_argument("--background-source", choices=["fit", "gt"], default=None,
+                    help="ORACLE: gt = the true static-world flow replaces rotation + ego fit "
+                         "where there is depth (overrides motion.background_source).")
     ap.add_argument("--scene-disjoint", choices=["yes", "no"], default=None,
                     help="yes = never train on any take of a test scene (strict); no = EVIMO2's "
                          "own train/eval split (other takes of the test scenes are trained on). "
@@ -238,6 +244,9 @@ def main() -> None:
         val = getattr(args, key)
         if val:
             mot[key] = val == "yes"
+    for key in ("flow_source", "background_source"):
+        if getattr(args, key):
+            mot[key] = getattr(args, key)
     dset = dict(cfg.get("dataset") or {})
     if args.scene_disjoint:
         dset["scene_disjoint"] = args.scene_disjoint == "yes"
@@ -302,6 +311,8 @@ def main() -> None:
               + f" | fine flow {opt('motion', 'fine_flow')} | VSA consistency "
               f"{opt('motion', 'vsa_consistency')} | extra inputs {opt('motion', 'extra_inputs')}"
               + f" | event density {opt('motion', 'density_input')}"
+              + "".join(f" | {k.split('_')[0]} from GROUND TRUTH (oracle)"
+                        for k in ("flow_source", "background_source") if opt("motion", k) == "gt")
               + (f" | IMU shift {opt('motion', 'imu_shift_ms')} ms gain {opt('motion', 'imu_gain')}"
                  if src == "imu" else ""))
     mean_center = bool(seg_cfg.get("ridge_mean_center", True))
@@ -337,8 +348,12 @@ def main() -> None:
     # holdout = train scenes never trained on (dataset.val_scenes).
     val_split = val_split_of(cfg)
     val_ds = build_dataset(cfg, split=val_split)
-    scenes = cfg.get("dataset", {}).get("val_scenes") if val_split == "holdout" else None
-    print(f"[fit] validation split: {val_split}" + (f"  (scenes {scenes})" if scenes else ""))
+    held = None
+    if val_split == "holdout":           # val_sequences (takes) win over val_scenes
+        ds_cfg = cfg.get("dataset", {})
+        held = (f"takes {ds_cfg['val_sequences']}" if ds_cfg.get("val_sequences")
+                else f"scenes {ds_cfg.get('val_scenes')}")
+    print(f"[fit] validation split: {val_split}" + (f"  ({held}, {len(val_ds)} frames)" if held else ""))
     if val_split == cfg.get("dataset", {}).get("eval_split", "eval"):
         print("[fit] WARNING: validating on the eval split -- eval scores will be optimistic")
 

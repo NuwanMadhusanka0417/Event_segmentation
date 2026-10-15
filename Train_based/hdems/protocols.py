@@ -41,7 +41,7 @@ import torch.nn.functional as F
 from hdems.data.evimo2_reader import gt_key, load_meta
 from hdems.data.motion_labels import MotionParams, sequence_motion
 from hdems.grouping import GroupingParams, group_objects
-from hdems.seg_features import rot_flow_of, score_pixel_mask
+from hdems.seg_features import motion_kwargs, score_pixel_mask
 from hdems.temporal_filter import TemporalFilter
 
 GT_MODES = ("moving", "moving_slow", "tracked")
@@ -245,14 +245,21 @@ class GTFrames:
 
 
 def forward_sample(model: Any, sample: dict, device: torch.device):
-    """Model output for one dataset sample -> (out dict, surface, rot_flow)."""
+    """Model output for one dataset sample -> (out dict, surface, motion fields).
+
+    The motion fields (motion_kwargs: rot_flow, and gt_flow / gt_background for
+    oracle runs) are what the model was given, for re-use by the grouping."""
     surface = sample["surface"].unsqueeze(0).to(device)
-    rot = rot_flow_of(sample, device)
-    return model(surface, task="segmentation", rot_flow=rot), surface, rot
+    aux = motion_kwargs(sample, device)
+    return model(surface, task="segmentation", **aux), surface, aux
 
 
 def moving_prob(out: dict) -> torch.Tensor:
-    """(H, W) P(moving) at working resolution from a model output."""
+    """(H, W) P(moving) at working resolution from a model output. A training-free
+    baseline (hdems.baselines) gives its cue instead ("moving_score", sensor px):
+    thresholded the same way, at the baseline's decision_threshold."""
+    if "moving_score" in out:
+        return out["moving_score"][0, 0]
     logits = out["seg_logits"]
     if logits.shape[1] == 2:
         return logits.softmax(dim=1)[0, 1]
@@ -406,7 +413,7 @@ def run_benchmark(
         # 2. run the model on them
         for n, (lab, k, score_it) in enumerate(order):
             sample = dataset[k]
-            out, surface, rot = forward_sample(model, sample, device)
+            out, surface, aux = forward_sample(model, sample, device)
             stats["forward"] += 1
             prob = moving_prob(out)
             if tf is not None:
@@ -423,7 +430,8 @@ def run_benchmark(
                     raise ValueError("pred='objects' needs a head that returns the flow")
                 res = out.get("residual")
                 if res is None:
-                    res, _ = model.residual_from_flow(out["flow"], surface, rot)
+                    res, _ = model.residual_from_flow(out["flow"], surface, aux.get("rot_flow"),
+                                                      aux.get("gt_background"))
                 ev = score_pixel_mask(sample, surface)[0]
                 objects = group_objects(res[0].cpu().numpy(),
                                         (pred_t & ev).cpu().numpy(), grouping)

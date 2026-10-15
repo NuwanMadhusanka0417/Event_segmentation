@@ -77,6 +77,15 @@ FINE_FLOW=yes          # yes | no  second, lightly pooled flow estimate (slow / 
 VSA_CONS=yes           # yes | no  VSA ego-consistency maps (descriptor match at the background-
                        #           predicted position, 12.5 / 25 / 50 ms; 3 extra encodes per sample)
 EXTRA_INPUTS=yes       # yes | no  derotated flow vector + rotation speed as head inputs
+ORACLE_INPUT=none      # DIAGNOSTIC runs only (upper bounds, never results) -- trained AND
+                       # tested with ground truth (depth + poses) where EVIMO2 has it:
+                       #   none       = the real pipeline
+                       #   flow       = O1: ground-truth flow instead of the VSA flow
+                       #   background = O2: true static-world flow instead of rotation + ego fit
+                       #   both       = O1 + O2
+                       # Diagnostic size: SAMPLES=1500. Compare with a none run of the same size:
+                       # a big gain from flow = the front end is the bottleneck; from
+                       # background = the ego model is; from neither = the head / labels are.
 
 CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_paper1/Train_based
 CONFIG=configs/evimo_seg.yaml
@@ -116,6 +125,15 @@ MOT_TAG="_${ROT_SOURCE}-${EGO_MODEL:0:4}-"
 [ "${VSA_CONS}" = "yes" ] && MOT_TAG="${MOT_TAG}c"
 [ "${EXTRA_INPUTS}" = "yes" ] && MOT_TAG="${MOT_TAG}x"
 [ "${DENSITY}" = "no" ] && MOT_TAG="${MOT_TAG}_noden"
+ORACLE_ARGS=()
+case "${ORACLE_INPUT}" in
+  none) ;;
+  flow) ORACLE_ARGS=(--flow-source gt) ;;
+  background) ORACLE_ARGS=(--background-source gt) ;;
+  both) ORACLE_ARGS=(--flow-source gt --background-source gt) ;;
+  *) echo "ERROR: ORACLE_INPUT must be none | flow | background | both"; exit 1 ;;
+esac
+[ "${ORACLE_INPUT}" != "none" ] && MOT_TAG="${MOT_TAG}_ORACLE-${ORACLE_INPUT}"
 SPLIT_TAG=""
 [ "${SPLIT}" = "official" ] && SPLIT_TAG="_official"
 if [ "${SPLIT}" = "official" ]; then
@@ -178,6 +196,7 @@ printf '  %-16s %s\n' \
   VSA_CONS     "${VSA_CONS}  (VSA ego-consistency maps)" \
   EXTRA_INPUTS "${EXTRA_INPUTS}" \
   DENSITY      "${DENSITY}  (event density as a head input)" \
+  ORACLE_INPUT "${ORACLE_INPUT}$( [ "${ORACLE_INPUT}" != "none" ] && echo "  (GROUND-TRUTH input: diagnostic, NOT a result)")" \
   SPLIT        "${SPLIT}$( [ "${SPLIT}" = "official" ] && echo "  (validation: ${VAL_SEQUENCES})")" \
   CONFIG       "${CONFIG}"
 echo
@@ -245,7 +264,7 @@ python scripts/fit_ridge_head.py --config "${CONFIG}" \
   --augment "${AUGMENT}" --hv-input "${HV_INPUT}" \
   --rot-source "${ROT_SOURCE}" --ego-model "${EGO_MODEL}" --fine-flow "${FINE_FLOW}" \
   --vsa-consistency "${VSA_CONS}" --extra-inputs "${EXTRA_INPUTS}" --density-input "${DENSITY}" \
-  "${SPLIT_ARGS[@]}" \
+  "${SPLIT_ARGS[@]}" "${ORACLE_ARGS[@]}" \
   --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"
 
 # ---------------------------------------------------------------------------
