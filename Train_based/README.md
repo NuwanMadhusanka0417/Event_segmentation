@@ -394,16 +394,33 @@ foreground IoU in motion mode.
 ## One colour per moving object
 
 The CNN answers *"is this pixel moving?"*. `hdems/grouping.py` then answers
-*"which object?"*, the way EMSGC and cascaded multi-model fitting do: every
-independently moving object has one rigid motion, so its pixels share one
-parametric (affine) flow model — even when the flow **direction** varies across
-the object (rotation, scaling). Pixels are grouped by the model they fit:
+*"which object?"*. There are two methods (`grouping.method`):
 
-1. sequential RANSAC on the ego-compensated VSA flow of the CNN's moving pixels
-2. each pixel joins the model it fits best
-3. one model covering two separate regions → two objects
-4. neighbouring groups whose joint motion still fits one model are merged (so one
-   object does not split into several colours); small leftovers join a neighbour
+- **`spatial`** (default since 2026-10-15) groups by location first. Moving event
+  pixels within `adjacency_px` of each other form one object; events are sparse edges,
+  so they are linked across a small gap. A group can optionally be cut in two by
+  motion (`split_depth`), and groups with little residual motion can be dropped
+  (`min_motion_px`). Both are off by default.
+- **`motion`** (the original) groups by motion first. Sequential RANSAC fits affine
+  motions, each pixel joins its best model, separate regions are split, and
+  neighbours whose joint motion fits are merged.
+
+Measured on 60 validation frames with ground-truth moving pixels, so only the
+grouping is scored (`scripts/check_grouping.py`):
+
+| | object mIoU | objects split | groups gluing 2 objects |
+|---|---|---|---|
+| motion, old settings (6 px link, 0.25 px filter) | 0.747 | 19% | 15% |
+| motion, same link / filter as below | 0.811 | 20% | 10% |
+| **spatial, 4 px link, no filter, no split** | **0.845** | **1%** | 17% |
+| spatial + motion split | 0.806 | 14% | 14% |
+
+Motion first breaks objects into pieces, because the flow is noisy and pooled. One
+object's pixels fall into several affine models, and the same rim effect defeats
+the optional motion split. The motion filter at the label threshold drops real slow
+movers. Touching objects stay glued (17%); with this flow, motion cannot tell them
+apart reliably. Whether the filter pays off against a trained head's false positives
+is checked by `check_grouping.py --fg head` (in `run_phase1_diag.pbs`).
 
 Settings: `grouping:` in the config (full-resolution units, scaled by
 `resolution_ratio`). It runs in `hdems.eval` only — training is unchanged.
@@ -577,6 +594,25 @@ does not help** (AUC 0.665, vs 0.784 for the residual). The camera hardly transl
 (AUC 0.792, event IoU 28.9% vs 25.2% for the residual). On those high-motion frames the
 ego fit scored below chance (per-frame AUC 0.43, vs 0.67 without it); on quiet frames it
 helped (0.92 vs 0.85).
+
+**The ego model's form is not the issue** (`motion.ego_model: planar8` = the paper's
+8-parameter plane flow, Hua et al. 2025 Eq. 6, a quadratic with 4 coefficients tied or
+zeroed; same 60 frames, same flow): AUC planar8 0.795 / quadratic 0.784 / affine 0.790,
+best event IoU 25.4 / 25.2 / 25.2%. On the leftover-motion frames all three stay below
+chance (per-frame 0.39 / 0.43 / 0.44). Whatever goes wrong there, a different
+background model does not fix it.
+
+**What does go wrong: big movers capture the fit.** On frames where moving objects
+cover more than half of the scored pixels (9 of 60), every robust fit models the mover
+as the background, and the residual inverts (AUC 0.33; the derotated flow gives 0.55).
+The IMU check rules out the gyro: AUC 0.783–0.785 for every window, shift and gain, and
+the flow is 0.86× ground truth, not 1.28×. A tighter anchor (`ego_prior_px` 0–2) also
+does not help. What does help is the **capture fallback** `motion.ego_gate_px` (default
+0.5). When the fitted background, with rotation excluded, still moves more than this
+at the median event pixel, that frame keeps only the IMU rotation. Training-free AUC
+rises from 0.784 to 0.801, and best event IoU from 25.2 to 29.5%. Old checkpoints
+restore it as 0 (off). `scripts/check_ego_prior.py` sweeps anchor and fallback values,
+and `run_phase1_diag.pbs` runs that sweep on all validation frames.
 
 ```bash
 qsub run_phase1_diag.pbs        # FOE pre-test + baselines; with CKPT=... also O1/O2 at test time

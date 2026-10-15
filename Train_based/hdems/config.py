@@ -39,7 +39,7 @@ _FRONTEND_KEYS = {
     "motion": ("rot_source", "imu_topic", "imu_avg_ms", "imu_calib", "ego_model", "ego_prior_px",
                "fine_flow", "fine_alpha", "fine_smooth", "extra_inputs", "vsa_consistency",
                "imu_shift_ms", "imu_gain", "density_input", "rot_fallback",
-               "flow_source", "background_source"),
+               "flow_source", "background_source", "ego_gate_px"),
 }
 
 # Front-end options added after checkpoints were already trained (2026-09-29). A
@@ -68,6 +68,7 @@ _LEGACY_FRONTEND = {
     # added 2026-10-15 (oracle diagnostics): measured flow, fitted background
     ("motion", "flow_source"): "vsa",
     ("motion", "background_source"): "fit",
+    ("motion", "ego_gate_px"): 0.0,       # no capture fallback before 2026-10-15
 }
 
 # Current defaults of those options (used when the YAML leaves one out). Checkpoints
@@ -107,6 +108,8 @@ FRONTEND_DEFAULTS = {
     #   background_source fit = rotation + ego fit | gt = true static-world flow
     ("motion", "flow_source"): "vsa",
     ("motion", "background_source"): "fit",
+    # capture fallback (validation 2026-10-15: best event IoU 25.2 -> 29.5%, training-free)
+    ("motion", "ego_gate_px"): 0.5,
 }
 
 

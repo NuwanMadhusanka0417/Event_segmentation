@@ -170,6 +170,11 @@ class HDEMS(nn.Module):
         #   flow_source / background_source = gt: ORACLES (sample["gt_flow"] /
         #   sample["gt_background"]) -- where the pipeline would be with perfect flow or
         #   a perfect background model. Pixels without ground truth keep vsa / fit.
+        #   ego_gate_px      capture fallback: when the fitted background (rotation
+        #                    excluded) moves more than this at the median event pixel
+        #                    (sensor px / interval), the fit has taken a large mover for the
+        #                    background -- the frame keeps only the rotation (no ego fit)
+        self.ego_gate_px = float(frontend_option(cfg, "motion", "ego_gate_px"))
         self.flow_source = str(frontend_option(cfg, "motion", "flow_source"))
         self.background_source = str(frontend_option(cfg, "motion", "background_source"))
         if self.flow_source not in FLOW_SOURCES:
@@ -328,9 +333,38 @@ class HDEMS(nn.Module):
         replaces the fitted background wherever it is known (oracle).
         """
         residual, background = self._background_fit(flow, surfaces, rot_flow)
+        rot = self._rot(rot_flow, flow)
+        if self.ego_gate_px and rot is not None:
+            residual, background = self._capture_gate(flow, surfaces, rot, residual, background)
         if self.background_source == "gt":
             background = self._fill(self._oracle("gt_background", gt_background, flow), background)
             residual = flow - background
+        return residual, background
+
+    def _capture_gate(self, flow: torch.Tensor, surfaces: torch.Tensor, rot: torch.Tensor,
+                      residual: torch.Tensor, background: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
+        """motion.ego_gate_px: drop the ego fit of a frame whose fit took a mover for the
+        background.
+
+        Measured 2026-10-15 (60 validation frames): when a mover covers > 50% of the
+        scored pixels, the robust fit models IT, and the residual inverts (AUC 0.33);
+        the derotated flow alone gives 0.55. The IMU has removed the rotation and the
+        camera hardly translates, so a fitted background that still moves > 0.5 px at
+        the median event pixel is a mover, not the scene. Those frames keep only the
+        rotation as background (residual = derotated flow). Anchoring the fit more
+        tightly did not help (ego_prior_px 0..2: AUC 0.781-0.785).
+        """
+        fitted = (background - rot).norm(dim=1) * self.res_ratio          # sensor px
+        valid = self.ego_mask(surfaces)
+        captured = [b for b in range(flow.shape[0])
+                    if valid[b].any() and float(fitted[b][valid[b]].median()) > self.ego_gate_px]
+        if not captured:
+            return residual, background
+        residual, background = residual.clone(), background.clone()
+        for b in captured:
+            background[b] = rot[b]
+            residual[b] = flow[b] - rot[b]
         return residual, background
 
     def _background_fit(self, flow: torch.Tensor, surfaces: torch.Tensor,

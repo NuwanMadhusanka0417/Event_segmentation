@@ -16,7 +16,9 @@ and the AUC split by camera TRANSLATION speed (Vicon, for the analysis only): th
 FOE cue should help most where the camera translates.
 
 Cues: residual (current pipeline: IMU + ego fit) | derotated |flow - rotation| | perp
-| foe (perp + wrong-sign part) | min(residual, foe) | sqrt(residual * foe).
+| foe (perp + wrong-sign part) | min(residual, foe) | sqrt(residual * foe), and
+res:<model> = the residual with another ego model on the SAME flow (--compare-ego,
+e.g. planar8 = the 8-parameter plane flow of Hua et al. 2025).
 
     python scripts/check_foe_residual.py --config configs/evimo_seg.yaml \
         --val-sequences scene13_dyn_test_03,scene14_dyn_test_02 --resolution-ratio 2 \
@@ -45,6 +47,7 @@ from hdems.eval import load_config  # noqa: E402
 from hdems.baselines import THRESHOLD_GRID_PX  # noqa: E402
 from hdems.foe import FoeParams, foe_cue_maps  # noqa: E402
 from hdems.models.hdems import HDEMS  # noqa: E402
+from hdems.models.motion import EGO_MODELS  # noqa: E402
 from hdems.protocols import GTFrames, _spread_cap  # noqa: E402
 from hdems.seg_features import motion_kwargs, score_pixel_mask  # noqa: E402
 
@@ -79,6 +82,8 @@ def main() -> None:
     ap.add_argument("--inlier-px", type=float, default=FoeParams.inlier_px,
                     help="sensor px / interval: perpendicular residual of an FOE inlier")
     ap.add_argument("--min-moving-frac", type=float, default=FoeParams.min_moving_frac)
+    ap.add_argument("--compare-ego", nargs="*", choices=list(EGO_MODELS), default=["planar8"],
+                    help="also score the residual of these ego models (same flow, same rotation)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", default=None, help="write the numbers to this .json")
     args = ap.parse_args()
@@ -101,6 +106,9 @@ def main() -> None:
     params = FoeParams(min_flow_px=args.min_flow, inlier_px=args.inlier_px,
                        min_moving_frac=args.min_moving_frac)
     r = model.res_ratio
+    own_ego = model.ego_model
+    other_ego = [e for e in dict.fromkeys(args.compare_ego) if e != own_ego]
+    cues = list(CUES) + [f"res:{e}" for e in other_ego]
 
     ds = build_dataset(cfg, args.split)
     gtf = GTFrames(ds, [args.window_ms])
@@ -110,9 +118,9 @@ def main() -> None:
           f"with a mover, using {len(ks)}; ratio {r}; rotation {model.rot_source}; "
           f"ego model {model.ego_model}; FOE {params}", flush=True)
 
-    px = {c: [] for c in CUES}             # pixel-level, for the AUC
+    px = {c: [] for c in cues}             # pixel-level, for the AUC
     px_y, px_frame = [], []
-    ev = {c: [] for c in CUES}             # per-frame event values, for the IoU
+    ev = {c: [] for c in cues}             # per-frame event values, for the IoU
     ev_g = []
     frames = []
     for n, k in enumerate(ks):
@@ -125,11 +133,18 @@ def main() -> None:
         cue = {"residual": res, "derotated": maps["derotated"], "perp": maps["perp"],
                "foe": maps["foe"], "min(res,foe)": torch.minimum(res, maps["foe"]),
                "sqrt(res*foe)": torch.sqrt(res * maps["foe"])}
+        for e in other_ego:                        # the same flow + rotation, another ego model
+            model.ego_model = e
+            try:
+                res_e, _ = model.background_fit(m["flow"], surf, m["rot"])
+            finally:
+                model.ego_model = own_ego
+            cue[f"res:{e}"] = res_e.norm(dim=1, keepdim=True)
         cue = {c: (v * r)[0, 0] for c, v in cue.items()}                   # sensor px
         lab = s["mask"].to(dev)
         sc = score_pixel_mask(s, surf)[0] & (lab != 255)
         y = (lab[sc] == 1).cpu().numpy()
-        for c in CUES:
+        for c in cues:
             px[c].append(cue[c][sc].cpu().numpy())
         px_y.append(y)
         px_frame.append(np.full(y.size, n))
@@ -137,7 +152,7 @@ def main() -> None:
         gt, evs, fi, _ts = gtf(k)
         Hf, Wf = gt.shape
         x_e, y_e = evs[args.window_ms]
-        for c in CUES:
+        for c in cues:
             full = F.interpolate(cue[c][None, None], size=(Hf, Wf), mode="nearest")[0, 0]
             ev[c].append(full.cpu().numpy()[y_e, x_e])
         ev_g.append(gt[y_e, x_e])
@@ -147,7 +162,7 @@ def main() -> None:
                "foe_defined": f.e is not None, "foe_inliers": f.inliers, "moving_frac": f.moving_frac,
                "movers": int(y.sum()), "static": int((~y).sum())}
         if 0 < y.sum() < y.size:                         # per-frame AUC: where does a cue win?
-            rec["auc"] = {c: float(roc_auc_score(y, px[c][-1])) for c in CUES}
+            rec["auc"] = {c: float(roc_auc_score(y, px[c][-1])) for c in cues}
         frames.append(rec)
         if (n + 1) % 25 == 0:
             print(f"  {n + 1}/{len(ks)}", flush=True)
@@ -171,7 +186,7 @@ def main() -> None:
           f"camera translation median {np.nanmedian(speeds):.2f} m/s")
     hdr = "".join(f"{f'AUC v{lo:g}-{hi:g}':>13s}" for lo, hi in TRANS_BUCKETS)
     print(f"\n{'cue':<15s}{'AUC':>7s}{hdr}{'best IoU':>10s}{'@ px':>7s}")
-    for c in CUES:
+    for c in cues:
         x_all = np.concatenate(px[c])
         auc = roc_auc_score(y_all, x_all) if 0 < y_all.sum() < y_all.size else float("nan")
         buckets = []
@@ -189,12 +204,14 @@ def main() -> None:
     # frames where the FOE was estimated: per-frame AUC (no pooling across frames)
     foe_fr = [f for f in frames if f["foe_defined"] and "auc" in f]
     if foe_fr:
-        print(f"\nper-frame AUC on the {len(foe_fr)} frames WITH an FOE (median): "
-              + "  ".join(f"{c} {np.median([f['auc'][c] for f in foe_fr]):.3f}" for c in CUES))
+        print(f"\nper-frame AUC (median) on the {len(foe_fr)} frames with LEFTOVER motion "
+              f"(>= {params.min_moving_frac:.0%} of event px move >= {params.min_flow_px:g} px after "
+              f"derotation -> FOE estimated):\n  "
+              + "  ".join(f"{c} {np.median([f['auc'][c] for f in foe_fr]):.3f}" for c in cues))
     rest = [f for f in frames if not f["foe_defined"] and "auc" in f]
     if rest:
-        print(f"per-frame AUC on the {len(rest)} frames without (median): "
-              + "  ".join(f"{c} {np.median([f['auc'][c] for f in rest]):.3f}" for c in CUES))
+        print(f"per-frame AUC (median) on the {len(rest)} QUIET frames:\n  "
+              + "  ".join(f"{c} {np.median([f['auc'][c] for f in rest]):.3f}" for c in cues))
     n_b = [int(np.sum((speeds >= lo) & (speeds < hi))) for lo, hi in TRANS_BUCKETS]
     print(f"(frames per translation bucket: {n_b}; IoU = event IoU {args.window_ms:g} ms at the "
           f"best threshold on THESE frames -- a validation number, not a test result)")

@@ -1,0 +1,70 @@
+{
+ "fg": "gt",
+ "frames": 60,
+ "methods": {
+  "motion first (old)": {
+   "obj_miou": 0.7472410678363104,
+   "pred_per_frame": 1.45,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 1.130952380952381,
+   "split_pct": 19.047619047619047,
+   "merged_pct": 14.942528735632186
+  },
+  "spatial, link 2, filter 0": {
+   "obj_miou": 0.8173363831587162,
+   "pred_per_frame": 1.35,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.9880952380952381,
+   "split_pct": 3.571428571428571,
+   "merged_pct": 14.814814814814813
+  },
+  "spatial, link 2, filter 0.25": {
+   "obj_miou": 0.7687994366996918,
+   "pred_per_frame": 1.2833333333333334,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.9404761904761905,
+   "split_pct": 2.380952380952381,
+   "merged_pct": 15.584415584415584
+  },
+  "spatial, link 4, filter 0": {
+   "obj_miou": 0.8448111022758388,
+   "pred_per_frame": 1.2,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.9642857142857143,
+   "split_pct": 1.1904761904761905,
+   "merged_pct": 16.666666666666664
+  },
+  "spatial, link 4, filter 0.25": {
+   "obj_miou": 0.7951512383302606,
+   "pred_per_frame": 1.15,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.9285714285714286,
+   "split_pct": 1.1904761904761905,
+   "merged_pct": 17.391304347826086
+  },
+  "spatial, link 6, filter 0": {
+   "obj_miou": 0.8287984971676284,
+   "pred_per_frame": 1.0666666666666667,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.9642857142857143,
+   "split_pct": 0.0,
+   "merged_pct": 20.3125
+  },
+  "spatial, link 6, filter 0.25": {
+   "obj_miou": 0.7787984971676284,
+   "pred_per_frame": 1.0166666666666666,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.9285714285714286,
+   "split_pct": 0.0,
+   "merged_pct": 21.311475409836063
+  },
+  "spatial+split d2 g0.5": {
+   "obj_miou": 0.8058522890253912,
+   "pred_per_frame": 1.5333333333333334,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 1.1785714285714286,
+   "split_pct": 14.285714285714285,
+   "merged_pct": 14.130434782608695
+  }
+ }
+}

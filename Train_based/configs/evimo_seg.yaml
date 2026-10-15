@@ -94,18 +94,28 @@ motion_label:            # label_mode: motion — thresholds in IMAGE PIXELS per
   #                        in the mask with at least this many pixels
 
 grouping:                # ONE COLOUR PER MOVING OBJECT (eval + event-colour figures)
-  enabled: true          # the CNN's moving pixels are grouped by the motion model they fit
-  #                        (affine flow per object, sequential RANSAC + merge of neighbours),
-  #                        so a whole object gets one colour even if its flow direction varies.
-  #                        Distances below are FULL-resolution; resolution_ratio scales them.
-  tol_px: 0.7            # a pixel belongs to a motion model within this flow error (px/interval)
+  enabled: true          # Distances below are FULL-resolution; resolution_ratio scales them.
+  method: spatial        # spatial = the moving event pixels within adjacency_px of each other are
+  #                        one object (+ optional motion split, split_depth) | motion = the old
+  #                        motion-first grouping (affine RANSAC + merge of neighbours).
+  #                        Validation 2026-10-15 (60 frames, ground-truth moving pixels, object
+  #                        mIoU): motion 0.747 (19% of objects split into pieces) | spatial, link
+  #                        4, no motion filter 0.845 (1% split, 17% of groups glue two objects)
+  adjacency_px: 4        # pixels this close are linked (events are sparse edges). 2: 0.817,
+  #                        4: 0.845, 6: 0.829 (spatial, ground-truth pixels)
   min_object_px: 160     # smaller groups are not objects
   max_objects: 8
-  merge_tol_px: 0.7      # neighbouring groups whose joint motion fits within this are one object
-  adjacency_px: 6        # groups this close count as neighbours
-  min_motion_px: 0.25    # an object must move at least this much RELATIVE TO THE CAMERA
-  #                        (px per 12.5 ms interval = motion_label.move_px 1.0 per 50 ms
-  #                        window), else it is background the CNN marked by mistake
+  min_motion_px: 0.0     # drop groups whose median residual flow is below this (px per 12.5 ms):
+  #                        meant to remove the classifier's false positives on static background,
+  #                        but 0.25 (= the 1 px / 50 ms label threshold) also drops real slow movers
+  #                        (0.845 -> 0.795 on ground-truth pixels). Re-check with the trained head:
+  #                        scripts/check_grouping.py --fg head (run_phase1_diag.pbs)
+  split_depth: 0         # spatial: cut a group in two by motion, recursively (0 = off). Off: the
+  #                        pooled flow makes object rims look like a second motion (0.806 vs 0.845)
+  split_min_diff_px: 2.0 #   the two motions must differ by this (px per 12.5 ms) ...
+  split_gain: 0.5        #   ... and explain the flow this much better (median error ratio)
+  tol_px: 0.7            # motion-model fit tolerance (px/interval): method motion, and the split
+  merge_tol_px: 0.7      # method motion: neighbouring groups whose joint motion fits are merged
   ransac_iters: 300
 
 train:
@@ -217,6 +227,11 @@ motion:                  # how motion reaches the head (2026-10-11). Benchmark b
   ego_prior_px: 1.0      # with the rotation removed, the fit STARTS at "nothing moves" with this
   #                        scale (SENSOR px per 12.5 ms), so a large mover cannot capture it.
   #                        0 = plain least-squares start
+  ego_gate_px: 0.5       # capture fallback: when the FITTED background (rotation excluded) moves
+  #                        > this (sensor px / 12.5 ms) at the median event pixel, the fit took a
+  #                        large mover for the background -> that frame keeps only the rotation.
+  #                        Validation (60 frames): best event IoU 25.2 -> 29.5%; frames where
+  #                        movers are > 50% of the pixels: AUC 0.33 -> 0.55. 0 = off
   fine_flow: true        # second Eq.12 flow from the SAME cost volume (no extra cost volume):
   fine_alpha: 0.6        #   lower threshold (0.85 snaps sub-pixel motion to 0) ...
   fine_smooth: 15        #   ... and lighter pooling (full-res px; scaled by resolution_ratio)

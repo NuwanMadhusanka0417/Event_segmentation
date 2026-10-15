@@ -1,0 +1,149 @@
+{
+ "derotated": {
+  "auc": 0.7915571820823021,
+  "frame_auc_mover_dominated": 0.5529313824817947,
+  "frame_auc_other": 0.8675286369083032,
+  "best_iou": 0.2894730711687725,
+  "threshold": 1.25
+ },
+ "prior 0": {
+  "auc": 0.7846560955888234,
+  "frame_auc_mover_dominated": 0.3458558558684393,
+  "frame_auc_other": 0.9238449259970063,
+  "best_iou": 0.2525742954932277,
+  "threshold": 0.5
+ },
+ "prior 0.25": {
+  "auc": 0.7823776581024691,
+  "frame_auc_mover_dominated": 0.3458558558684393,
+  "frame_auc_other": 0.9127904372750651,
+  "best_iou": 0.24749862111888288,
+  "threshold": 0.5
+ },
+ "prior 0.5": {
+  "auc": 0.7808514803896925,
+  "frame_auc_mover_dominated": 0.3401816052133394,
+  "frame_auc_other": 0.9189414124851714,
+  "best_iou": 0.25049149421283545,
+  "threshold": 0.5
+ },
+ "prior 1": {
+  "auc": 0.7843094441181635,
+  "frame_auc_mover_dominated": 0.3292010416991368,
+  "frame_auc_other": 0.9208326346059488,
+  "best_iou": 0.25188671819738334,
+  "threshold": 0.5
+ },
+ "prior 2": {
+  "auc": 0.785034728134688,
+  "frame_auc_mover_dominated": 0.3446751883728861,
+  "frame_auc_other": 0.9227797549174881,
+  "best_iou": 0.2523321727642845,
+  "threshold": 0.5
+ },
+ "prior 0 + gate 0.5": {
+  "auc": 0.8008806949626983,
+  "frame_auc_mover_dominated": 0.5529313824817947,
+  "frame_auc_other": 0.9277905611367437,
+  "best_iou": 0.30167417285492226,
+  "threshold": 1.25
+ },
+ "prior 0 + gate 1": {
+  "auc": 0.7734730036044151,
+  "frame_auc_mover_dominated": 0.5260110184822803,
+  "frame_auc_other": 0.9288373981063972,
+  "best_iou": 0.2719790445224841,
+  "threshold": 1.25
+ },
+ "prior 0 + gate 2": {
+  "auc": 0.753556970443146,
+  "frame_auc_mover_dominated": 0.3458558558684393,
+  "frame_auc_other": 0.9238449259970063,
+  "best_iou": 0.25299686519342485,
+  "threshold": 0.5
+ },
+ "prior 0.25 + gate 0.5": {
+  "auc": 0.8051155157839882,
+  "frame_auc_mover_dominated": 0.5529313824817947,
+  "frame_auc_other": 0.9127904372750651,
+  "best_iou": 0.2997387862734601,
+  "threshold": 1.25
+ },
+ "prior 0.25 + gate 1": {
+  "auc": 0.7720331603595467,
+  "frame_auc_mover_dominated": 0.5260110184822803,
+  "frame_auc_other": 0.9250815433336103,
+  "best_iou": 0.27261637594072147,
+  "threshold": 1.25
+ },
+ "prior 0.25 + gate 2": {
+  "auc": 0.7514485280700063,
+  "frame_auc_mover_dominated": 0.3458558558684393,
+  "frame_auc_other": 0.9127904372750651,
+  "best_iou": 0.24792119081908004,
+  "threshold": 0.5
+ },
+ "prior 0.5 + gate 0.5": {
+  "auc": 0.8016408001408082,
+  "frame_auc_mover_dominated": 0.5529313824817947,
+  "frame_auc_other": 0.9149459401281727,
+  "best_iou": 0.2963876601145103,
+  "threshold": 1.25
+ },
+ "prior 0.5 + gate 1": {
+  "auc": 0.7526326473068241,
+  "frame_auc_mover_dominated": 0.4696450601911097,
+  "frame_auc_other": 0.9249575974665228,
+  "best_iou": 0.26367306931722273,
+  "threshold": 1.25
+ },
+ "prior 0.5 + gate 2": {
+  "auc": 0.7502635505582339,
+  "frame_auc_mover_dominated": 0.3401816052133394,
+  "frame_auc_other": 0.9189414124851714,
+  "best_iou": 0.2509140639130326,
+  "threshold": 0.5
+ },
+ "prior 1 + gate 0.5": {
+  "auc": 0.8007720472026194,
+  "frame_auc_mover_dominated": 0.5529313824817947,
+  "frame_auc_other": 0.9160284215574832,
+  "best_iou": 0.2949767104539225,
+  "threshold": 1.25
+ },
+ "prior 1 + gate 1": {
+  "auc": 0.773087682719261,
+  "frame_auc_mover_dominated": 0.5260110184822803,
+  "frame_auc_other": 0.9252547117220765,
+  "best_iou": 0.27180546544268813,
+  "threshold": 1.25
+ },
+ "prior 1 + gate 2": {
+  "auc": 0.7534585804612528,
+  "frame_auc_mover_dominated": 0.3292010416991368,
+  "frame_auc_other": 0.9208326346059488,
+  "best_iou": 0.2523092878975805,
+  "threshold": 0.5
+ },
+ "prior 2 + gate 0.5": {
+  "auc": 0.8006141438923011,
+  "frame_auc_mover_dominated": 0.5529313824817947,
+  "frame_auc_other": 0.9259015458205795,
+  "best_iou": 0.30151026452468205,
+  "threshold": 1.25
+ },
+ "prior 2 + gate 1": {
+  "auc": 0.773560397897183,
+  "frame_auc_mover_dominated": 0.5260110184822803,
+  "frame_auc_other": 0.9269923260310042,
+  "best_iou": 0.27191341061107094,
+  "threshold": 1.25
+ },
+ "prior 2 + gate 2": {
+  "auc": 0.7539670788987376,
+  "frame_auc_mover_dominated": 0.3446751883728861,
+  "frame_auc_other": 0.9227797549174881,
+  "best_iou": 0.252751652486649,
+  "threshold": 0.5
+ }
+}

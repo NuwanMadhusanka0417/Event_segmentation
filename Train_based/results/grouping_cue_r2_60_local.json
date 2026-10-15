@@ -1,0 +1,70 @@
+{
+ "fg": "cue",
+ "frames": 60,
+ "methods": {
+  "motion first (old)": {
+   "obj_miou": 0.28733197623351064,
+   "pred_per_frame": 5.783333333333333,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.9880952380952381,
+   "split_pct": 22.61904761904762,
+   "merged_pct": 2.881844380403458
+  },
+  "spatial, link 2, filter 0": {
+   "obj_miou": 0.2892164206937646,
+   "pred_per_frame": 4.683333333333334,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.8928571428571429,
+   "split_pct": 14.285714285714285,
+   "merged_pct": 4.270462633451958
+  },
+  "spatial, link 2, filter 0.25": {
+   "obj_miou": 0.2892164206937646,
+   "pred_per_frame": 4.683333333333334,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.8928571428571429,
+   "split_pct": 14.285714285714285,
+   "merged_pct": 4.270462633451958
+  },
+  "spatial, link 4, filter 0": {
+   "obj_miou": 0.2841421881388127,
+   "pred_per_frame": 4.116666666666666,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.8809523809523809,
+   "split_pct": 13.095238095238097,
+   "merged_pct": 4.8582995951417
+  },
+  "spatial, link 4, filter 0.25": {
+   "obj_miou": 0.2841421881388127,
+   "pred_per_frame": 4.116666666666666,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.8809523809523809,
+   "split_pct": 13.095238095238097,
+   "merged_pct": 4.8582995951417
+  },
+  "spatial, link 6, filter 0": {
+   "obj_miou": 0.28280147739422823,
+   "pred_per_frame": 3.9166666666666665,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.8333333333333334,
+   "split_pct": 9.523809523809524,
+   "merged_pct": 4.680851063829787
+  },
+  "spatial, link 6, filter 0.25": {
+   "obj_miou": 0.28280147739422823,
+   "pred_per_frame": 3.9166666666666665,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.8333333333333334,
+   "split_pct": 9.523809523809524,
+   "merged_pct": 4.680851063829787
+  },
+  "spatial+split d2 g0.5": {
+   "obj_miou": 0.28824066611474897,
+   "pred_per_frame": 4.433333333333334,
+   "gt_per_frame": 1.4,
+   "pieces_per_object": 0.9880952380952381,
+   "split_pct": 20.238095238095237,
+   "merged_pct": 4.511278195488721
+  }
+ }
+}

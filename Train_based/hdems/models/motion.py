@@ -57,7 +57,30 @@ def decode_flow(
     return torch.stack([u, v], dim=1)
 
 
-EGO_MODELS = ("affine", "quadratic")
+EGO_MODELS = ("affine", "quadratic", "planar8")
+
+
+def _basis_planar8(H: int, W: int, dev: torch.device) -> torch.Tensor:
+    """Design matrix (2HW, 8) of the 8-parameter planar flow (Hua et al. 2025, Eq. 6):
+
+        u_x = a1 x² + a2 xy + a3 x + a4 y + a5
+        u_y = a1 xy + a2 y² + a6 y + a7 x + a8
+
+    -- the flow of a plane under any camera motion, rotation included. It is the
+    quadratic model with 4 constraints (no y² in u_x, no x² in u_y, the curvature
+    terms shared by both axes), so it cannot bend toward non-physical patterns.
+    The ties only hold with ONE scale for x and y (square pixels): both are divided
+    by max(H, W) / 2, not normalised to [-1, 1] separately. The origin may sit
+    anywhere (the constraints survive a shift), so no intrinsics are needed.
+    Rows 0..HW-1 are u_x, rows HW..2HW-1 are u_y.
+    """
+    s = max(H, W) / 2.0
+    ys = ((torch.arange(H, device=dev, dtype=torch.float32) - (H - 1) / 2.0) / s).view(H, 1).expand(H, W).reshape(-1)
+    xs = ((torch.arange(W, device=dev, dtype=torch.float32) - (W - 1) / 2.0) / s).view(1, W).expand(H, W).reshape(-1)
+    one, zero = torch.ones_like(xs), torch.zeros_like(xs)
+    ax = torch.stack([xs * xs, xs * ys, xs, ys, one, zero, zero, zero], dim=1)
+    ay = torch.stack([xs * ys, ys * ys, zero, zero, zero, ys, xs, one], dim=1)
+    return torch.cat([ax, ay], dim=0)
 
 
 def _basis(H: int, W: int, model: str, dev: torch.device) -> torch.Tensor:
@@ -85,10 +108,11 @@ def ego_residual_joint(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Robust background model with ONE weight per pixel for both flow axes.
 
-    model     affine (3 coefficients per axis) | quadratic (6 per axis). Camera
-              rotation and a translating camera over a plane give flow that is
-              quadratic in the image coordinates (the 8-parameter planar flow is a
-              special case); the affine model cannot follow either.
+    model     affine (3 coefficients per axis) | quadratic (6 per axis) | planar8
+              (8 shared by both axes, ``_basis_planar8``). Camera rotation and a
+              translating camera over a plane give flow that is quadratic in the image
+              coordinates -- exactly the 8-parameter planar flow, which the quadratic
+              model contains; the affine model cannot follow either.
     prior_px  where the fit STARTS. None: plain least squares, so the first pass is
               pulled by everything -- a mover covering half the events captures it.
               A value (working px per interval): the first weights come from the flow
@@ -106,8 +130,21 @@ def ego_residual_joint(
     """
     B, C, H, W = flow.shape
     dev = flow.device
-    A = _basis(H, W, model, dev)                                   # (HW, P)
+    joint = model == "planar8"              # one coefficient vector for BOTH axes
+    A = _basis_planar8(H, W, dev) if joint else _basis(H, W, model, dev)   # (2HW | HW, P)
     eye = torch.eye(A.shape[1], device=dev)
+
+    def fit(w: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+        """Weighted least squares -> the model's flow (2, HW)."""
+        if joint:
+            w2 = torch.cat([w, w])
+            Aw = A * w2[:, None]
+            coef = torch.linalg.solve(A.t() @ Aw + eps * eye, Aw.t() @ f.reshape(-1))   # (8,)
+            return (A @ coef).view(2, -1)
+        Aw = A * w[:, None]
+        coef = torch.linalg.solve(A.t() @ Aw + eps * eye, Aw.t() @ f.t())               # (P, 2)
+        return (A @ coef).t()
+
     residual = torch.empty_like(flow)
     for b in range(B):
         f = flow[b].reshape(C, -1)                                 # (2, HW)
@@ -127,9 +164,7 @@ def ego_residual_joint(
                 w = w0
         r = f
         for _ in range(iters):
-            Aw = A * w[:, None]
-            coef = torch.linalg.solve(A.t() @ Aw + eps * eye, Aw.t() @ f.t())   # (P, 2)
-            r = f - (A @ coef).t()
+            r = f - fit(w, f)
             rn = r.norm(dim=0)
             inl = sel & (w >= 0.5 * w[sel].max())
             s = (rn[inl] if inl.any() else rn[sel]).median().clamp_min(floor_px)

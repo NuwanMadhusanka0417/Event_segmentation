@@ -73,6 +73,23 @@ python scripts/check_foe_residual.py --config "${CONFIG}" "${CKPT_ARGS[@]}" \
   --max-frames "${VAL_FRAMES}" --device cuda --out "${OUT}/foe_check.json" \
   | tee "${OUT}/foe_check.txt"
 
+# ego-fit anchor + capture fallback sweep on ALL validation frames (confirms EGO_GATE)
+echo ">>> [$(date +%T)] ego-fit anchor / capture fallback sweep on the validation takes"
+python scripts/check_ego_prior.py --config "${CONFIG}" "${CKPT_ARGS[@]}" \
+  --val-sequences "${VAL_SEQUENCES}" --resolution-ratio "${RES_RATIO}" \
+  --max-frames "${VAL_FRAMES}" --device cuda --out "${OUT}/ego_prior.json" \
+  | tee "${OUT}/ego_prior.txt"
+
+# object grouping on the validation takes: ground-truth moving pixels (the grouping alone)
+# and, with CKPT, the trained head's moving pixels (decides grouping.min_motion_px)
+for FG in gt $( [ -n "${CKPT}" ] && echo head ); do
+  echo ">>> [$(date +%T)] object grouping check (pixels: ${FG})"
+  python scripts/check_grouping.py --config "${CONFIG}" "${CKPT_ARGS[@]}" --fg "${FG}" \
+    --val-sequences "${VAL_SEQUENCES}" --resolution-ratio "${RES_RATIO}" \
+    --max-frames "${VAL_FRAMES}" --device cuda --out "${OUT}/grouping_${FG}.json" \
+    | tee "${OUT}/grouping_${FG}.txt"
+done
+
 # 1a. training-free baselines on the benchmark (threshold from the validation takes)
 for CUE in ${BASELINES}; do
   echo ">>> [$(date +%T)] training-free baseline: |${CUE}| thresholded, no head"

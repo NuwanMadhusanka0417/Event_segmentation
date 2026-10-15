@@ -167,8 +167,18 @@ def main() -> None:
                          "configs/imu_calib.json) | vicon (ground truth: ORACLE only) | none "
                          "(events only). Overrides motion.rot_source.")
     ap.add_argument("--ego-model", choices=list(EGO_MODELS), default=None,
-                    help="Background motion model fitted after derotation: quadratic | affine "
-                         "(overrides motion.ego_model).")
+                    help="Background motion model fitted after derotation: quadratic | planar8 | "
+                         "affine (overrides motion.ego_model).")
+    ap.add_argument("--ego-gate-px", type=float, default=None,
+                    help="Capture fallback (overrides motion.ego_gate_px): drop a frame's ego fit "
+                         "when the fitted background moves more than this (sensor px); 0 = off.")
+    ap.add_argument("--imu-gain", type=float, default=None,
+                    help="Scale of the removed gyro rotation (overrides motion.imu_gain); tune it "
+                         "on VALIDATION frames with scripts/check_imu_timing.py.")
+    ap.add_argument("--imu-shift-ms", type=float, default=None,
+                    help="Gyro window shift, ms (overrides motion.imu_shift_ms).")
+    ap.add_argument("--imu-avg-ms", type=float, default=None,
+                    help="Gyro averaging window, ms (overrides motion.imu_avg_ms).")
     for flag, key, what in (("--fine-flow", "fine_flow", "second, lightly pooled flow estimate"),
                             ("--vsa-consistency", "vsa_consistency", "VSA ego-consistency maps"),
                             ("--extra-inputs", "extra_inputs", "derotated flow vector + rotation speed"),
@@ -247,6 +257,9 @@ def main() -> None:
     for key in ("flow_source", "background_source"):
         if getattr(args, key):
             mot[key] = getattr(args, key)
+    for key in ("imu_gain", "imu_shift_ms", "imu_avg_ms", "ego_gate_px"):
+        if getattr(args, key) is not None:
+            mot[key] = float(getattr(args, key))
     dset = dict(cfg.get("dataset") or {})
     if args.scene_disjoint:
         dset["scene_disjoint"] = args.scene_disjoint == "yes"
@@ -307,7 +320,8 @@ def main() -> None:
         src = opt("motion", "rot_source")
         print(f"[fit] motion: rotation from {src}"
               + (" (GROUND TRUTH -- oracle, not a result)" if src == "vicon" else "")
-              + f" | ego model {opt('motion', 'ego_model')} (prior {opt('motion', 'ego_prior_px')} px)"
+              + f" | ego model {opt('motion', 'ego_model')} (prior {opt('motion', 'ego_prior_px')} px, "
+                f"capture fallback {opt('motion', 'ego_gate_px')} px)"
               + f" | fine flow {opt('motion', 'fine_flow')} | VSA consistency "
               f"{opt('motion', 'vsa_consistency')} | extra inputs {opt('motion', 'extra_inputs')}"
               + f" | event density {opt('motion', 'density_input')}"

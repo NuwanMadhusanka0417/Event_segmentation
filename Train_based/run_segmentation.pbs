@@ -72,7 +72,17 @@ TEMPORAL_ABLATION=yes  # yes -> ALSO run the benchmark without the temporal filt
 ROT_SOURCE=imu         # imu   = remove the camera rotation measured by the gyroscope (real sensor;
                        #         IMU->camera calibration from the TRAIN sequences, configs/imu_calib.json)
                        # vicon = ground-truth rotation (oracle only) | none = events only
-EGO_MODEL=quadratic    # quadratic | affine (old)   background model fitted after derotation
+IMU_GAIN=1.0           # ROT_SOURCE=imu: scale, time shift and averaging window of the removed
+IMU_SHIFT_MS=0         #   gyro rotation, tuned on VALIDATION frames only (scripts/check_imu_timing.py).
+IMU_AVG_MS=25          #   Checked 2026-10-15 (60 val frames): AUC 0.783-0.785 for every window /
+                       #   shift / gain -> keep 1.0 / 0 / 25
+EGO_MODEL=quadratic    # quadratic | planar8 | affine (old)   background model fitted after derotation
+                       #   planar8 = Hua et al. 2025's 8-parameter plane flow (quadratic, 4 ties);
+                       #   validation: same as quadratic (AUC .795 vs .784, IoU 25.4 vs 25.2%)
+EGO_GATE=0.5           # capture fallback (sensor px): a frame whose fitted background still moves
+                       #   more than this keeps only the IMU rotation -- the fit took a big mover
+                       #   for the background. Validation (training-free, 60 frames): best event
+                       #   IoU 25.2 -> 29.5%. 0 = off (the 46.8% run had none)
 FINE_FLOW=yes          # yes | no  second, lightly pooled flow estimate (slow / small movers)
 VSA_CONS=yes           # yes | no  VSA ego-consistency maps (descriptor match at the background-
                        #           predicted position, 12.5 / 25 / 50 ms; 3 extra encodes per sample)
@@ -125,6 +135,11 @@ MOT_TAG="_${ROT_SOURCE}-${EGO_MODEL:0:4}-"
 [ "${VSA_CONS}" = "yes" ] && MOT_TAG="${MOT_TAG}c"
 [ "${EXTRA_INPUTS}" = "yes" ] && MOT_TAG="${MOT_TAG}x"
 [ "${DENSITY}" = "no" ] && MOT_TAG="${MOT_TAG}_noden"
+[ "${EGO_GATE}" != "0" ] && MOT_TAG="${MOT_TAG}_gate${EGO_GATE}"
+# the gyro settings, when not the defaults (e.g. _g1.25s-10a25)
+if [ "${ROT_SOURCE}" = "imu" ] && { [ "${IMU_GAIN}" != "1.0" ] || [ "${IMU_SHIFT_MS}" != "0" ] || [ "${IMU_AVG_MS}" != "25" ]; }; then
+  MOT_TAG="${MOT_TAG}_g${IMU_GAIN}s${IMU_SHIFT_MS}a${IMU_AVG_MS}"
+fi
 ORACLE_ARGS=()
 case "${ORACLE_INPUT}" in
   none) ;;
@@ -191,7 +206,8 @@ printf '  %-16s %s\n' \
   PANELS       "${PANELS}  (which frames get figures)" \
   BENCHMARK    "${BENCHMARK}  (gt=${BENCH_GT}, pred=${BENCH_PRED}, oracle=${ORACLE})" \
   ROT_SOURCE   "${ROT_SOURCE}  (camera rotation removed before the ego fit)" \
-  EGO_MODEL    "${EGO_MODEL}" \
+  IMU          "gain ${IMU_GAIN}, shift ${IMU_SHIFT_MS} ms, window ${IMU_AVG_MS} ms" \
+  EGO_MODEL    "${EGO_MODEL}  (capture fallback ${EGO_GATE} px)" \
   FINE_FLOW    "${FINE_FLOW}" \
   VSA_CONS     "${VSA_CONS}  (VSA ego-consistency maps)" \
   EXTRA_INPUTS "${EXTRA_INPUTS}" \
@@ -217,9 +233,11 @@ echo
 echo "--- config file: ${CONFIG}  (* = overridden by this script) ----"
 python - "${CONFIG}" "${HEAD}" "${AX_COMBINE}" "${EV_COMBINE}" "${LABEL_MODE}" "${EV_FEATURE}" "${RES_RATIO}" "${AUGMENT}" "${HV_INPUT}" \
   "${ROT_SOURCE}" "${EGO_MODEL}" "${FINE_FLOW}" "${VSA_CONS}" "${EXTRA_INPUTS}" "${DENSITY}" "${SPLIT}" \
+  "${IMU_GAIN}" "${IMU_SHIFT_MS}" "${IMU_AVG_MS}" "${EGO_GATE}" \
   <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
 import sys, yaml
 path, head, ax, ev, lm, feat, rr, aug, hv, rot, ego, fine, cons, extra, dens, split = sys.argv[1:17]
+gain, shift, avg, gate = (str(float(v)) for v in sys.argv[17:21])
 cfg = yaml.safe_load(open(path, encoding="utf-8")) or {}
 # CLI flags passed by this script win over the YAML -- show the value actually used
 override = {"segmentation.head": head, "velocity.axis_combine": ax,
@@ -229,7 +247,9 @@ override = {"segmentation.head": head, "velocity.axis_combine": ax,
             "motion.rot_source": rot, "motion.ego_model": ego,
             "motion.fine_flow": str(fine == "yes"), "motion.vsa_consistency": str(cons == "yes"),
             "motion.extra_inputs": str(extra == "yes"), "motion.density_input": str(dens == "yes"),
-            "dataset.scene_disjoint": str(split != "official")}
+            "dataset.scene_disjoint": str(split != "official"),
+            "motion.imu_gain": gain, "motion.imu_shift_ms": shift, "motion.imu_avg_ms": avg,
+            "motion.ego_gate_px": gate}
 def walk(node, prefix=""):
     for k, v in node.items():
         key = f"{prefix}{k}"
@@ -263,6 +283,8 @@ python scripts/fit_ridge_head.py --config "${CONFIG}" \
   --label-mode "${LABEL_MODE}" --resolution-ratio "${RES_RATIO}" --out "${CKPT}" \
   --augment "${AUGMENT}" --hv-input "${HV_INPUT}" \
   --rot-source "${ROT_SOURCE}" --ego-model "${EGO_MODEL}" --fine-flow "${FINE_FLOW}" \
+  --imu-gain "${IMU_GAIN}" --imu-shift-ms "${IMU_SHIFT_MS}" --imu-avg-ms "${IMU_AVG_MS}" \
+  --ego-gate-px "${EGO_GATE}" \
   --vsa-consistency "${VSA_CONS}" --extra-inputs "${EXTRA_INPUTS}" --density-input "${DENSITY}" \
   "${SPLIT_ARGS[@]}" "${ORACLE_ARGS[@]}" \
   --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"

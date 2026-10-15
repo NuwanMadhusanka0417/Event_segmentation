@@ -775,7 +775,8 @@ def main() -> None:
         print(f"mIoU:     {metrics['miou']:.4f}   (secondary — see FG IoU)")
         if label_mode in ("motion", "tracked"):
             if "instance_miou" in metrics:
-                src = "motion grouping" if not args.events_only_baseline else "connected pieces"
+                src = (f"{grouping_params(cfg).method} grouping" if not args.events_only_baseline
+                       else "connected pieces")
                 print(f"--- OBJECTS ({src}), over {metrics.get('frames_with_objects', 0)} frames "
                       f"that contain a moving object ---")
                 print(f"Object mIoU (matched):        {metrics['instance_miou']:.4f}")
