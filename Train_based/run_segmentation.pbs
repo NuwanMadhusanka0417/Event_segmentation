@@ -16,78 +16,137 @@
 set -eo pipefail   # stop immediately if fit fails, so eval never runs on a stale/missing checkpoint
 
 # ---------------------------------------------------------------------------
-# PARAMETERS  (edit these; everything below is derived from them)
+# EXPERIMENTS FOR THE WORKSHOP PAPER  (2026-10-19)
 # ---------------------------------------------------------------------------
-HEAD=mfunet            # mfunet | mfcnn | cnn | prototype | ridge | motion
+# Every parameter below can be set from the command line, nothing needs editing:
+#     qsub -v EXP_ID=E3,SEED=1 run_segmentation.pbs
+# EXP_ID picks a preset (the parameters that define the experiment); anything given with
+# -v wins over the preset, the preset wins over the defaults. Each run writes
+# results/<EXP_ID>_s<SEED>_<run name>_<date>_<job>/EXPERIMENT.md (purpose, settings,
+# results) -- python scripts/collect_results.py results  makes one table of all of them.
+#
+#  id  what                                   compare with
+#  E0  final config, ALL training frames      46.8% (results_7) and the paper's 77.4
+#  E1  E0 + more static negatives (0.3)       E0
+#  E2  velocity-only code, beta_vel 0.3       E3 (same size, same seeds)
+#  E3  final config, 300 frames               reference for every 300-frame ablation
+#  E4  no VSA hypervector                     E3
+#  E5  no IMU, affine ego model               E3
+#  E6  ORACLE ground-truth flow + background  E3 (upper bound, never a result)
+#  E7  ORACLE ground-truth flow               E3 (upper bound)
+#  E8  ORACLE ground-truth background         E3 (upper bound)
+EXP_ID="${EXP_ID:-custom}"
+SEED="${SEED:-0}"            # random seed: the SAME experiment with seeds 0,1,2 shows the noise
+EXP_NOTE_DEF="custom run (no preset)"
+EXP_CMP_DEF="-"
+case "${EXP_ID}" in
+  E0) : "${SAMPLES:=4000}"
+      EXP_NOTE_DEF="Headline: final configuration (IMU + quadratic ego fit + capture fallback + VSA code) on all training frames"
+      EXP_CMP_DEF="46.8% (results_7, same data, no capture fallback); Hua et al. 2025 = 77.4" ;;
+  E1) : "${SAMPLES:=4000}"; : "${NEG_RATIO:=0.3}"
+      EXP_NOTE_DEF="E0 with more all-static training frames (negative ratio 0.3 instead of 0.1): fewer false objects on static frames?"
+      EXP_CMP_DEF="E0 (benchmark, static-frame false-object rate)" ;;
+  E2) : "${SAMPLES:=300}"; : "${HV_INPUT:=v}"; : "${BETA_VEL:=0.3}"
+      EXP_NOTE_DEF="Velocity-only hypervector (no position) with a finer velocity code (beta_vel 0.3 instead of 0.05)"
+      EXP_CMP_DEF="E3 (pv_bind, beta_vel 0.05), same seeds" ;;
+  E3) : "${SAMPLES:=300}"
+      EXP_NOTE_DEF="Final configuration on 300 training frames: the reference for the 300-frame ablations"
+      EXP_CMP_DEF="E2, E4, E5 (ablations) and E6-E8 (oracles), same seeds" ;;
+  E4) : "${SAMPLES:=300}"; : "${HV_INPUT:=none}"
+      EXP_NOTE_DEF="Ablation: no VSA position/velocity hypervector (U-Net gets only the scalar motion and evidence channels)"
+      EXP_CMP_DEF="E3: the VSA code's contribution" ;;
+  E5) : "${SAMPLES:=300}"; : "${ROT_SOURCE:=none}"; : "${EGO_MODEL:=affine}"
+      EXP_NOTE_DEF="Ablation: events only -- no IMU rotation removal, the original affine ego model"
+      EXP_CMP_DEF="E3: what the IMU + quadratic ego model add" ;;
+  E6) : "${SAMPLES:=300}"; : "${ORACLE_INPUT:=both}"
+      EXP_NOTE_DEF="ORACLE: ground-truth flow AND background (depth + poses) -- the ceiling of this design, NOT a result"
+      EXP_CMP_DEF="E3: total cost of motion-estimation errors" ;;
+  E7) : "${SAMPLES:=300}"; : "${ORACLE_INPUT:=flow}"
+      EXP_NOTE_DEF="ORACLE: ground-truth flow instead of the VSA flow -- NOT a result"
+      EXP_CMP_DEF="E3: cost of flow errors" ;;
+  E8) : "${SAMPLES:=300}"; : "${ORACLE_INPUT:=background}"
+      EXP_NOTE_DEF="ORACLE: true static-world background instead of IMU + ego fit -- NOT a result"
+      EXP_CMP_DEF="E3: cost of background-model errors" ;;
+  custom) ;;
+  *) echo "ERROR: unknown EXP_ID=${EXP_ID} (E0-E8 or custom)"; exit 1 ;;
+esac
+EXP_NOTE="${EXP_NOTE:-${EXP_NOTE_DEF}}"
+EXP_CMP="${EXP_CMP:-${EXP_CMP_DEF}}"
+
+# ---------------------------------------------------------------------------
+# PARAMETERS  (defaults; any of them can be given with qsub -v NAME=value)
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+HEAD="${HEAD:-mfunet}"            # mfunet | mfcnn | cnn | prototype | ridge | motion
                        #   mfunet = motion-first U-Net: sees ~110 px around each pixel, plus
                        #            event density + flow confidence channels
                        #   mfcnn  = motion-first: velocity code Mv + 6 motion channels, and only
                        #            8 appearance channels (dropped at random while training);
                        #            sees 5x5 px. Run both to compare.
                        #   cnn    = HV-channels CNN on the fused X/Mv feature (EV_COMBINE)
-EV_FEATURE=f           # phi | f                (event HV: Phi neighbourhood field, or descriptor F0)
-AX_COMBINE=bind        # bind | bundle          (combine Vx,Vy velocity hypervectors)
+EV_FEATURE="${EV_FEATURE:-f}"           # phi | f                (event HV: Phi neighbourhood field, or descriptor F0)
+AX_COMBINE="${AX_COMBINE:-bind}"        # bind | bundle          (combine Vx,Vy velocity hypervectors)
                        #   bind   = Vx ⊛ Vy        joint 2-D code (speed / direction readable)
                        #   bundle = (Vx + Vy)/√2   each axis on its own
-HV_INPUT=pv_bind       # mfcnn / mfunet (real FPE): how the pixel POSITION code P joins velocity V
+HV_INPUT="${HV_INPUT:-pv_bind}"       # mfcnn / mfunet (real FPE): how the pixel POSITION code P joins velocity V
                        #   pv_bind   = P ⊛ V        velocity tied to where it occurs
                        #   pv_bundle = (P + V)/√2   side by side in one 500-d vector
                        #   pv_concat = [P | V]      1000 channels, the U-Net combines them
                        #   v         = V only       no absolute position
                        #   none      = no hypervector (ablation: does the VSA code help?)
-EV_COMBINE=concat     # bind | bundle | bindbundle | concat   (combine event HV X with velocity Mv)
+EV_COMBINE="${EV_COMBINE:-concat}"     # bind | bundle | bindbundle | concat   (combine event HV X with velocity Mv)
                        #   bindbundle = (X^ o Mv) + Mv.   NOT used by HEAD=mfcnn / mfunet
-LABEL_MODE=motion      # motion = moving vs background (Option A)
+LABEL_MODE="${LABEL_MODE:-motion}"      # motion = moving vs background (Option A)
                        # objects = per-object id        (Option B)
-DETECT=yes             # yes | no  -> also report object detection (boxes from instances)
-ABLATION=yes           # yes | no  -> eval also runs without motion / without appearance and
+DETECT="${DETECT:-yes}"             # yes | no  -> also report object detection (boxes from instances)
+ABLATION="${ABLATION:-yes}"           # yes | no  -> eval also runs without motion / without appearance and
                        #   prints a verdict: a motion segmenter must collapse without motion
-AUGMENT=yes            # yes | no  -> random flips / 180-degree rotation of training samples
+AUGMENT="${AUGMENT:-yes}"            # yes | no  -> random flips / 180-degree rotation of training samples
                        #   (first epochs slower: the flow of each flipped version is computed once)
-RES_RATIO=2            # 1 = full 480x640 | 2 = half 240x320 | 4 = quarter 120x160
+RES_RATIO="${RES_RATIO:-2}"            # 1 = full 480x640 | 2 = half 240x320 | 4 = quarter 120x160
                        #   kernel N, search M and Eq.12 pooling scale with it (~ratio^4 cheaper)
-SAMPLES=4000           # max train frames (more than exist = ALL: 2204 strict split, ~3700 official)
-VAL_SAMPLES=300        # max validation frames WITH A MOVER (epoch + threshold choice); never eval
-SPLIT=official         # official = EVIMO2's own train/eval split: other takes of the test scenes
+SAMPLES="${SAMPLES:-4000}"           # max train frames (more than exist = ALL: 2204 strict split, ~3700 official)
+VAL_SAMPLES="${VAL_SAMPLES:-300}"        # max validation frames WITH A MOVER (epoch + threshold choice); never eval
+SPLIT="${SPLIT:-official}"         # official = EVIMO2's own train/eval split: other takes of the test scenes
                        #            are trained on, validation = VAL_SEQUENCES (takes of 13 / 14)
                        # disjoint = no take of a test scene is trained on, validation = scene9 (old)
-VAL_SEQUENCES=scene13_dyn_test_03,scene14_dyn_test_02   # SPLIT=official only: held-out takes
+VAL_SEQUENCES="${VAL_SEQUENCES:-scene13_dyn_test_03,scene14_dyn_test_02}"   # SPLIT=official only: held-out takes
                        #   (141 + 115 frames with a mover, one take of each benchmark scene)
-DENSITY=yes            # yes | no  event density as a head input (no = deny the head that shortcut)
-TEST_SAMPLES=50        # max eval panels saved
-PANELS=movers          # which eval frames get figures (scores always use ALL frames):
+DENSITY="${DENSITY:-yes}"            # yes | no  event density as a head input (no = deny the head that shortcut)
+TEST_SAMPLES="${TEST_SAMPLES:-50}"        # max eval panels saved
+PANELS="${PANELS:-movers}"          # which eval frames get figures (scores always use ALL frames):
                        #   movers = only frames with a visible moving object (see object colours)
                        #   spread = evenly over the whole eval set (moving + static frames)
                        #   first  = first N frames (old; mostly the static start of each recording)
-BENCHMARK=hua2025      # hua2025 | none  -> also score with the published protocol of
+BENCHMARK="${BENCHMARK:-hua2025}"      # hua2025 | none  -> also score with the published protocol of
                        #   Hua, Yuan & Fermueller 2025 (IoU over events, 5 sequences)
-BENCH_GT=moving        # moving | moving_slow | tracked   (which objects count as moving)
-BENCH_PRED=fg          # fg | objects   (head's moving pixels, or only what grouping keeps)
-ORACLE=no              # yes -> ALSO run the benchmark with the Vicon (ground-truth) rotation:
+BENCH_GT="${BENCH_GT:-moving}"        # moving | moving_slow | tracked   (which objects count as moving)
+BENCH_PRED="${BENCH_PRED:-fg}"          # fg | objects   (head's moving pixels, or only what grouping keeps)
+ORACLE="${ORACLE:-no}"              # yes -> ALSO run the benchmark with the Vicon (ground-truth) rotation:
                        #   the upper bound of rotation removal -- never report it as a result
-TEMPORAL_ABLATION=yes  # yes -> ALSO run the benchmark without the temporal filter (beta 0).
+TEMPORAL_ABLATION="${TEMPORAL_ABLATION:-yes}"  # yes -> ALSO run the benchmark without the temporal filter (beta 0).
                        #   The main benchmark uses the beta tuned on validation (train.temporal_betas)
 
 # Motion pipeline (motion: section of the config) ----------------------------
-ROT_SOURCE=imu         # imu   = remove the camera rotation measured by the gyroscope (real sensor;
+ROT_SOURCE="${ROT_SOURCE:-imu}"         # imu   = remove the camera rotation measured by the gyroscope (real sensor;
                        #         IMU->camera calibration from the TRAIN sequences, configs/imu_calib.json)
                        # vicon = ground-truth rotation (oracle only) | none = events only
-IMU_GAIN=1.0           # ROT_SOURCE=imu: scale, time shift and averaging window of the removed
-IMU_SHIFT_MS=0         #   gyro rotation, tuned on VALIDATION frames only (scripts/check_imu_timing.py).
-IMU_AVG_MS=25          #   Checked 2026-10-15 (60 val frames): AUC 0.783-0.785 for every window /
+IMU_GAIN="${IMU_GAIN:-1.0}"           # ROT_SOURCE=imu: scale, time shift and averaging window of the removed
+IMU_SHIFT_MS="${IMU_SHIFT_MS:-0}"         #   gyro rotation, tuned on VALIDATION frames only (scripts/check_imu_timing.py).
+IMU_AVG_MS="${IMU_AVG_MS:-25}"          #   Checked 2026-10-15 (60 val frames): AUC 0.783-0.785 for every window /
                        #   shift / gain -> keep 1.0 / 0 / 25
-EGO_MODEL=quadratic    # quadratic | planar8 | affine (old)   background model fitted after derotation
+EGO_MODEL="${EGO_MODEL:-quadratic}"    # quadratic | planar8 | affine (old)   background model fitted after derotation
                        #   planar8 = Hua et al. 2025's 8-parameter plane flow (quadratic, 4 ties);
                        #   validation: same as quadratic (AUC .795 vs .784, IoU 25.4 vs 25.2%)
-EGO_GATE=0.5           # capture fallback (sensor px): a frame whose fitted background still moves
+EGO_GATE="${EGO_GATE:-0.5}"           # capture fallback (sensor px): a frame whose fitted background still moves
                        #   more than this keeps only the IMU rotation -- the fit took a big mover
                        #   for the background. Validation (training-free, 60 frames): best event
                        #   IoU 25.2 -> 29.5%. 0 = off (the 46.8% run had none)
-FINE_FLOW=yes          # yes | no  second, lightly pooled flow estimate (slow / small movers)
-VSA_CONS=yes           # yes | no  VSA ego-consistency maps (descriptor match at the background-
+FINE_FLOW="${FINE_FLOW:-yes}"          # yes | no  second, lightly pooled flow estimate (slow / small movers)
+VSA_CONS="${VSA_CONS:-yes}"           # yes | no  VSA ego-consistency maps (descriptor match at the background-
                        #           predicted position, 12.5 / 25 / 50 ms; 3 extra encodes per sample)
-EXTRA_INPUTS=yes       # yes | no  derotated flow vector + rotation speed as head inputs
-ORACLE_INPUT=none      # DIAGNOSTIC runs only (upper bounds, never results) -- trained AND
+EXTRA_INPUTS="${EXTRA_INPUTS:-yes}"       # yes | no  derotated flow vector + rotation speed as head inputs
+ORACLE_INPUT="${ORACLE_INPUT:-none}"      # DIAGNOSTIC runs only (upper bounds, never results) -- trained AND
                        # tested with ground truth (depth + poses) where EVIMO2 has it:
                        #   none       = the real pipeline
                        #   flow       = O1: ground-truth flow instead of the VSA flow
@@ -97,9 +156,12 @@ ORACLE_INPUT=none      # DIAGNOSTIC runs only (upper bounds, never results) -- t
                        # a big gain from flow = the front end is the bottleneck; from
                        # background = the ego model is; from neither = the head / labels are.
 
-CODE_DIR=/scratch/mi23/nuwan/Event_segmentation_paper1/Train_based
-CONFIG=configs/evimo_seg.yaml
-VENV=/scratch/jq77/nk8155/seg1/bin/activate
+CODE_DIR="${CODE_DIR:-/scratch/mi23/nuwan/Event_segmentation_paper1/Train_based}"
+CONFIG="${CONFIG:-configs/evimo_seg.yaml}"
+VENV="${VENV:-/scratch/jq77/nk8155/seg1/bin/activate}"
+
+NEG_RATIO="${NEG_RATIO:-0.1}"      # share of all-static frames added to training (dataset.negative_ratio)
+BETA_VEL="${BETA_VEL:-0.05}"       # real FPE velocity bandwidth (real_fpe.beta_vel): larger = finer code
 
 # ---------------------------------------------------------------------------
 # ENVIRONMENT
@@ -149,6 +211,8 @@ case "${ORACLE_INPUT}" in
   *) echo "ERROR: ORACLE_INPUT must be none | flow | background | both"; exit 1 ;;
 esac
 [ "${ORACLE_INPUT}" != "none" ] && MOT_TAG="${MOT_TAG}_ORACLE-${ORACLE_INPUT}"
+[ "${NEG_RATIO}" != "0.1" ] && MOT_TAG="${MOT_TAG}_neg${NEG_RATIO}"
+[ "${BETA_VEL}" != "0.05" ] && MOT_TAG="${MOT_TAG}_bv${BETA_VEL}"
 SPLIT_TAG=""
 [ "${SPLIT}" = "official" ] && SPLIT_TAG="_official"
 if [ "${SPLIT}" = "official" ]; then
@@ -157,8 +221,8 @@ else
   SPLIT_ARGS=(--scene-disjoint yes --val-sequences none)
 fi
 RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_TAG}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}${AUG_TAG}${MOT_TAG}${SPLIT_TAG}"
-CKPT="checkpoints/${RUN_NAME}_${JOB_NUM}.pt"
-RESULTS_DIR="results/${RUN_NAME}_$(date +%Y%m%d_%H%M%S)_${JOB_NUM}"
+CKPT="checkpoints/${EXP_ID}_s${SEED}_${RUN_NAME}_${JOB_NUM}.pt"
+RESULTS_DIR="results/${EXP_ID}_s${SEED}_${RUN_NAME}_$(date +%Y%m%d_%H%M%S)_${JOB_NUM}"
 mkdir -p "${RESULTS_DIR}"
 
 # Job log in the results folder too: from here on, everything (run configuration,
@@ -171,6 +235,19 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 LOG_TEE_PID=$!
 # On exit -- also when a step fails -- let tee write the last lines before PBS ends the job.
 trap 'exec >&- 2>&-; wait "${LOG_TEE_PID}" 2>/dev/null || true' EXIT
+
+# EXPERIMENT.md / experiment.json: what this run is, why, and every setting
+python scripts/summarize_run.py init "${RESULTS_DIR}" --exp-id "${EXP_ID}" \
+  --note "${EXP_NOTE}" --compare "${EXP_CMP}" \
+  --param "JOB=${PBS_JOBID:-local}" --param "SEED=${SEED}" --param "SAMPLES=${SAMPLES}" \
+  --param "HEAD=${HEAD}" --param "HV_INPUT=${HV_INPUT}" --param "BETA_VEL=${BETA_VEL}" \
+  --param "ROT_SOURCE=${ROT_SOURCE}" --param "EGO_MODEL=${EGO_MODEL}" --param "EGO_GATE=${EGO_GATE}" \
+  --param "IMU=gain ${IMU_GAIN} shift ${IMU_SHIFT_MS} avg ${IMU_AVG_MS}" \
+  --param "FINE_FLOW=${FINE_FLOW}" --param "VSA_CONS=${VSA_CONS}" --param "EXTRA_INPUTS=${EXTRA_INPUTS}" \
+  --param "DENSITY=${DENSITY}" --param "NEG_RATIO=${NEG_RATIO}" --param "ORACLE_INPUT=${ORACLE_INPUT}" \
+  --param "RES_RATIO=${RES_RATIO}" --param "AUGMENT=${AUGMENT}" --param "SPLIT=${SPLIT}" \
+  --param "VAL_SEQUENCES=${VAL_SEQUENCES}" --param "VAL_SAMPLES=${VAL_SAMPLES}" \
+  --param "CHECKPOINT=${CKPT}" || echo "(could not write EXPERIMENT.md)"
 
 # ---------------------------------------------------------------------------
 # RUN CONFIGURATION  (printed first, so every log explains its own results)
@@ -212,6 +289,11 @@ printf '  %-16s %s\n' \
   VSA_CONS     "${VSA_CONS}  (VSA ego-consistency maps)" \
   EXTRA_INPUTS "${EXTRA_INPUTS}" \
   DENSITY      "${DENSITY}  (event density as a head input)" \
+  EXP_ID       "${EXP_ID}  -- ${EXP_NOTE}" \
+  COMPARE_WITH "${EXP_CMP}" \
+  SEED         "${SEED}" \
+  NEG_RATIO    "${NEG_RATIO}  (all-static training frames)" \
+  BETA_VEL     "${BETA_VEL}  (velocity code bandwidth)" \
   ORACLE_INPUT "${ORACLE_INPUT}$( [ "${ORACLE_INPUT}" != "none" ] && echo "  (GROUND-TRUTH input: diagnostic, NOT a result)")" \
   SPLIT        "${SPLIT}$( [ "${SPLIT}" = "official" ] && echo "  (validation: ${VAL_SEQUENCES})")" \
   CONFIG       "${CONFIG}"
@@ -233,11 +315,11 @@ echo
 echo "--- config file: ${CONFIG}  (* = overridden by this script) ----"
 python - "${CONFIG}" "${HEAD}" "${AX_COMBINE}" "${EV_COMBINE}" "${LABEL_MODE}" "${EV_FEATURE}" "${RES_RATIO}" "${AUGMENT}" "${HV_INPUT}" \
   "${ROT_SOURCE}" "${EGO_MODEL}" "${FINE_FLOW}" "${VSA_CONS}" "${EXTRA_INPUTS}" "${DENSITY}" "${SPLIT}" \
-  "${IMU_GAIN}" "${IMU_SHIFT_MS}" "${IMU_AVG_MS}" "${EGO_GATE}" \
+  "${IMU_GAIN}" "${IMU_SHIFT_MS}" "${IMU_AVG_MS}" "${EGO_GATE}" "${NEG_RATIO}" "${BETA_VEL}" \
   <<'PY' 2>/dev/null || echo "  (could not parse ${CONFIG})"
 import sys, yaml
 path, head, ax, ev, lm, feat, rr, aug, hv, rot, ego, fine, cons, extra, dens, split = sys.argv[1:17]
-gain, shift, avg, gate = (str(float(v)) for v in sys.argv[17:21])
+gain, shift, avg, gate, neg, bvel = (str(float(v)) for v in sys.argv[17:23])
 cfg = yaml.safe_load(open(path, encoding="utf-8")) or {}
 # CLI flags passed by this script win over the YAML -- show the value actually used
 override = {"segmentation.head": head, "velocity.axis_combine": ax,
@@ -249,7 +331,7 @@ override = {"segmentation.head": head, "velocity.axis_combine": ax,
             "motion.extra_inputs": str(extra == "yes"), "motion.density_input": str(dens == "yes"),
             "dataset.scene_disjoint": str(split != "official"),
             "motion.imu_gain": gain, "motion.imu_shift_ms": shift, "motion.imu_avg_ms": avg,
-            "motion.ego_gate_px": gate}
+            "motion.ego_gate_px": gate, "dataset.negative_ratio": neg, "real_fpe.beta_vel": bvel}
 def walk(node, prefix=""):
     for k, v in node.items():
         key = f"{prefix}{k}"
@@ -284,7 +366,7 @@ python scripts/fit_ridge_head.py --config "${CONFIG}" \
   --augment "${AUGMENT}" --hv-input "${HV_INPUT}" \
   --rot-source "${ROT_SOURCE}" --ego-model "${EGO_MODEL}" --fine-flow "${FINE_FLOW}" \
   --imu-gain "${IMU_GAIN}" --imu-shift-ms "${IMU_SHIFT_MS}" --imu-avg-ms "${IMU_AVG_MS}" \
-  --ego-gate-px "${EGO_GATE}" \
+  --ego-gate-px "${EGO_GATE}" --seed "${SEED}" --negative-ratio "${NEG_RATIO}" --beta-vel "${BETA_VEL}" \
   --vsa-consistency "${VSA_CONS}" --extra-inputs "${EXTRA_INPUTS}" --density-input "${DENSITY}" \
   "${SPLIT_ARGS[@]}" "${ORACLE_ARGS[@]}" \
   --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"
@@ -346,6 +428,10 @@ fi
 # 3. COLLECT  (keep a copy of the checkpoint next to the results; the log is already there)
 # ---------------------------------------------------------------------------
 cp "${CKPT}" "${RESULTS_DIR}/" 2>/dev/null || true
+echo "--- resources used (for the next memory / walltime request) ---"
+qstat -f "${PBS_JOBID}" 2>/dev/null | grep -E 'resources_used\.(mem|vmem|walltime|cpupercent|ncpus)' \
+  | sed 's/^ */  /' || echo "  (qstat unavailable)"
+python scripts/summarize_run.py finish "${RESULTS_DIR}" || echo "(could not summarise the results)"
 echo "=== Job ${PBS_JOBID} (${RUN_NAME}) finished $(date)  --  elapsed $((SECONDS/3600))h $((SECONDS%3600/60))m ==="
 # When this line completes, PBS tears the job down and stops billing. No qdel needed.
 

@@ -215,7 +215,15 @@ def main() -> None:
                          "Kernel size, search window M and Eq.12 pooling scale with it "
                          "(overrides dataset.resolution_ratio).")
     ap.add_argument("--device", type=str, default="cpu")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="Random seed (head initialisation, sample order, augmentation). Repeat "
+                         "a run with other seeds to see how much of a difference is noise.")
+    ap.add_argument("--negative-ratio", type=float, default=None,
+                    help="Share of all-static frames added to training as negatives "
+                         "(overrides dataset.negative_ratio).")
+    ap.add_argument("--beta-vel", type=float, default=None,
+                    help="Real-FPE velocity bandwidth (overrides real_fpe.beta_vel): larger = "
+                         "finer velocity code (0.05: v=0 vs 1 px similarity 0.996).")
     ap.add_argument("--backend", choices=["streaming", "sklearn"], default=None)
     ap.add_argument(
         "--max-train-samples",
@@ -245,6 +253,8 @@ def main() -> None:
         cfg["velocity"] = vel
     if args.hv_input:                     # before frontend_settings: the checkpoint records it
         cfg["real_fpe"] = {**(cfg.get("real_fpe") or {}), "input": args.hv_input}
+    if args.beta_vel is not None:
+        cfg["real_fpe"] = {**(cfg.get("real_fpe") or {}), "beta_vel": float(args.beta_vel)}
     mot = dict(cfg.get("motion") or {})   # likewise: the motion options are front end
     if args.rot_source:
         mot["rot_source"] = args.rot_source
@@ -263,6 +273,8 @@ def main() -> None:
     dset = dict(cfg.get("dataset") or {})
     if args.scene_disjoint:
         dset["scene_disjoint"] = args.scene_disjoint == "yes"
+    if args.negative_ratio is not None:
+        dset["negative_ratio"] = float(args.negative_ratio)
     if args.val_sequences is not None:
         dset["val_sequences"] = ([] if args.val_sequences.strip().lower() in ("", "none")
                                  else [s.strip() for s in args.val_sequences.split(",") if s.strip()])
@@ -349,6 +361,11 @@ def main() -> None:
     bg_ratio = float(ridge_cfg.get("bg_subsample_ratio", 0.2))
 
     torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    import random
+    random.seed(args.seed)
+    print(f"[fit] seed {args.seed} | negative ratio {cfg.get('dataset', {}).get('negative_ratio')} | "
+          f"velocity beta {frontend_option(cfg, 'real_fpe', 'beta_vel')}")
     device = torch.device(args.device)
 
     if not trainable:                        # frozen feature extractor for ridge/prototype
@@ -438,6 +455,8 @@ def main() -> None:
                         "axis_combine": axis, "event_combine": event,
                         "event_feature": feature, "label_mode": label_mode,
                         "resolution_ratio": ratio, "frontend": frontend,
+                        "seed": args.seed,
+                        "negative_ratio": cfg.get("dataset", {}).get("negative_ratio"),
                         "head_config": head_settings(cfg)}, out_path)
         stale = 0                                  # validations since the last improvement
         for epoch in range(1, epochs + 1):

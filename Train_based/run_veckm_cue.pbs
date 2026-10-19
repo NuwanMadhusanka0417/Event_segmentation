@@ -1,0 +1,84 @@
+#!/bin/bash
+#PBS -N veckm_cue
+#PBS -P mi23
+#PBS -q gpuvolta
+#PBS -l ncpus=12
+#PBS -l mem=96GB
+#PBS -l ngpus=1
+#PBS -l walltime=06:00:00
+#PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+#PBS -l wd
+#PBS -j oe
+# E9 -- flow source, training-free: VecKM_flow normal flow (Yuan et al. ICCV 2025, the flow
+# Hua et al. 2025 use) vs our VSA flow as the motion cue. Thresholds are chosen on the
+# validation takes, then the 5 benchmark test sequences are scored -- VecKM_flow was not
+# trained on them, so the test numbers are clean. No training.
+#
+# Needs the VecKM_flow repository on Gadi (MIT licence, includes the weights):
+#   cd /scratch/mi23/nuwan && wget https://github.com/dhyuan99/VecKM_flow/archive/refs/heads/main.zip \
+#     && unzip -q main.zip && mv VecKM_flow-main VecKM_flow
+#   (set VECKM_DIR below to that folder)
+#
+#   qsub run_veckm_cue.pbs
+
+set -eo pipefail
+
+VECKM_DIR="${VECKM_DIR:-/scratch/mi23/nuwan/VecKM_flow}"
+RES_RATIO="${RES_RATIO:-2}"
+VAL_FRAMES="${VAL_FRAMES:-300}"            # validation frames with a mover (all 263)
+VAL_SEQUENCES="${VAL_SEQUENCES:-scene13_dyn_test_03,scene14_dyn_test_02}"
+CONFIG="${CONFIG:-configs/evimo_seg.yaml}"
+CODE_DIR="${CODE_DIR:-/scratch/mi23/nuwan/Event_segmentation_paper1/Train_based}"
+VENV="${VENV:-/scratch/jq77/nk8155/seg1/bin/activate}"
+
+module load cuda
+module load python3/3.9.2
+source "${VENV}"
+if [ "$(command -v python)" != "$(dirname "${VENV}")/python" ]; then
+  echo "ERROR: no python in $(dirname "${VENV}") (found: '$(command -v python)') -- repair or recreate the venv"
+  exit 1
+fi
+cd "${CODE_DIR}"
+source scripts/nci_env.sh
+export PYTHONUNBUFFERED=1
+if [ ! -f "${VECKM_DIR}/VecKM_flow/models/UNION.pth" ]; then
+  echo "ERROR: VecKM_flow not found in ${VECKM_DIR} (see the download lines at the top)"
+  exit 1
+fi
+
+JOB_NUM="${PBS_JOBID%%.*}"
+JOB_NUM="${JOB_NUM:-local$$}"
+OUT="results/E9_veckm_vs_vsa_cue_$(date +%Y%m%d_%H%M%S)_${JOB_NUM}"
+mkdir -p "${OUT}"
+exec > >(tee -a "${OUT}/${PBS_JOBNAME:-veckm_cue}.o${JOB_NUM}") 2>&1
+LOG_TEE_PID=$!
+trap 'exec >&- 2>&-; wait "${LOG_TEE_PID}" 2>/dev/null || true' EXIT
+cat > "${OUT}/EXPERIMENT.md" <<EOF
+# Experiment E9 -- flow source (training-free)
+
+**Purpose:** is VecKM_flow's per-event normal flow (the flow Hua et al. 2025 use) a better
+motion cue than our VSA flow? Each cue is thresholded (no head); the threshold is chosen
+on the validation takes (${VAL_SEQUENCES}), then the 5 benchmark test sequences are scored.
+
+**Compare with:** the trained heads (E0, E3) and the paper (77.4). Cues:
+veckm - IMU = |normal speed - IMU rotation along the normal|; vsa - IMU = |VSA flow - IMU
+rotation|; vsa residual = our current cue (IMU + ego fit + capture fallback).
+
+**Caveat:** VecKM_flow was trained on EVIMO2-imo's TRAIN split, which holds the validation
+takes -- validation numbers favour it; the TEST numbers are clean.
+
+Settings: RES_RATIO=${RES_RATIO}, VAL_FRAMES=${VAL_FRAMES}, VecKM UNION weights, ensemble 3.
+Job ${PBS_JOBID:-local}, started $(date '+%Y-%m-%d %H:%M').
+
+## Results
+
+See veckm_cue.txt (tables) and veckm_cue.json.
+EOF
+
+echo "=== E9 VecKM vs VSA cue ${PBS_JOBID:-local} started $(date) -> ${OUT}"
+python scripts/check_veckm_cue.py --veckm-dir "${VECKM_DIR}" --config "${CONFIG}" \
+  --val-sequences "${VAL_SEQUENCES}" --resolution-ratio "${RES_RATIO}" --max-frames "${VAL_FRAMES}" \
+  --benchmark --device cuda --out "${OUT}/veckm_cue.json" | tee "${OUT}/veckm_cue.txt"
+echo "--- resources used ---"
+qstat -f "${PBS_JOBID}" 2>/dev/null | grep -E 'resources_used\.(mem|walltime|cpupercent)' | sed 's/^ */  /' || true
+echo "=== finished $(date)"

@@ -54,8 +54,23 @@ fi
 
 JOB_NUM="${PBS_JOBID%%.*}"
 JOB_NUM="${JOB_NUM:-local$$}"
-OUT="results/phase1_$(date +%Y%m%d_%H%M%S)_${JOB_NUM}"
+OUT="results/E10_diagnostics_$(date +%Y%m%d_%H%M%S)_${JOB_NUM}"
 mkdir -p "${OUT}"
+cat > "${OUT}/EXPERIMENT.md" <<EOF
+# Experiment E10 -- training-free diagnostics (no training)
+
+**Purpose:** numbers for the analysis part of the paper, all chosen on the validation takes
+(${VAL_SEQUENCES}), never on the test set:
+- foe_check.txt     depth-free FOE cue vs the ego-fit residual (negative result expected)
+- ego_prior.txt     ego-fit anchor and capture-fallback sweep (confirms EGO_GATE)
+- grouping_gt.txt   object grouping on ground-truth moving pixels (spatial vs motion-first)
+- grouping_head.txt the same on the trained head's moving pixels (decides min_motion_px)
+- baseline_*.txt    training-free benchmark: one motion cue thresholded, no head
+- oracle_*.txt      the trained head (CKPT) re-scored with ground-truth flow / background
+
+**Front end / head:** ${CKPT:-the YAML front end, no trained head}
+Job ${PBS_JOBID:-local}, started $(date '+%Y-%m-%d %H:%M').
+EOF
 exec > >(tee -a "${OUT}/${PBS_JOBNAME:-phase1_diag}.o${JOB_NUM}") 2>&1
 LOG_TEE_PID=$!
 trap 'exec >&- 2>&-; wait "${LOG_TEE_PID}" 2>/dev/null || true' EXIT
