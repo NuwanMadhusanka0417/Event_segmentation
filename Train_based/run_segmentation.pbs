@@ -35,6 +35,10 @@ set -eo pipefail   # stop immediately if fit fails, so eval never runs on a stal
 #  E6  ORACLE ground-truth flow + background  E3 (upper bound, never a result)
 #  E7  ORACLE ground-truth flow               E3 (upper bound)
 #  E8  ORACLE ground-truth background         E3 (upper bound)
+#  E11 HEADLINE: all frames, no fallback      the paper (seed 0 = the 46.8% run 181118790)
+#  E12 no VSA consistency maps                E3
+#  E13 no event-density input                 E3
+#  E14 training-set size (SAMPLES=1000|2000)  E3 (300) and E11 (all) -- the data curve
 EXP_ID="${EXP_ID:-custom}"
 SEED="${SEED:-0}"            # random seed: the SAME experiment with seeds 0,1,2 shows the noise
 EXP_NOTE_DEF="custom run (no preset)"
@@ -67,8 +71,20 @@ case "${EXP_ID}" in
   E8) : "${SAMPLES:=300}"; : "${ORACLE_INPUT:=background}"
       EXP_NOTE_DEF="ORACLE: true static-world background instead of IMU + ego fit -- NOT a result"
       EXP_CMP_DEF="E3: cost of background-model errors" ;;
+  E11) : "${SAMPLES:=4000}"; : "${EGO_GATE:=0}"
+      EXP_NOTE_DEF="HEADLINE (chosen on validation 2026-10-20): full training data, NO capture fallback -- seeds of the 46.8% run 181118790"
+      EXP_CMP_DEF="Hua et al. 2025 = 77.4; E0 (with fallback) and E1 (more negatives)" ;;
+  E12) : "${SAMPLES:=300}"; : "${VSA_CONS:=no}"
+      EXP_NOTE_DEF="Ablation: no VSA ego-consistency maps (the other VSA component; E4 removes the hypervector)"
+      EXP_CMP_DEF="E3: the consistency maps' contribution" ;;
+  E13) : "${SAMPLES:=300}"; : "${DENSITY:=no}"
+      EXP_NOTE_DEF="Ablation: no event-density input -- does the head take the 'where events are' shortcut?"
+      EXP_CMP_DEF="E3: the density input's contribution" ;;
+  E14) : "${SAMPLES:=1000}"; : "${EGO_GATE:=0}"
+      EXP_NOTE_DEF="Training-set size curve: headline configuration (no capture fallback) on SAMPLES training frames"
+      EXP_CMP_DEF="E11 (all frames) and the 300-frame runs" ;;
   custom) ;;
-  *) echo "ERROR: unknown EXP_ID=${EXP_ID} (E0-E8 or custom)"; exit 1 ;;
+  *) echo "ERROR: unknown EXP_ID=${EXP_ID} (E0-E8, E11-E14 or custom)"; exit 1 ;;
 esac
 EXP_NOTE="${EXP_NOTE:-${EXP_NOTE_DEF}}"
 EXP_CMP="${EXP_CMP:-${EXP_CMP_DEF}}"
