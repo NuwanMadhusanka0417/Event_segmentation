@@ -28,11 +28,22 @@ def main() -> None:
     ap.add_argument("root", nargs="?", default="results")
     a = ap.parse_args()
     root = Path(a.root)
-    groups: dict[str, list[dict]] = defaultdict(list)
+    docs = []
     for f in sorted(root.glob("*/experiment.json")):
         doc = json.loads(f.read_text(encoding="utf-8"))
         doc["_dir"] = f.parent.name
-        groups[doc.get("exp_id", "?")].append(doc)
+        docs.append(doc)
+    # an experiment run at several training sizes (E14) gets one row per size
+    sizes: dict[str, set] = defaultdict(set)
+    for doc in docs:
+        n = doc.get("params", {}).get("SAMPLES")
+        if n is not None:                     # runs registered later may not record it
+            sizes[doc.get("exp_id", "?")].add(n)
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for doc in docs:
+        exp = doc.get("exp_id", "?")
+        n = doc.get("params", {}).get("SAMPLES")
+        groups[f"{exp} n={n}" if len(sizes[exp]) > 1 else exp].append(doc)
 
     lines = ["| exp | runs (seeds) | benchmark 12.5 ms | no temporal | validation | "
              + " | ".join(SEQS) + " | purpose |", "|---" * (len(SEQS) + 6) + "|"]

@@ -1,0 +1,53 @@
+{
+ "validation": {
+  "vsa gc lam=0.5 delta=0.25": 0.19687136471135538,
+  "vsa gc lam=0.5 delta=0.5": 0.21993875033306046,
+  "vsa gc lam=0.5 delta=0.75": 0.2449970068393409,
+  "vsa gc lam=0.5 delta=1": 0.26894246243253367,
+  "vsa gc lam=0.5 delta=1.25": 0.26243457779537105,
+  "vsa gc lam=0.5 delta=1.5": 0.24961094304532186,
+  "vsa gc lam=0.5 delta=2": 0.19253681158098943,
+  "vsa gc lam=0.5 delta=2.5": 0.1753689462393839,
+  "vsa gc lam=0.5 delta=3": 0.1522373758297883,
+  "vsa gc lam=0.5 delta=4": 0.09323647311205557,
+  "vsa gc lam=1 delta=0.25": 0.19842291547468485,
+  "vsa gc lam=1 delta=0.5": 0.22022062731267597,
+  "vsa gc lam=1 delta=0.75": 0.24689478682139132,
+  "vsa gc lam=1 delta=1": 0.2668721867179303,
+  "vsa gc lam=1 delta=1.25": 0.2733684310000669,
+  "vsa gc lam=1 delta=1.5": 0.25457403918827853,
+  "vsa gc lam=1 delta=2": 0.19965631616698573,
+  "vsa gc lam=1 delta=2.5": 0.18195351759208445,
+  "vsa gc lam=1 delta=3": 0.14813450919450585,
+  "vsa gc lam=1 delta=4": 0.08890077539695376,
+  "vsa gc lam=2 delta=0.25": 0.19725847816476796,
+  "vsa gc lam=2 delta=0.5": 0.2234300494505818,
+  "vsa gc lam=2 delta=0.75": 0.2587323117323351,
+  "vsa gc lam=2 delta=1": 0.2723859029435737,
+  "vsa gc lam=2 delta=1.25": 0.2723248888424571,
+  "vsa gc lam=2 delta=1.5": 0.25632164901501375,
+  "vsa gc lam=2 delta=2": 0.20006170393832115,
+  "vsa gc lam=2 delta=2.5": 0.1751591882746323,
+  "vsa gc lam=2 delta=3": 0.1518235600742808,
+  "vsa gc lam=2 delta=4": 0.08844672111860621,
+  "vsa gc lam=4 delta=0.25": 0.1989195943624619,
+  "vsa gc lam=4 delta=0.5": 0.22720908995877362,
+  "vsa gc lam=4 delta=0.75": 0.2542385683321454,
+  "vsa gc lam=4 delta=1": 0.27596271804792166,
+  "vsa gc lam=4 delta=1.25": 0.2705810700763465,
+  "vsa gc lam=4 delta=1.5": 0.25108034073226393,
+  "vsa gc lam=4 delta=2": 0.19451178555233045,
+  "vsa gc lam=4 delta=2.5": 0.16836149795071684,
+  "vsa gc lam=4 delta=3": 0.14062889927138655,
+  "vsa gc lam=4 delta=4": 0.07998088606065402
+ },
+ "choice": {
+  "vsa": {
+   "cue_threshold": 1.25,
+   "cue_val_iou": 0.2894730711687725,
+   "lam": 4.0,
+   "delta": 1.0,
+   "gc_val_iou": 0.27596271804792166
+  }
+ }
+}
