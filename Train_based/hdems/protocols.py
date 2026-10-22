@@ -45,7 +45,11 @@ from hdems.seg_features import motion_kwargs, score_pixel_mask
 from hdems.temporal_filter import TemporalFilter
 
 GT_MODES = ("moving", "moving_slow", "tracked")
-PRED_SOURCES = ("fg", "objects")   # fg = the head's moving pixels | objects = after grouping
+PRED_SOURCES = ("fg", "objects", "gt_objects")
+# fg = the head's moving pixels | objects = after grouping | gt_objects = DIAGNOSTIC: perfect
+# grouping -- every GT object instance (tracked mask id) is moving as a whole if the mean
+# P(moving) over its events exceeds the decision threshold. An upper bound for object-level
+# decisions on top of this model's motion evidence, NOT a result.
 
 
 @dataclass(frozen=True)
@@ -425,7 +429,16 @@ def run_benchmark(
             gt, evs, fi, ts = frame_gt(k)
             H, W = gt.shape
             pred_t = prob > thr
-            if pred_source == "objects":
+            if pred_source == "gt_objects":
+                seq_dir = Path(dataset.index[k][0])
+                obj = frame_gt.masks[seq_dir][gt_key("mask", fi)] // 1000
+                p_full = F.interpolate(prob.float()[None, None].cpu(), size=(H, W), mode="nearest")[0, 0].numpy()
+                x0, y0 = evs[windows[0]]
+                ids, inv = np.unique(obj[y0, x0], return_inverse=True)
+                mean_p = np.bincount(inv, p_full[y0, x0], len(ids)) / np.maximum(np.bincount(inv, minlength=len(ids)), 1)
+                moving_ids = ids[(mean_p > thr) & (ids > 0)]
+                pred = np.isin(obj, moving_ids)
+            elif pred_source == "objects":
                 if out.get("flow") is None:
                     raise ValueError("pred='objects' needs a head that returns the flow")
                 res = out.get("residual")
@@ -438,7 +451,7 @@ def run_benchmark(
                 pred = objects > 0
             else:
                 pred = pred_t.cpu().numpy()
-            pred_full = _upsample(pred, H, W)
+            pred_full = pred if pred_source == "gt_objects" else _upsample(pred, H, W)
             stats["run"] += 1
 
             for sc in scores:

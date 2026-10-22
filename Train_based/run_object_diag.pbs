@@ -1,0 +1,92 @@
+#!/bin/bash
+#PBS -N object_diag
+#PBS -P mi23
+#PBS -q gpuvolta
+#PBS -l ncpus=12
+#PBS -l mem=96GB
+#PBS -l ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -l storage=gdata/jq77+scratch/jq77+scratch/mi23
+#PBS -l wd
+#PBS -j oe
+# E15 -- can OBJECT-LEVEL decisions on top of our VSA motion evidence pass Hua et al. (77.4)?
+# Diagnostic, no training. On the 5 benchmark test sequences (our protocol):
+#   1. the trained head as it is (pred fg)                -> should reproduce its benchmark
+#   2. the same head + PERFECT grouping (pred gt_objects) -> every GT object instance is
+#      moving as a whole if its mean P(moving) > the head's validation threshold
+#   3. the training-free VSA cue (|VSA flow - IMU rotation|, threshold from validation),
+#      per event and + perfect grouping
+#   4. GT-motion oracles: per event / per object / per object + memory
+#      (scripts/check_object_oracle.py; 2026-10-22 locally: 80.2 / 90.1 / 90.4)
+# 2 and 3 are upper bounds for the grouping stage, NOT results: if they reach ~77+, the
+# remaining work is the object grouping; if not, the motion evidence must improve too.
+#
+#   qsub -v CKPT=/path/to/headline_checkpoint.pt run_object_diag.pbs
+
+set -eo pipefail
+
+CKPT="${CKPT:?set CKPT=<trained head checkpoint .pt> (qsub -v CKPT=...)}"
+HEAD="${HEAD:-mfunet}"
+VAL_SEQUENCES="${VAL_SEQUENCES:-scene13_dyn_test_03,scene14_dyn_test_02}"
+CONFIG="${CONFIG:-configs/evimo_seg.yaml}"
+CODE_DIR="${CODE_DIR:-/scratch/mi23/nuwan/Event_segmentation_paper1/Train_based}"
+VENV="${VENV:-/scratch/jq77/nk8155/seg1/bin/activate}"
+
+module load cuda
+module load python3/3.9.2
+source "${VENV}"
+if [ "$(command -v python)" != "$(dirname "${VENV}")/python" ]; then
+  echo "ERROR: no python in $(dirname "${VENV}") (found: '$(command -v python)') -- repair or recreate the venv"
+  exit 1
+fi
+cd "${CODE_DIR}"
+source scripts/nci_env.sh
+export PYTHONUNBUFFERED=1
+if [ ! -f "${CKPT}" ]; then
+  echo "ERROR: checkpoint not found: ${CKPT}"
+  exit 1
+fi
+
+JOB_NUM="${PBS_JOBID%%.*}"
+JOB_NUM="${JOB_NUM:-local$$}"
+OUT="results/E15_object_level_diag_$(date +%Y%m%d_%H%M%S)_${JOB_NUM}"
+mkdir -p "${OUT}"
+exec > >(tee -a "${OUT}/${PBS_JOBNAME:-object_diag}.o${JOB_NUM}") 2>&1
+LOG_TEE_PID=$!
+trap 'exec >&- 2>&-; wait "${LOG_TEE_PID}" 2>/dev/null || true' EXIT
+cat > "${OUT}/EXPERIMENT.md" <<EOF
+# Experiment E15 -- object-level decisions (diagnostic)
+
+**Purpose:** with PERFECT object grouping (GT instances), how high does our real motion
+evidence score? Head checkpoint: ${CKPT}. Upper bounds for the grouping stage, not results.
+
+**Compare with:** the head as it is (fg), Hua et al. 77.4, and the GT-motion oracles
+(per event 80.2 / per object 90.1 / per object + memory 90.4, local run 2026-10-22).
+
+Job ${PBS_JOBID:-local}, started $(date '+%Y-%m-%d %H:%M').
+
+## Results
+
+benchmark_*.txt (tables), benchmark_*.json, object_oracle.txt.
+EOF
+
+echo "=== E15 object-level diagnostic ${PBS_JOBID:-local} started $(date) -> ${OUT}"
+for PRED in fg gt_objects; do
+  echo ">>> [$(date +%T)] trained head, pred=${PRED}"
+  python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" --checkpoint "${CKPT}" --device cuda \
+    --benchmark hua2025 --benchmark-pred "${PRED}" \
+    --benchmark-out "${OUT}/benchmark_head_${PRED}.json" | tee "${OUT}/benchmark_head_${PRED}.txt"
+done
+for PRED in fg gt_objects; do
+  echo ">>> [$(date +%T)] training-free VSA cue (derotated), pred=${PRED}"
+  python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" --device cuda \
+    --baseline derotated --val-sequences "${VAL_SEQUENCES}" \
+    --benchmark hua2025 --benchmark-pred "${PRED}" \
+    --benchmark-out "${OUT}/benchmark_vsa_cue_${PRED}.json" | tee "${OUT}/benchmark_vsa_cue_${PRED}.txt" \
+    || echo "WARNING: baseline run failed (pred=${PRED})"
+done
+echo ">>> [$(date +%T)] GT-motion oracles"
+python scripts/check_object_oracle.py --config "${CONFIG}" --workers 5 | tee "${OUT}/object_oracle.txt"
+echo "--- resources used ---"
+qstat -f "${PBS_JOBID}" 2>/dev/null | grep -E 'resources_used\.(mem|walltime|cpupercent)' | sed 's/^ */  /' || true
+echo "=== finished $(date)"
