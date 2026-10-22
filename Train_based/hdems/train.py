@@ -20,7 +20,7 @@ from hdems.data.build import val_split_of
 from hdems.data.labels import LABEL_MODES, num_classes_for, resolve_label_mode
 from hdems.data.motion_labels import IGNORE_LABEL
 from hdems.losses.flow import epe_loss
-from hdems.losses.seg import dice_loss, seg_loss
+from hdems.losses.seg import dice_loss, discriminative_loss, seg_loss
 from hdems.models.hdems import HDEMS
 from hdems.seg_features import motion_kwargs, score_pixel_mask
 from hdems.vsa.velocity import EVENT_COMBINES
@@ -43,7 +43,12 @@ def train_one_epoch(
     *,
     use_dice: bool = False,
     num_classes: int = 16,
+    instance_weight: float = 0.0,
+    instance_margins: tuple[float, float] = (0.5, 1.5),
 ) -> float:
+    """One epoch. ``instance_weight`` > 0 (head with an instance embedding): adds the
+    discriminative loss on the event pixels, instances = EVIMO2 object ids (gt_raw // 1000,
+    every tracked object -- the static table too -- and the untracked background as one)."""
     model.train()
     total_loss = 0.0
     n = 0
@@ -73,6 +78,12 @@ def train_one_epoch(
                 loss = loss + dice_loss(
                     logits, target.masked_fill(~valid, 0), num_classes, mask=valid,
                 )
+            if instance_weight > 0 and "embedding" in out and "gt_raw" in batch:
+                ev = score_pixel_mask(batch, surface)
+                inst = batch["gt_raw"].to(device).long() // 1000
+                loss = loss + instance_weight * discriminative_loss(
+                    out["embedding"], inst, ev,
+                    delta_v=instance_margins[0], delta_d=instance_margins[1])
 
         loss.backward()
         optimizer.step()

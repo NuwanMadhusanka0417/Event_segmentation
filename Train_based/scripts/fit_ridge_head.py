@@ -224,6 +224,11 @@ def main() -> None:
     ap.add_argument("--beta-vel", type=float, default=None,
                     help="Real-FPE velocity bandwidth (overrides real_fpe.beta_vel): larger = "
                          "finer velocity code (0.05: v=0 vs 1 px similarity 0.996).")
+    ap.add_argument("--instance-dim", type=int, default=None,
+                    help="mfunet: instance-embedding size (0 = off; overrides segmentation.instance_dim). "
+                         "Objects are then decided as a whole (hdems.object_seg, --benchmark-pred instances).")
+    ap.add_argument("--instance-weight", type=float, default=None,
+                    help="Weight of the instance-embedding loss (overrides train.instance_weight).")
     ap.add_argument("--backend", choices=["streaming", "sklearn"], default=None)
     ap.add_argument(
         "--max-train-samples",
@@ -253,6 +258,10 @@ def main() -> None:
         cfg["velocity"] = vel
     if args.hv_input:                     # before frontend_settings: the checkpoint records it
         cfg["real_fpe"] = {**(cfg.get("real_fpe") or {}), "input": args.hv_input}
+    if args.instance_dim is not None:
+        cfg["segmentation"] = {**(cfg.get("segmentation") or {}), "instance_dim": int(args.instance_dim)}
+    if args.instance_weight is not None:
+        cfg["train"] = {**(cfg.get("train") or {}), "instance_weight": float(args.instance_weight)}
     if args.beta_vel is not None:
         cfg["real_fpe"] = {**(cfg.get("real_fpe") or {}), "beta_vel": float(args.beta_vel)}
     mot = dict(cfg.get("motion") or {})   # likewise: the motion options are front end
@@ -425,6 +434,13 @@ def main() -> None:
         optimizer = torch.optim.Adam([p for p in net.parameters() if p.requires_grad],
                                      lr=train_cfg.get("lr", 1e-4))
         use_dice = bool(train_cfg.get("use_dice", False))
+        # instance embedding (segmentation.instance_dim > 0): weight of its loss + margins
+        instance_weight = float(train_cfg.get("instance_weight", 1.0)) if seg_cfg.get("instance_dim") else 0.0
+        instance_margins = (float(train_cfg.get("instance_delta_v", 0.5)),
+                            float(train_cfg.get("instance_delta_d", 1.5)))
+        if instance_weight:
+            print(f"[train] instance embedding: dim {seg_cfg.get('instance_dim')}, loss weight "
+                  f"{instance_weight:g}, margins {instance_margins}")
         epochs = int(train_cfg.get("epochs", 30))
         # Early stopping: past runs all picked epoch 1 of 30, so most epochs were
         # wasted. Stop after `patience` validations without improvement.
@@ -461,7 +477,9 @@ def main() -> None:
         stale = 0                                  # validations since the last improvement
         for epoch in range(1, epochs + 1):
             loss = train_one_epoch(net, tr_loader, optimizer, device, "segmentation",
-                                   use_dice=use_dice, num_classes=num_classes)
+                                   use_dice=use_dice, num_classes=num_classes,
+                                   instance_weight=instance_weight,
+                                   instance_margins=instance_margins)
             if len(val_ds):
                 if epoch % val_every and epoch != epochs:
                     print(f"[train] epoch {epoch}/{epochs}  loss={loss:.4f}")

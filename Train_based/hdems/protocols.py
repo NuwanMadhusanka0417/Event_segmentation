@@ -41,11 +41,15 @@ import torch.nn.functional as F
 from hdems.data.evimo2_reader import gt_key, load_meta
 from hdems.data.motion_labels import MotionParams, sequence_motion
 from hdems.grouping import GroupingParams, group_objects
+from hdems.object_seg import (ObjectMemory, ObjectParams, cluster_embeddings, object_scores, segment_objects,
+                              split_spatially)
 from hdems.seg_features import motion_kwargs, score_pixel_mask
 from hdems.temporal_filter import TemporalFilter
 
 GT_MODES = ("moving", "moving_slow", "tracked")
-PRED_SOURCES = ("fg", "objects", "gt_objects")
+PRED_SOURCES = ("fg", "objects", "gt_objects", "instances")
+# instances = objects cut out by the learned instance embedding, each decided moving / static
+# as a whole (hdems.object_seg), optionally with per-object memory across frames
 # fg = the head's moving pixels | objects = after grouping | gt_objects = DIAGNOSTIC: perfect
 # grouping -- every GT object instance (tracked mask id) is moving as a whole if the mean
 # P(moving) over its events exceeds the decision threshold. An upper bound for object-level
@@ -346,6 +350,71 @@ def validate_event_iou(
 
 
 @torch.no_grad()
+def validate_objects(
+    model: Any,
+    dataset: Any,
+    device: torch.device,
+    base_params: ObjectParams,
+    *,
+    thresholds: Iterable[float] = (0.5,),
+    memories: Iterable[float] = (0.0,),
+    window_ms: float = 12.5,
+    gt_mode: str = "moving",
+    max_frames: int | None = None,
+) -> tuple[dict[tuple[float, float], float], int]:
+    """validate_event_iou for OBJECT-level decisions (pred 'instances'): every frame of each
+    sequence runs in time order (the memory is causal), objects are cut once per frame and
+    every (threshold, memory) pair is scored. -> ({(thr, memory): mean event IoU}, frames)."""
+    base = dataset.dataset if hasattr(dataset, "indices") else dataset
+    pool = list(dataset.indices) if hasattr(dataset, "indices") else list(range(len(base)))
+    thresholds = [float(t) for t in thresholds]
+    memories = [float(m) for m in memories]
+    gtf = GTFrames(base, [window_ms], gt_mode)
+    model.eval()
+    mems = {m: ObjectMemory(ObjectParams(**{**base_params.__dict__, "memory": m})) for m in memories}
+    ious: dict[tuple[float, float], list[float]] = {(t, m): [] for t in thresholds for m in memories}
+    try:
+        pool = _in_time_order(gtf, pool)
+        keep = [k for k in pool if not isinstance(gtf(k), str)]
+        scored = set(_spread_cap(keep, max_frames))
+        if not scored:
+            return {k: float("nan") for k in ious}, 0
+        last = max(i for i, k in enumerate(pool) if k in scored)
+        run = pool[: last + 1] if any(m > 0 for m in memories) else [k for k in pool if k in scored]
+        for k in run:
+            sample = base[k]
+            out, surface, _aux = forward_sample(model, sample, device)
+            if "embedding" not in out:
+                raise ValueError("pred 'instances' needs a head with an instance embedding "
+                                 "(segmentation.instance_dim > 0)")
+            prob = moving_prob(out)
+            mask = score_pixel_mask(sample, surface)[0]
+            objects = split_spatially(cluster_embeddings(out["embedding"][0], mask, base_params), base_params.link_px)
+            pr = prob.detach().float().cpu().numpy()
+            raw = object_scores(pr, objects)
+            seq, _fi, _ts = gtf.time_of(k)
+            sc = {m: mems[m](seq, objects, raw) for m in memories}
+            if k not in scored:
+                continue
+            gt, evs, _fi, _ts = gtf(k)
+            H, W = gt.shape
+            x, y = evs[float(window_ms)]
+            g_ev = gt[y, x]
+            sizes = np.bincount(objects.reshape(-1), minlength=len(raw))
+            small = (sizes < base_params.min_px)[objects] & (objects > 0)
+            for m in memories:
+                for t in thresholds:
+                    pred = np.where(small, pr > t, (sc[m] > t)[objects] & (objects > 0))
+                    p_ev = _upsample(pred, H, W)[y, x]
+                    union = int((p_ev | g_ev).sum())
+                    ious[(t, m)].append(int((p_ev & g_ev).sum()) / union if union else float("nan"))
+    finally:
+        gtf.close()
+    n = len(next(iter(ious.values()))) if ious else 0
+    return {k: float(np.nanmean(v)) if v else float("nan") for k, v in ious.items()}, n
+
+
+@torch.no_grad()
 def run_benchmark(
     model: Any,
     dataset: Any,
@@ -360,6 +429,7 @@ def run_benchmark(
     max_per_sequence: int | None = None,
     log_every: int = 100,
     temporal_beta: float | None = None,
+    objects: ObjectParams | None = None,
 ) -> tuple[list[ProtocolScores], dict[str, Any]]:
     """Score ``model`` on the benchmark's sequences of ``dataset`` (an EVIMODataset).
 
@@ -376,11 +446,17 @@ def run_benchmark(
     windows = [float(w) for w in windows_ms]
     if pred_source == "objects" and grouping is None:
         raise ValueError("pred='objects' needs grouping parameters")
+    if pred_source == "instances" and objects is None:
+        raise ValueError("pred='instances' needs object parameters (hdems.object_seg.ObjectParams)")
+    memory = ObjectMemory(objects) if pred_source == "instances" else None
+    sequential = pred_source == "instances" and objects.memory > 0
     model.eval()
     thr = getattr(model, "decision_threshold", None)
     thr = 0.5 if thr is None else float(thr)
     beta = float(getattr(model, "temporal_beta", 0.0) or 0.0) if temporal_beta is None else float(temporal_beta)
     tf = TemporalFilter(beta, getattr(dataset, "interval_s", None) or 0.0125) if beta else None
+    if pred_source == "instances":
+        tf = None                       # object memory replaces the per-pixel temporal filter
     frame_gt = GTFrames(dataset, windows, gt_mode, min_gt_events)
 
     all_frames: dict[str, list[int]] = {}
@@ -408,7 +484,7 @@ def run_benchmark(
                 else:
                     keep.append(k)
             scored = set(_spread_cap(keep, max_per_sequence))
-            if tf is None:
+            if tf is None and not sequential:
                 order += [(lab, k, True) for k in seq_frames if k in scored]
             elif scored:
                 last = max(i for i, k in enumerate(seq_frames) if k in scored)
@@ -424,12 +500,20 @@ def run_benchmark(
                 seq, _fi, ts_k = frame_gt.time_of(k)
                 flow = out.get("flow")
                 prob = tf(seq, prob, None if flow is None else flow[0], ts_k)
+            if pred_source == "instances":
+                if "embedding" not in out:
+                    raise ValueError("pred 'instances' needs a head with an instance embedding")
+                seq_name = frame_gt.time_of(k)[0]
+                moving_px, _objs, _sc = segment_objects(prob, out["embedding"][0], score_pixel_mask(sample, surface)[0],
+                                                        objects, memory, seq_name)
             if not score_it:
                 continue
             gt, evs, fi, ts = frame_gt(k)
             H, W = gt.shape
             pred_t = prob > thr
-            if pred_source == "gt_objects":
+            if pred_source == "instances":
+                pred = moving_px
+            elif pred_source == "gt_objects":
                 seq_dir = Path(dataset.index[k][0])
                 obj = frame_gt.masks[seq_dir][gt_key("mask", fi)] // 1000
                 p_full = F.interpolate(prob.float()[None, None].cpu(), size=(H, W), mode="nearest")[0, 0].numpy()

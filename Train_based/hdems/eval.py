@@ -27,6 +27,7 @@ from hdems.detection import detection_metrics, masks_to_boxes
 from hdems.instances import binary_iou, connected_components, instance_metrics
 from hdems.baselines import BASELINE_CUES, THRESHOLD_GRID_PX, CueBaseline
 from hdems.models.hdems import ABLATIONS, BACKGROUND_SOURCES, FLOW_SOURCES, HDEMS
+from hdems.object_seg import ObjectParams
 from hdems.vsa.velocity import EVENT_COMBINES
 from hdems.seg_features import motion_kwargs, predict_labels, score_pixel_mask
 
@@ -385,12 +386,18 @@ def run_published_benchmark(args, cfg: dict, model: HDEMS, dataset, eval_split: 
     base = dataset.dataset if isinstance(dataset, Subset) else dataset
     if eval_split != bench.split:
         base = build_dataset(cfg, split=bench.split)
+    objects = None
+    if s["pred"] == "instances":
+        objects = getattr(model, "object_params", None) or tune_objects(args, cfg, model, device, s["gt"])
+        model.object_params = objects
+        print(f"[eval] object-level decisions: {objects}")
     scores, stats = bm.run_benchmark(
         model, base, bench, device,
         windows_ms=s["event_windows_ms"], gt_mode=s["gt"], pred_source=s["pred"],
         grouping=grouping_params(cfg) if s["pred"] == "objects" else None,
         min_gt_events=s["min_gt_events"],
         max_per_sequence=args.max_samples,
+        objects=objects,
     )
     print(bm.format_report(bench, scores, stats, gt_mode=s["gt"], pred_source=s["pred"]))
     oracles = {k: getattr(getattr(model, "model", model), k, None)
@@ -407,10 +414,36 @@ def run_published_benchmark(args, cfg: dict, model: HDEMS, dataset, eval_split: 
                       "max_per_sequence": args.max_samples,
                       "decision_threshold": getattr(model, "decision_threshold", None),
                       "threshold_curve": getattr(model, "threshold_curve", None),
-                      "temporal_beta": stats.get("temporal_beta", 0.0)})
+                      "temporal_beta": stats.get("temporal_beta", 0.0),
+                      "object_params": None if objects is None else objects.__dict__,
+                      "object_curve": getattr(model, "object_curve", None)})
         print(f"Per-frame scores -> {Path(args.benchmark_out).resolve()}")
     if model.flow_cache is not None:
         print(model.flow_cache.summary())
+
+
+def tune_objects(args, cfg: dict, model, device: torch.device, gt_mode: str) -> ObjectParams:
+    """pred 'instances': the object decision threshold and the memory strength, chosen on the
+    VALIDATION takes with the benchmark metric (never the test). --object-threshold skips it."""
+    from dataclasses import replace
+    from hdems.data.build import HOLDOUT
+    base = ObjectParams(bandwidth=args.object_bandwidth, link_px=args.object_link_px)
+    if args.object_threshold is not None:
+        return replace(base, threshold=args.object_threshold, memory=args.object_memory or 0.0)
+    val_ds = build_dataset(cfg, split=HOLDOUT)
+    if len(val_ds) == 0:
+        raise SystemExit("pred instances: the validation split is empty -- pass --val-sequences")
+    grid = [round(0.05 * i, 2) for i in range(1, 17)]
+    mems = [float(args.object_memory)] if args.object_memory is not None else [0.0, 0.5, 0.7, 0.85, 0.95]
+    got, n = bm.validate_objects(model, val_ds, device, base, thresholds=grid, memories=mems,
+                                 gt_mode=gt_mode, max_frames=args.object_val_frames)
+    best = max(got, key=lambda k: got[k] if got[k] == got[k] else -1.0)
+    for m in mems:
+        tm = max(grid, key=lambda t: got[(t, m)] if got[(t, m)] == got[(t, m)] else -1.0)
+        print(f"[objects] validation, memory {m:g}: best threshold {tm:.2f} event IoU {got[(tm, m)]:.4f}  [{n} frames]")
+    print(f"[objects] chosen: threshold {best[0]:.2f}, memory {best[1]:g} (validation event IoU {got[best]:.4f})")
+    model.object_curve = {f"thr={t:g},mem={m:g}": v for (t, m), v in got.items()}
+    return replace(base, threshold=best[0], memory=best[1])
 
 
 def tune_baseline(args, cfg: dict, baseline: CueBaseline, device: torch.device) -> None:
@@ -534,6 +567,18 @@ def main() -> None:
                         help="--baseline: comma-separated held-out takes for tuning its threshold "
                              "(default dataset.val_sequences), e.g. "
                              "scene13_dyn_test_03,scene14_dyn_test_02.")
+    parser.add_argument("--object-threshold", type=float, default=None,
+                        help="--benchmark-pred instances: decision threshold on an object's mean "
+                             "P(moving) (default: tuned on the validation takes, with the memory).")
+    parser.add_argument("--object-memory", type=float, default=None,
+                        help="--benchmark-pred instances: memory strength 0..1 (0 = off; default: "
+                             "tuned on validation among 0, .5, .7, .85, .95).")
+    parser.add_argument("--object-bandwidth", type=float, default=ObjectParams.bandwidth,
+                        help="--benchmark-pred instances: embedding distance joining a pixel to an object.")
+    parser.add_argument("--object-link-px", type=int, default=ObjectParams.link_px,
+                        help="--benchmark-pred instances: spatial split distance (working px).")
+    parser.add_argument("--object-val-frames", type=int, default=300,
+                        help="--benchmark-pred instances: validation frames with a mover for the tuning.")
     parser.add_argument("--baseline-val-frames", type=int, default=300,
                         help="--baseline: validation frames with a mover used for the threshold.")
     args = parser.parse_args()

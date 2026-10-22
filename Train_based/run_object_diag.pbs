@@ -21,11 +21,13 @@
 # 2 and 3 are upper bounds for the grouping stage, NOT results: if they reach ~77+, the
 # remaining work is the object grouping; if not, the motion evidence must improve too.
 #
-#   qsub -v CKPT=/path/to/headline_checkpoint.pt run_object_diag.pbs
+#   qsub run_object_diag.pbs                                  (no trained head: steps 3 + 4)
+#   qsub -v CKPT=/path/to/headline_checkpoint.pt run_object_diag.pbs   (all steps)
+# The E16-E19 runs of run_segmentation.pbs score their own head with perfect objects too.
 
 set -eo pipefail
 
-CKPT="${CKPT:?set CKPT=<trained head checkpoint .pt> (qsub -v CKPT=...)}"
+CKPT="${CKPT:-}"                 # optional: a trained head checkpoint (steps 1 + 2)
 HEAD="${HEAD:-mfunet}"
 VAL_SEQUENCES="${VAL_SEQUENCES:-scene13_dyn_test_03,scene14_dyn_test_02}"
 CONFIG="${CONFIG:-configs/evimo_seg.yaml}"
@@ -42,7 +44,7 @@ fi
 cd "${CODE_DIR}"
 source scripts/nci_env.sh
 export PYTHONUNBUFFERED=1
-if [ ! -f "${CKPT}" ]; then
+if [ -n "${CKPT}" ] && [ ! -f "${CKPT}" ]; then
   echo "ERROR: checkpoint not found: ${CKPT}"
   exit 1
 fi
@@ -72,6 +74,7 @@ EOF
 
 echo "=== E15 object-level diagnostic ${PBS_JOBID:-local} started $(date) -> ${OUT}"
 for PRED in fg gt_objects; do
+  [ -z "${CKPT}" ] && break
   echo ">>> [$(date +%T)] trained head, pred=${PRED}"
   python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" --checkpoint "${CKPT}" --device cuda \
     --benchmark hua2025 --benchmark-pred "${PRED}" \

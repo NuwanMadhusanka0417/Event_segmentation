@@ -120,7 +120,7 @@ def frontend_option(cfg: dict[str, Any], section: str, key: str) -> Any:
 
 # Head sizes that decide the checkpoint's tensor shapes (stored, restored by eval).
 _HEAD_KEYS = ("embedding_dim", "ctx_dim", "mf_motion_dim", "mf_app_dim", "mf_app_dropout",
-              "mf_widths")
+              "mf_widths", "instance_dim")
 
 
 def head_settings(cfg: dict[str, Any]) -> dict[str, Any]:

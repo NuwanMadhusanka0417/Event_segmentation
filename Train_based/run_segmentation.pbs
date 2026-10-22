@@ -39,6 +39,16 @@ set -eo pipefail   # stop immediately if fit fails, so eval never runs on a stal
 #  E12 no VSA consistency maps                E3
 #  E13 no event-density input                 E3
 #  E14 training-set size (SAMPLES=1000|2000)  E3 (300) and E11 (all) -- the data curve
+#
+# OBJECT-LEVEL METHOD (CVPR, 2026-10-22): instance embedding on the U-Net, objects cut out
+# by clustering and decided moving / static AS A WHOLE, + per-object memory (hdems/object_seg.py).
+# Oracle: per-object decisions 90.1% vs per-event 80.2% (scripts/check_object_oracle.py).
+#  E16 MAIN: all frames, instance dim 8, w 1   E11 (per-pixel, same data) and Hua et al. 77.4
+#  E17 E16 with instance loss weight 0.3       E16: does the embedding loss cost P(moving)?
+#  E18 E16 with instance dim 16                E16
+#  E19 E16 on 1000 frames (fast iteration)     E14 (1000 frames, per pixel)
+# Each E16-E19 run also scores the same checkpoint per pixel (fg), without memory (nomem)
+# and with PERFECT objects (gt_objects, an upper bound).
 EXP_ID="${EXP_ID:-custom}"
 SEED="${SEED:-0}"            # random seed: the SAME experiment with seeds 0,1,2 shows the noise
 EXP_NOTE_DEF="custom run (no preset)"
@@ -83,8 +93,20 @@ case "${EXP_ID}" in
   E14) : "${SAMPLES:=1000}"; : "${EGO_GATE:=0}"
       EXP_NOTE_DEF="Training-set size curve: headline configuration (no capture fallback) on SAMPLES training frames"
       EXP_CMP_DEF="E11 (all frames) and the 300-frame runs" ;;
+  E16) : "${SAMPLES:=4000}"; : "${EGO_GATE:=0}"; : "${INSTANCE_DIM:=8}"; : "${INSTANCE_W:=1.0}"; : "${BENCH_PRED:=instances}"
+      EXP_NOTE_DEF="OBJECT-LEVEL MAIN: E11 + instance embedding (dim 8); every object decided moving/static as a whole, with per-object memory (tuned on validation)"
+      EXP_CMP_DEF="E11 (per-pixel decisions, same data); the same checkpoint per pixel (benchmark_*_fg), without memory (*_nomem), with perfect objects (*_gt_objects); Hua et al. 2025 = 77.4" ;;
+  E17) : "${SAMPLES:=4000}"; : "${EGO_GATE:=0}"; : "${INSTANCE_DIM:=8}"; : "${INSTANCE_W:=0.3}"; : "${BENCH_PRED:=instances}"
+      EXP_NOTE_DEF="E16 with a lighter instance loss (weight 0.3): does the embedding loss cost the moving/static evidence?"
+      EXP_CMP_DEF="E16, same seeds" ;;
+  E18) : "${SAMPLES:=4000}"; : "${EGO_GATE:=0}"; : "${INSTANCE_DIM:=16}"; : "${INSTANCE_W:=1.0}"; : "${BENCH_PRED:=instances}"
+      EXP_NOTE_DEF="E16 with a 16-d instance embedding"
+      EXP_CMP_DEF="E16, same seeds" ;;
+  E19) : "${SAMPLES:=1000}"; : "${EGO_GATE:=0}"; : "${INSTANCE_DIM:=8}"; : "${INSTANCE_W:=1.0}"; : "${BENCH_PRED:=instances}"
+      EXP_NOTE_DEF="E16 on 1000 training frames: fast check of the object-level method"
+      EXP_CMP_DEF="E14 (1000 frames, per-pixel decisions)" ;;
   custom) ;;
-  *) echo "ERROR: unknown EXP_ID=${EXP_ID} (E0-E8, E11-E14 or custom)"; exit 1 ;;
+  *) echo "ERROR: unknown EXP_ID=${EXP_ID} (E0-E8, E11-E14, E16-E19 or custom)"; exit 1 ;;
 esac
 EXP_NOTE="${EXP_NOTE:-${EXP_NOTE_DEF}}"
 EXP_CMP="${EXP_CMP:-${EXP_CMP_DEF}}"
@@ -129,6 +151,9 @@ SPLIT="${SPLIT:-official}"         # official = EVIMO2's own train/eval split: o
 VAL_SEQUENCES="${VAL_SEQUENCES:-scene13_dyn_test_03,scene14_dyn_test_02}"   # SPLIT=official only: held-out takes
                        #   (141 + 115 frames with a mover, one take of each benchmark scene)
 DENSITY="${DENSITY:-yes}"            # yes | no  event density as a head input (no = deny the head that shortcut)
+INSTANCE_DIM="${INSTANCE_DIM:-0}"     # mfunet: instance-embedding size (0 = off). > 0: objects are cut out
+                       #   by clustering the embedding and decided moving/static as a whole (BENCH_PRED=instances)
+INSTANCE_W="${INSTANCE_W:-1.0}"       # weight of the instance-embedding (discriminative) loss
 TEST_SAMPLES="${TEST_SAMPLES:-50}"        # max eval panels saved
 PANELS="${PANELS:-movers}"          # which eval frames get figures (scores always use ALL frames):
                        #   movers = only frames with a visible moving object (see object colours)
@@ -137,7 +162,8 @@ PANELS="${PANELS:-movers}"          # which eval frames get figures (scores alwa
 BENCHMARK="${BENCHMARK:-hua2025}"      # hua2025 | none  -> also score with the published protocol of
                        #   Hua, Yuan & Fermueller 2025 (IoU over events, 5 sequences)
 BENCH_GT="${BENCH_GT:-moving}"        # moving | moving_slow | tracked   (which objects count as moving)
-BENCH_PRED="${BENCH_PRED:-fg}"          # fg | objects   (head's moving pixels, or only what grouping keeps)
+BENCH_PRED="${BENCH_PRED:-fg}"          # fg | objects | instances   (head's moving pixels | only what grouping
+                       #   keeps | whole objects from the instance embedding, needs INSTANCE_DIM > 0)
 ORACLE="${ORACLE:-no}"              # yes -> ALSO run the benchmark with the Vicon (ground-truth) rotation:
                        #   the upper bound of rotation removal -- never report it as a result
 TEMPORAL_ABLATION="${TEMPORAL_ABLATION:-yes}"  # yes -> ALSO run the benchmark without the temporal filter (beta 0).
@@ -236,6 +262,17 @@ if [ "${SPLIT}" = "official" ]; then
 else
   SPLIT_ARGS=(--scene-disjoint yes --val-sequences none)
 fi
+# object-level decisions are tuned on the validation takes (threshold + memory), never the test
+OBJ_VAL_ARGS=()
+if [ "${BENCH_PRED}" = "instances" ]; then
+  if [ "${SPLIT}" != "official" ]; then
+    echo "ERROR: BENCH_PRED=instances tunes on VAL_SEQUENCES -- use SPLIT=official"; exit 1
+  fi
+  if [ "${INSTANCE_DIM}" = "0" ]; then
+    echo "ERROR: BENCH_PRED=instances needs INSTANCE_DIM > 0"; exit 1
+  fi
+  OBJ_VAL_ARGS=(--val-sequences "${VAL_SEQUENCES}")
+fi
 RUN_NAME="${HEAD}_${EV_FEATURE}_${AX_COMBINE}_${EV_TAG}_${LABEL_MODE}_r${RES_RATIO}_${SAMPLES}${AUG_TAG}${MOT_TAG}${SPLIT_TAG}"
 CKPT="checkpoints/${EXP_ID}_s${SEED}_${RUN_NAME}_${JOB_NUM}.pt"
 RESULTS_DIR="results/${EXP_ID}_s${SEED}_${RUN_NAME}_$(date +%Y%m%d_%H%M%S)_${JOB_NUM}"
@@ -263,6 +300,7 @@ python scripts/summarize_run.py init "${RESULTS_DIR}" --exp-id "${EXP_ID}" \
   --param "DENSITY=${DENSITY}" --param "NEG_RATIO=${NEG_RATIO}" --param "ORACLE_INPUT=${ORACLE_INPUT}" \
   --param "RES_RATIO=${RES_RATIO}" --param "AUGMENT=${AUGMENT}" --param "SPLIT=${SPLIT}" \
   --param "VAL_SEQUENCES=${VAL_SEQUENCES}" --param "VAL_SAMPLES=${VAL_SAMPLES}" \
+  --param "INSTANCE=dim ${INSTANCE_DIM} weight ${INSTANCE_W}" --param "BENCH_PRED=${BENCH_PRED}" \
   --param "CHECKPOINT=${CKPT}" || echo "(could not write EXPERIMENT.md)"
 
 # ---------------------------------------------------------------------------
@@ -384,6 +422,7 @@ python scripts/fit_ridge_head.py --config "${CONFIG}" \
   --imu-gain "${IMU_GAIN}" --imu-shift-ms "${IMU_SHIFT_MS}" --imu-avg-ms "${IMU_AVG_MS}" \
   --ego-gate-px "${EGO_GATE}" --seed "${SEED}" --negative-ratio "${NEG_RATIO}" --beta-vel "${BETA_VEL}" \
   --vsa-consistency "${VSA_CONS}" --extra-inputs "${EXTRA_INPUTS}" --density-input "${DENSITY}" \
+  --instance-dim "${INSTANCE_DIM}" --instance-weight "${INSTANCE_W}" \
   "${SPLIT_ARGS[@]}" "${ORACLE_ARGS[@]}" \
   --device cuda --max-train-samples "${SAMPLES}" --max-val-samples "${VAL_SAMPLES}"
 
@@ -418,8 +457,31 @@ if [ "${BENCHMARK}" != "none" ]; then
   python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
     --checkpoint "${CKPT}" --device cuda \
     --benchmark "${BENCHMARK}" --benchmark-gt "${BENCH_GT}" --benchmark-pred "${BENCH_PRED}" \
+    "${OBJ_VAL_ARGS[@]}" \
     --benchmark-out "${RESULTS_DIR}/benchmark_${BENCHMARK}.json" \
     | tee "${RESULTS_DIR}/benchmark_${BENCHMARK}.txt"
+  if [ "${BENCH_PRED}" = "instances" ]; then
+    # ABLATIONS of the object-level method, same checkpoint: no memory, per-pixel decisions,
+    # and the upper bound with perfect (GT) objects
+    echo ">>> [$(date +%T)] benchmark ${BENCHMARK}: objects WITHOUT memory (ablation)"
+    python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
+      --checkpoint "${CKPT}" --device cuda --object-memory 0 \
+      --benchmark "${BENCHMARK}" --benchmark-gt "${BENCH_GT}" --benchmark-pred instances "${OBJ_VAL_ARGS[@]}" \
+      --benchmark-out "${RESULTS_DIR}/benchmark_${BENCHMARK}_nomem.json" \
+      | tee "${RESULTS_DIR}/benchmark_${BENCHMARK}_nomem.txt"
+    echo ">>> [$(date +%T)] benchmark ${BENCHMARK}: per-pixel decisions of the same head (ablation)"
+    python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
+      --checkpoint "${CKPT}" --device cuda \
+      --benchmark "${BENCHMARK}" --benchmark-gt "${BENCH_GT}" --benchmark-pred fg \
+      --benchmark-out "${RESULTS_DIR}/benchmark_${BENCHMARK}_fg.json" \
+      | tee "${RESULTS_DIR}/benchmark_${BENCHMARK}_fg.txt"
+    echo ">>> [$(date +%T)] benchmark ${BENCHMARK}: same head + PERFECT objects (upper bound, not a result)"
+    python -m hdems.eval --config "${CONFIG}" --head "${HEAD}" \
+      --checkpoint "${CKPT}" --device cuda \
+      --benchmark "${BENCHMARK}" --benchmark-gt "${BENCH_GT}" --benchmark-pred gt_objects \
+      --benchmark-out "${RESULTS_DIR}/benchmark_${BENCHMARK}_gt_objects.json" \
+      | tee "${RESULTS_DIR}/benchmark_${BENCHMARK}_gt_objects.txt"
+  fi
   if [ "${TEMPORAL_ABLATION}" = "yes" ]; then
     # ABLATION: the same head without the temporal filter (beta 0), for the paper's table
     echo ">>> [$(date +%T)] benchmark ${BENCHMARK} WITHOUT temporal consistency (ablation)"

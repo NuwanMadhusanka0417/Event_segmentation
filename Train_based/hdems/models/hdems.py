@@ -226,6 +226,7 @@ class HDEMS(nn.Module):
                 app_scalars=(self.n_motion_ch,),    # event density goes with appearance
                 mv_ch=mv_ch,
                 widths=tuple(int(w) for w in seg.get("mf_widths", (32, 64, 96, 128))),
+                instance_dim=int(seg.get("instance_dim", 0) or 0),
             )
         else:  # "cnn" — HV-as-channels CNN on the paper feature tensor
             self.seg_head = HVConvHead(
@@ -662,7 +663,10 @@ class HDEMS(nn.Module):
                 scalars = torch.cat([scalars, self.evidence_channels(surface, m["conf"])], dim=1)
             outputs["flow"] = m["flow"]
             outputs["residual"] = m["residual"]
-            outputs["seg_logits"] = self.seg_head(self.pixel_hv(m["residual"]), m["x"], scalars)
+            seg = self.seg_head(self.pixel_hv(m["residual"]), m["x"], scalars)
+            if isinstance(seg, tuple):                 # mfunet with an instance embedding
+                seg, outputs["embedding"] = seg
+            outputs["seg_logits"] = seg
             return outputs
 
         # ---- paper two-time / multi-scale motion path -----------------------

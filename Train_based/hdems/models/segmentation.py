@@ -232,6 +232,12 @@ class MotionUNetHead(_MotionFirstInputs):
 
     ``app_scalars``: indices of scalar channels that are appearance-like (event
     density); they are dropped together with the appearance projection.
+
+    ``instance_dim`` > 0 adds an instance-embedding output on the same decoder features
+    (2026-10-22): pixels of one object are pulled together, different objects pushed apart
+    (hdems.losses.seg.discriminative_loss), so objects can be cut out by clustering and
+    decided moving / static AS A WHOLE (hdems.object_seg). forward then returns
+    (logits, embedding).
     """
 
     def __init__(
@@ -246,6 +252,7 @@ class MotionUNetHead(_MotionFirstInputs):
         app_scalars: tuple[int, ...] = (6,),
         widths: tuple[int, ...] = (32, 64, 96, 128),
         mv_ch: int | None = None,
+        instance_dim: int = 0,
     ) -> None:
         super().__init__(d, motion_dim, app_dim, app_dropout, app_scalars, mv_ch=mv_ch)
         cin = motion_dim + scalar_ch + max(app_dim, 0)
@@ -257,10 +264,15 @@ class MotionUNetHead(_MotionFirstInputs):
             _unet_block(widths[i + 1] + widths[i], widths[i]) for i in reversed(range(len(widths) - 1))
         )
         self.classifier = nn.Conv2d(widths[0], num_classes, 1)
+        self.instance_dim = int(instance_dim)
+        self.embed = (nn.Sequential(nn.Conv2d(widths[0], widths[0], 3, padding=1), nn.ReLU(inplace=True),
+                                    nn.Conv2d(widths[0], self.instance_dim, 1))
+                      if self.instance_dim > 0 else None)
 
-    def forward(self, mv: torch.Tensor, x: torch.Tensor, scalars: torch.Tensor) -> torch.Tensor:
+    def forward(self, mv: torch.Tensor, x: torch.Tensor, scalars: torch.Tensor):
         """mv: per-pixel hypervector, real (B, d_hv, H, W) or complex (B, d, H, W);
-        x: (B, d, H, W) complex, unit-RMS; scalars: (B, 8, H, W)."""
+        x: (B, d, H, W) complex, unit-RMS; scalars: (B, 8, H, W).
+        -> logits, or (logits, embedding (B, instance_dim, H, W)) with instance_dim > 0."""
         h = self._inputs(mv, x, scalars)
         skips = []
         for i, block in enumerate(self.down):
@@ -271,4 +283,6 @@ class MotionUNetHead(_MotionFirstInputs):
         for block, skip in zip(self.up, reversed(skips[:-1])):
             h = F.interpolate(h, size=skip.shape[-2:], mode="bilinear", align_corners=False)
             h = block(torch.cat([h, skip], dim=1))
+        if self.embed is not None:
+            return self.classifier(h), self.embed(h)
         return self.classifier(h)
